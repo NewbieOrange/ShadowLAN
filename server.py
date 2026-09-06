@@ -11,7 +11,6 @@ by --token, and assigns each node a virtual LAN IP (default 10.200.0.0/24).
 """
 import argparse
 import asyncio
-import hashlib
 import socket
 import struct
 import time
@@ -20,7 +19,7 @@ from common import (
     T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
     T_TCP_CLOSE, T_HELLO, T_NODE, T_ASSIGN, T_POPEN,
     U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_HELLO_HOST, U_NODE, UMAGIC, UVER,
-    Dedup, QueueProto,
+    QueueProto,
     decode_udp_game, encode_udp_game, decode_udp_hello,
     decode_hello, decode_node, decode_udp_node, decode_popen, decode_pdat,
     encode_assign, encode_bcast_from,
@@ -64,7 +63,6 @@ class Relay:
         self.c2h = {}  # (id(src_writer), sid_s) -> (sid_t, target_writer)
         self.h2c = {}  # sid_t -> (src_writer, sid_s, target_writer)
         self.next_sid = 1
-        self.dedup = Dedup()
         self.beaconers = {}  # writer -> last BCAST seen (TCP-routable fallback)
         # virtual-IP membership: node_id -> dict(writer, tcp_ip, udp_port,
         # udp_addr, virt, seen_tcp, seen_udp)
@@ -288,16 +286,8 @@ class Relay:
                     (dport,) = struct.unpack("!H", payload[:2])
                     if self.disc_ports and dport not in self.disc_ports:
                         continue
-                    # Per-source dedup: identical beacon payloads from
-                    # DIFFERENT hosts are distinct servers (multi-host
-                    # same game) and must all fan out; repeats from the
-                    # SAME host are still throttled.
-                    src_node = self.writer_node.get(owner, 0)
-                    uniq = struct.pack("!I", src_node) if src_node else \
-                        struct.pack("!Q", owner & 0xFFFFFFFFFFFFFFFF)
-                    if self.dedup.hit(hashlib.sha256(
-                            b"B" + uniq + payload).digest()):
-                        continue
+                    # Every beacon fans out as-is; echo loops are cut at
+                    # the edge and distinct hosts stay visible.
                     self.beaconers[writer] = time.monotonic()
                     src_node = self.writer_node.get(owner, 0)
                     for w in list(self.players) + ([self.host_writer] if self.host_writer else []):

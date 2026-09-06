@@ -2,7 +2,6 @@
 import asyncio
 import socket
 import struct
-import time
 
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
@@ -70,23 +69,6 @@ def make_reuse_udp(bind_ip, port):
     s.bind((bind_ip, port))
     s.setblocking(False)
     return s
-
-
-class Dedup:
-    """Drop our own re-broadcast echoes / loops (2s window)."""
-    def __init__(self, window=2.0):
-        self.window = window
-        self.seen = {}
-
-    def hit(self, key: bytes) -> bool:
-        now = time.monotonic()
-        for k, exp in list(self.seen.items()):
-            if exp < now:
-                del self.seen[k]
-        if key in self.seen:
-            return True
-        self.seen[key] = now + self.window
-        return False
 
 
 class QueueProto(asyncio.DatagramProtocol):

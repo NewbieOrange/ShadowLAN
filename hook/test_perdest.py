@@ -16,8 +16,8 @@
   to B (old code killed all streams on every HELLO).
 
   DISC-D (per-source beacons): two hosts beaconing the IDENTICAL
-  payload must both reach a player as distinct BCAST_FROMs (old
-  global dedup forwarded only the first host's).
+  payload must both reach a player as distinct BCAST_FROMs (a global
+  payload cache would forward only the first host's).
 """
 import asyncio
 import os

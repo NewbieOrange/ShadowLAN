@@ -24,7 +24,6 @@ Notes:
 """
 import argparse
 import asyncio
-import hashlib
 import os
 import random
 import socket
@@ -41,7 +40,7 @@ if os.name == "nt":
 from common import (
     T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
     T_TCP_CLOSE, T_HELLO, T_NODE, U_GAME_C2S, U_GAME_S2C, U_NODE,
-    Dedup, QueueProto,
+    QueueProto,
     decode_udp_game, encode_udp_game, encode_hello, encode_udp_hello,
     encode_node, encode_udp_node, decode_bcast_from,
     make_reuse_udp, parse_ports, tcp_read, tcp_send,
@@ -71,7 +70,6 @@ class WinClient:
         self.rebroadcast_ip = rebroadcast_ip
         self.rebroadcast_to = rebroadcast_to
         self.disc_bind = disc_bind
-        self.dedup = Dedup()
         self.tcp_writer = None
         self.send_lock = asyncio.Lock()
         # persistent broadcast socket (lazy): one socket for all re-emits,
@@ -131,8 +129,7 @@ class WinClient:
         # Is this snooped packet our own re-emit coming back? Decidable
         # without a cache: our re-emits all leave from one stable source
         # port. The local-IP check keeps a remote game that happens to
-        # share the port number from ever looking like us (then it just
-        # falls through to the relay dedup backstop).
+        # share the port number from ever looking like us.
         try:
             if not self.bcast_port or addr[1] != self.bcast_port:
                 return False
@@ -186,9 +183,6 @@ class WinClient:
             raw, addr = await proto.q.get()
             if self._own_echo(addr):
                 continue
-            key = hashlib.sha256(b"B" + struct.pack("!H", disc_port) + raw).digest()
-            if self.dedup.hit(key):
-                continue
             if self.tcp_writer:
                 try:
                     await self.tcp_send(T_BCAST, struct.pack("!H", disc_port) + raw)
@@ -204,8 +198,6 @@ class WinClient:
                         continue
                     (dport,) = struct.unpack("!H", payload[:2])
                     raw = payload[2:]
-                    if self.dedup.hit(hashlib.sha256(b"B" + payload).digest()):
-                        continue
                     self.rebroadcast(dport, raw)
                 elif mtype == T_BCAST_FROM:
                     # attributed beacon from another node; source faking
@@ -214,8 +206,6 @@ class WinClient:
                     if not dec:
                         continue
                     _node, dport, raw = dec
-                    if self.dedup.hit(hashlib.sha256(b"BF" + payload).digest()):
-                        continue
                     self.rebroadcast(dport, raw)
                 elif mtype == T_TCP_DATA_S2C:
                     sid = struct.unpack("!I", payload[:4])[0]
