@@ -654,6 +654,57 @@ static struct dt_udp *dt_udp_entry(long long s, int create) {
         }
     return NULL;
 }
+/* Event-driven readers (WSAEventSelect family): inbound tunnel data
+ * lands in hook-internal queues, so the real socket never becomes
+ * readable and the app's event would never fire. Track socket->event
+ * associations and signal on every queue insert. Windows-only in
+ * effect (event-driven socket loops); Linux gets stubs so the shared queue
+ * code compiles unchanged. */
+#ifndef LINUX_BUILD
+#define DT_MAXEV 128
+static struct { int used; long long sock; WSAEVENT ev; } g_evmap[DT_MAXEV];
+/* DLOCK must be held (every queue-insert path holds it). */
+static void dt_sig_locked(long long gsock) {
+    int i;
+    for (i = 0; i < DT_MAXEV; i++)
+        if (g_evmap[i].used && g_evmap[i].sock == gsock)
+            (void)WSASetEvent(g_evmap[i].ev);
+}
+static void dt_sock_state_locked(long long gsock, int *data, int *dead) {
+    int i;
+    *data = 0; *dead = 0;
+    for (i = 0; i < DT_MAXUDP; i++)
+        if (g_uq[i].used && !g_uq[i].closed && g_uq[i].gsock == gsock && g_uq[i].h) *data = 1;
+    for (i = 0; i < DT_MAXSTREAM; i++)
+        if (g_st[i].used && g_st[i].gsock == gsock) {
+            if (g_st[i].h) *data = 1;
+            if (g_st[i].dead) *dead = 1;
+        }
+}
+static void dt_sock_state(long long gsock, int *data, int *dead) {
+    DLOCK(); dt_sock_state_locked(gsock, data, dead); DUNLOCK();
+}
+static void dt_ev_unhook_sock(long long sock) {
+    int i;
+    DLOCK();
+    for (i = 0; i < DT_MAXEV; i++)
+        if (g_evmap[i].used && g_evmap[i].sock == sock) g_evmap[i].used = 0;
+    DUNLOCK();
+}
+static void dt_ev_unhook_ev(WSAEVENT ev) {
+    int i;
+    DLOCK();
+    for (i = 0; i < DT_MAXEV; i++)
+        if (g_evmap[i].used && g_evmap[i].ev == ev) g_evmap[i].used = 0;
+    DUNLOCK();
+}
+#else
+static void dt_sig_locked(long long gsock) { (void)gsock; }
+static void dt_sock_state(long long gsock, int *data, int *dead) {
+    (void)gsock; *data = 0; *dead = 0;
+}
+static void dt_ev_unhook_sock(long long sock) { (void)sock; }
+#endif
 static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
                         const struct sockaddr_in *from) {
     DLOCK();
@@ -668,6 +719,7 @@ static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
             d->p = (unsigned char *)malloc(n ? n : 1);
             if (d->p) { if (n) memcpy(d->p, p, n); d->n = n; d->from = *from; d->next = NULL;
                 if (e->t) e->t->next = d; else e->h = d; e->t = d; e->nq++;
+                dt_sig_locked(gsock);
 #ifdef LINUX_BUILD
                 { char lb[128]; snprintf(lb, sizeof(lb), "udp push gsock=%lld nq=%d n=%zu", gsock, e->nq, n); dlog(lb); }
 #else
@@ -797,6 +849,7 @@ static void dt_dispatch_bcast_from(unsigned node, int port,
                     d->p = (unsigned char *)malloc(n ? n : 1);
                     if (d->p) { if (n) memcpy(d->p, raw, n); d->n = n; d->from = fake; d->next = NULL;
                         if (e->t) e->t->next = d; else e->h = d; e->t = d; e->nq++;
+                        dt_sig_locked(gs);
                     } else free(d);
                 }
             }
@@ -816,6 +869,7 @@ static void dt_dispatch_s2c(unsigned sid, const unsigned char *raw, size_t n) {
             c->p = (unsigned char *)malloc(n ? n : 1);
             if (c->p) { if (n) memcpy(c->p, raw, n); c->n = n; c->off = 0; c->next = NULL;
                 if (st->t) st->t->next = c; else st->h = c; st->t = c; st->total += n;
+                dt_sig_locked(st->gsock);
             } else free(c);
         }
     }
@@ -824,7 +878,7 @@ static void dt_dispatch_s2c(unsigned sid, const unsigned char *raw, size_t n) {
 static void dt_dispatch_close(unsigned sid) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sid(sid);
-    if (st) st->dead = 1;
+    if (st) { st->dead = 1; dt_sig_locked(st->gsock); }
     struct dt_hosted *h = dt_hs_by_sid(sid);
     if (h) h->dead = 1;
     DUNLOCK();
@@ -1599,6 +1653,11 @@ static void dt_on_close(long long gsock) {
         struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
+    dt_sig_locked(gsock); /* wake event waiters with CLOSE (noop on Linux) */
+#ifndef LINUX_BUILD
+    for (int i = 0; i < DT_MAXEV; i++)
+        if (g_evmap[i].used && g_evmap[i].sock == gsock) g_evmap[i].used = 0;
+#endif
     DUNLOCK();
     if (sid) { unsigned char b[4]; dt_put32(b, sid); dt_tcp_queue(DT_CLOSE, b, 4); }
 #ifndef LINUX_BUILD
@@ -2038,6 +2097,11 @@ typedef int (WSAAPI *PFN_recv)(SOCKET, char*, int, int);
 typedef int (WSAAPI *PFN_WSASend)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_WSARecv)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_ioctlsocket)(SOCKET, long, u_long*);
+typedef int (WSAAPI *PFN_WSAEventSelect)(SOCKET, WSAEVENT, long);
+typedef int (WSAAPI *PFN_WSAEnumNetworkEvents)(SOCKET, WSAEVENT, LPWSANETWORKEVENTS);
+typedef DWORD (WSAAPI *PFN_WSAWaitForMultipleEvents)(DWORD, const WSAEVENT*, BOOL, DWORD, BOOL);
+typedef WSAEVENT (WSAAPI *PFN_WSACreateEvent)(void);
+typedef BOOL (WSAAPI *PFN_WSACloseEvent)(WSAEVENT);
 typedef FARPROC (WINAPI *PFN_GetProcAddress)(HMODULE, LPCSTR);
 typedef HMODULE (WINAPI *PFN_LoadLibraryA)(LPCSTR);
 typedef HMODULE (WINAPI *PFN_LoadLibraryW)(LPCWSTR);
@@ -2052,6 +2116,11 @@ static PFN_listen p_listen = 0;
 static PFN_send p_send = 0; static PFN_recv p_recv = 0;
 static PFN_WSASend p_WSASend = 0; static PFN_WSARecv p_WSARecv = 0;
 static PFN_ioctlsocket p_ioctlsocket = 0;
+static PFN_WSAEventSelect p_WSAEventSelect = 0;
+static PFN_WSAEnumNetworkEvents p_WSAEnumNetworkEvents = 0;
+static PFN_WSAWaitForMultipleEvents p_WSAWaitForMultipleEvents = 0;
+static PFN_WSACreateEvent p_WSACreateEvent = 0;
+static PFN_WSACloseEvent p_WSACloseEvent = 0;
 static HMODULE g_hself = 0;
 static PFN_GetProcAddress p_GetProcAddress = 0;
 static HMODULE hWS2 = 0, hKernel = 0;
@@ -2266,6 +2335,7 @@ int WSAAPI hk_getpeername(SOCKET s, struct sockaddr *a, int *l) {
 }
 int WSAAPI hk_closesocket(SOCKET s) {
     if (g_direct) dt_on_close((long long)s);
+    else dt_ev_unhook_sock((long long)s);
     return p_closesocket(s);
 }
 int WSAAPI hk_listen(SOCKET s, int backlog) {
@@ -2451,13 +2521,93 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
     }
 }
 
+/* Event-driven waiting (WSAEventSelect family): inbound tunnel data sits
+ * in hook queues, so also drive the app's event objects or event waiters
+ * sleep through arrivals. */
+int WSAAPI hk_WSAEventSelect(SOCKET s, WSAEVENT hEvent, long lNetworkEvents) {
+    int r = p_WSAEventSelect ? p_WSAEventSelect(s, hEvent, lNetworkEvents) : SOCKET_ERROR;
+    if (g_direct) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+    dt_ev_unhook_sock((long long)s);
+    if (r == 0 && hEvent && lNetworkEvents) {
+        int i, done = 0;
+        DLOCK();
+        for (i = 0; i < DT_MAXEV; i++) if (!g_evmap[i].used) {
+            g_evmap[i].used = 1; g_evmap[i].sock = (long long)s;
+            g_evmap[i].ev = hEvent; done = 1; break;
+        }
+        DUNLOCK();
+        if (done) {
+            int data = 0, dead = 0;
+            dt_sock_state((long long)s, &data, &dead);
+            if (data || dead) WSASetEvent(hEvent); /* already waiting */
+        }
+    }
+    return r;
+}
+int WSAAPI hk_WSAEnumNetworkEvents(SOCKET s, WSAEVENT hEventObject,
+                                   LPWSANETWORKEVENTS lpNetworkEvents) {
+    int r = p_WSAEnumNetworkEvents ?
+        p_WSAEnumNetworkEvents(s, hEventObject, lpNetworkEvents) : SOCKET_ERROR;
+    if (g_direct && r == 0 && lpNetworkEvents) {
+        int data = 0, dead = 0;
+        dt_sock_state((long long)s, &data, &dead);
+        if (data) lpNetworkEvents->lNetworkEvents |= FD_READ;
+        if (dead) lpNetworkEvents->lNetworkEvents |= FD_CLOSE;
+        /* real Enum reset the event: re-arm so later waits still fire */
+        if ((data || dead) && hEventObject) WSASetEvent(hEventObject);
+    }
+    return r;
+}
+DWORD WSAAPI hk_WSAWaitForMultipleEvents(DWORD cEvents, const WSAEVENT *lphEvents,
+                                         BOOL fWaitAll, DWORD dwTimeout,
+                                         BOOL fAlertable) {
+    if (g_direct && !fWaitAll && lphEvents && p_WSAWaitForMultipleEvents) {
+        long long budget = (dwTimeout == WSA_INFINITE) ? -1 : (long long)dwTimeout;
+        long long t0 = dt_now_ms(), waited = 0;
+        for (;;) {
+            DWORD i;
+            DLOCK();
+            for (i = 0; i < cEvents; i++) {
+                int j, hit = 0;
+                for (j = 0; j < DT_MAXEV; j++) {
+                    if (!g_evmap[j].used || g_evmap[j].ev != lphEvents[i]) continue;
+                    { int data = 0, dead = 0;
+                      dt_sock_state_locked(g_evmap[j].sock, &data, &dead);
+                      if (data || dead) { hit = 1; break; } }
+                }
+                if (hit) { DUNLOCK(); return WSA_WAIT_EVENT_0 + i; }
+            }
+            DUNLOCK();
+            if (budget >= 0 && waited >= budget) return WSA_WAIT_TIMEOUT;
+            {
+                DWORD slice = 25;
+                DWORD r;
+                if (budget >= 0 && waited + 25 > budget) slice = (DWORD)(budget - waited);
+                r = p_WSAWaitForMultipleEvents(cEvents, lphEvents, FALSE, slice, fAlertable);
+                if (r != WSA_WAIT_TIMEOUT) return r;
+                waited = dt_now_ms() - t0;
+            }
+        }
+    }
+    if (p_WSAWaitForMultipleEvents)
+        return p_WSAWaitForMultipleEvents(cEvents, lphEvents, fWaitAll, dwTimeout, fAlertable);
+    WSASetLastError(WSAENETDOWN);
+    return WSA_WAIT_FAILED;
+}
+WSAEVENT WSAAPI hk_WSACreateEvent(void) {
+    return p_WSACreateEvent ? p_WSACreateEvent() : WSA_INVALID_EVENT;
+}
+BOOL WSAAPI hk_WSACloseEvent(WSAEVENT hEvent) {
+    dt_ev_unhook_ev(hEvent);
+    return p_WSACloseEvent ? p_WSACloseEvent(hEvent) : FALSE;
+}
+
 /* Ordinal imports: MinGW import libs bind ws2_32 (and kernel32) by
- * ordinal, so name-based IAT patching is blind to them. Goldberg's
- * steam_api64.dll imports all of its socket I/O this way (sendto,
- * recvfrom, socket, ...), which hid its discovery traffic entirely.
- * Resolve ordinals through the exporting module's export table. The
- * small cache avoids re-walking; concurrent duplicate inserts are
- * benign (same bytes). */
+ * ordinal, so name-based IAT patching is blind to them (some modules
+ * import all of their socket I/O this way, hiding their traffic
+ * entirely). Resolve ordinals through the exporting module's export
+ * table. The small cache avoids re-walking; concurrent duplicate
+ * inserts are benign (same bytes). */
 #define ORD_MAXMAP 128
 static struct { HMODULE mod; DWORD ord; char name[40]; } g_ordmap[ORD_MAXMAP];
 static int g_ordmap_n = 0;
@@ -2540,6 +2690,11 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"ioctlsocket")) return (FARPROC)hk_ioctlsocket;
             if (!strcmp(n,"select")) return (FARPROC)hk_select;
             if (!strcmp(n,"WSAPoll")) return (FARPROC)hk_WSAPoll;
+            if (!strcmp(n,"WSAEventSelect")) return (FARPROC)hk_WSAEventSelect;
+            if (!strcmp(n,"WSAEnumNetworkEvents")) return (FARPROC)hk_WSAEnumNetworkEvents;
+            if (!strcmp(n,"WSAWaitForMultipleEvents")) return (FARPROC)hk_WSAWaitForMultipleEvents;
+            if (!strcmp(n,"WSACreateEvent")) return (FARPROC)hk_WSACreateEvent;
+            if (!strcmp(n,"WSACloseEvent")) return (FARPROC)hk_WSACloseEvent;
         }
         if (m == hKernel) {
             if (!strcmp(n,"CreateProcessA")) return (FARPROC)hk_CreateProcessA;
@@ -2636,6 +2791,11 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"ioctlsocket")) rep = (FARPROC)hk_ioctlsocket;
                     else if (!strcmp(fn,"select")) rep = (FARPROC)hk_select;
                     else if (!strcmp(fn,"WSAPoll")) rep = (FARPROC)hk_WSAPoll;
+                    else if (!strcmp(fn,"WSAEventSelect")) rep = (FARPROC)hk_WSAEventSelect;
+                    else if (!strcmp(fn,"WSAEnumNetworkEvents")) rep = (FARPROC)hk_WSAEnumNetworkEvents;
+                    else if (!strcmp(fn,"WSAWaitForMultipleEvents")) rep = (FARPROC)hk_WSAWaitForMultipleEvents;
+                    else if (!strcmp(fn,"WSACreateEvent")) rep = (FARPROC)hk_WSACreateEvent;
+                    else if (!strcmp(fn,"WSACloseEvent")) rep = (FARPROC)hk_WSACloseEvent;
                 } else if (isk32 && !strcmp(fn,"GetProcAddress")) {
                     rep = (FARPROC)hk_GetProcAddress;
                 } else if (isk32 && !strcmp(fn,"CreateProcessA")) {
@@ -2975,6 +3135,11 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_WSASend = (PFN_WSASend)GetProcAddress(hWS2, "WSASend");
     p_WSARecv = (PFN_WSARecv)GetProcAddress(hWS2, "WSARecv");
     p_ioctlsocket = (PFN_ioctlsocket)GetProcAddress(hWS2, "ioctlsocket");
+    p_WSAEventSelect = (PFN_WSAEventSelect)GetProcAddress(hWS2, "WSAEventSelect");
+    p_WSAEnumNetworkEvents = (PFN_WSAEnumNetworkEvents)GetProcAddress(hWS2, "WSAEnumNetworkEvents");
+    p_WSAWaitForMultipleEvents = (PFN_WSAWaitForMultipleEvents)GetProcAddress(hWS2, "WSAWaitForMultipleEvents");
+    p_WSACreateEvent = (PFN_WSACreateEvent)GetProcAddress(hWS2, "WSACreateEvent");
+    p_WSACloseEvent = (PFN_WSACloseEvent)GetProcAddress(hWS2, "WSACloseEvent");
     p_GetProcAddress = (PFN_GetProcAddress)GetProcAddress(hKernel, "GetProcAddress");
     p_CreateProcessA = (PFN_CreateProcessA)GetProcAddress(hKernel, "CreateProcessA");
     p_CreateProcessW = (PFN_CreateProcessW)GetProcAddress(hKernel, "CreateProcessW");
