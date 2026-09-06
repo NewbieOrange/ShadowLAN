@@ -165,7 +165,7 @@ class Relay:
             if w is exclude or w.is_closing():
                 continue
             if id(w) not in self.writer_node:
-                continue  # legacy peer: no node table
+                continue  # unregistered peer: no node table
             await self.send_assign(w)
 
     def prune_nodes(self, now=None):
@@ -318,20 +318,16 @@ class Relay:
                     continue
                 role = "host" if self.host_writer is writer else "player"
                 if mtype == T_BCAST:
-                    if len(payload) < 2:
+                    if len(payload) < 4:
                         continue
-                    (dport,) = struct.unpack("!H", payload[:2])
+                    (dport, sport) = struct.unpack("!HH", payload[:4])
+                    raw = payload[4:]
                     if self.disc_ports and dport not in self.disc_ports:
                         continue
                     # Every beacon fans out as-is; echo loops are cut at
                     # the edge and distinct hosts stay visible.
                     self.beaconers[writer] = time.monotonic()
                     src_node = self.writer_node.get(owner, 0)
-                    if len(payload) >= 4:
-                        (sport,) = struct.unpack("!H", payload[2:4])
-                        raw = payload[4:]
-                    else:   # legacy bridge frame: no source port
-                        sport, raw = 0, payload[2:]
                     for w in list(self.players) + ([self.host_writer] if self.host_writer else []):
                         if w is writer or w.is_closing():
                             continue

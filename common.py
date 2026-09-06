@@ -5,7 +5,7 @@ import struct
 
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
-T_BCAST = 0x01        # payload: !H disc_port + raw (legacy, unattributed)
+T_BCAST = 0x01        # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
 T_TCP_OPEN = 0x10     # payload: !I stream_id + !H game_port (implicit route)
 T_TCP_DATA_C2S = 0x11 # payload: !I stream_id + raw
@@ -236,15 +236,12 @@ def encode_bcast_from(node: int, disc_port: int, src_port: int,
 
 
 def decode_bcast_from(payload: bytes):
-    """-> (node, disc_port, src_port, raw); src_port 0 for legacy frames."""
+    """Attributed beacon frame -> (node, disc_port, src_port, raw)."""
     try:
-        if len(payload) < 6:
+        if len(payload) < 8:
             return None
-        node, dport = struct.unpack("!IH", payload[:6])
-        if len(payload) >= 8:
-            (sport,) = struct.unpack("!H", payload[6:8])
-            return node, dport, sport, payload[8:]
-        return node, dport, 0, payload[6:]
+        node, dport, sport = struct.unpack("!IHH", payload[:8])
+        return node, dport, sport, payload[8:]
     except struct.error:
         return None
 

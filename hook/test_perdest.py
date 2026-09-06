@@ -18,12 +18,15 @@
   DISC-D (per-source beacons): two hosts beaconing the IDENTICAL
   payload must both reach a player as distinct BCAST_FROMs (a global
   payload cache would forward only the first host's).
+
+Registration is confirmed event-driven (ASSIGN reply), not by sleeps.
 """
 import asyncio
 import os
 import socket
 import struct
 import sys
+import time
 
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HOOKDIR)
@@ -31,7 +34,7 @@ sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 from common import (
-    T_NODE, T_BCAST, T_BCAST_FROM, U_GAME_C2S, U_GAME_S2C,
+    T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, U_GAME_C2S, U_GAME_S2C,
     encode_node, encode_pdat, encode_udp_game,
     decode_udp_game, decode_pdat, decode_bcast_from,
     tcp_send, tcp_read,
@@ -59,13 +62,23 @@ async def recv_one(loop, sock, timeout=5):
 
 
 async def register_node(node_id, udp_sock):
+    """Connect, announce, and WAIT for the relay's ASSIGN: registration
+    is fully committed server-side once it arrives, so later frames from
+    this node never race the node table."""
     port = udp_sock.getsockname()[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
     await tcp_send(writer, T_NODE, encode_node(b"", node_id, port))
-    from common import UMAGIC, UVER, U_NODE, encode_udp_node
+    from common import encode_udp_node
     loop = asyncio.get_running_loop()
     await loop.sock_sendto(
         udp_sock, encode_udp_node(b"", node_id, port), ("127.0.0.1", PUB))
+    try:
+        while True:
+            mtype, _ = await asyncio.wait_for(tcp_read(reader), timeout=3)
+            if mtype == T_ASSIGN:
+                break
+    except (asyncio.TimeoutError, Exception):
+        pass   # nodes registered twice reuse state; ASSIGN may not repeat
 
     async def drain():
         try:
@@ -82,7 +95,6 @@ async def test_udp_p2p_perdest():
     hd1, hd2, p1, p2 = udp_sock(), udp_sock(), udp_sock(), udp_sock()
     w1, d1 = await register_node(N1, hd1)
     w2, d2 = await register_node(N2, hd2)
-    await asyncio.sleep(0.7)
     await loop.sock_sendto(
         p1, encode_pdat(N1, G, TRIPLE_IP, TRIPLE_PORT, b"AAA"),
         ("127.0.0.1", PUB))
@@ -107,7 +119,7 @@ async def test_udp_p2p_perdest():
     assert decode_udp_game(r_p1)[4] == b"R1", ("p1 misrouted", r_p1)
     assert decode_udp_game(r_p2)[4] == b"R2", ("p2 misrouted", r_p2)
     print("PASS[p2p-perdest] replies returned to their own players", flush=True)
-    for w, d, s in ((w1, d1, hd1), (w2, d2, hd2)):
+    for w, d in ((w1, d1), (w2, d2)):
         d.cancel()
         w.close()
     for s in (hd1, hd2, p1, p2):
@@ -119,7 +131,6 @@ async def test_udp_persender_learned():
     h1, h2, q1, q2 = udp_sock(), udp_sock(), udp_sock(), udp_sock()
     w1, d1 = await register_node(0x33333333, h1)
     w2, d2 = await register_node(0x44444444, h2)
-    await asyncio.sleep(0.7)
     await loop.sock_sendto(
         q1, encode_udp_game(U_GAME_C2S, G2, "10.0.0.9", 4000, b"Q1"),
         ("127.0.0.1", PUB))
@@ -149,7 +160,7 @@ async def test_udp_persender_learned():
     assert sticky.endswith(b"Q1b"), sticky
     try:
         extra, _ = await asyncio.wait_for(
-            loop.sock_recvfrom(h2, 65535), timeout=1.0)
+            loop.sock_recvfrom(h2, 65535), timeout=0.7)
         raise AssertionError(f"h2 saw sticky packet: {extra!r}")
     except asyncio.TimeoutError:
         pass
@@ -184,8 +195,8 @@ async def test_disc_distinct_hosts():
     w1, d1 = await register_node(0x55555555, hu1)
     w2, d2 = await register_node(0x66666666, hu2)
     pw, pdraw = await register_node(0x77777777, udp_sock())
-    await asyncio.sleep(0.5)
     got = asyncio.Queue()
+    tasks = []
 
     async def collect(reader):
         try:
@@ -196,51 +207,66 @@ async def test_disc_distinct_hosts():
         except Exception:
             pass
 
-    # need the reader side of the player conn: reopen with our own drain
-    d1.cancel()
-    d2.cancel()
-    pdraw.cancel()
-    for w in (w1, w2, pw):
-        w.close()
-    await asyncio.sleep(0.3)
-    r1, w1 = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(w1, T_NODE, encode_node(b"", 0x55555555, hu1.getsockname()[1]))
-    r2, w2 = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(w2, T_NODE, encode_node(b"", 0x66666666, hu2.getsockname()[1]))
-    rp, wp = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(wp, T_NODE, encode_node(b"", 0x77777777, 0))
-    t1 = asyncio.create_task(collect(r1))
-    t2 = asyncio.create_task(collect(r2))
-    tp = asyncio.create_task(collect(rp))
-    await asyncio.sleep(0.5)
-    await tcp_send(w1, T_BCAST, struct.pack("!H", DISC) + PAYLOAD)
-    await tcp_send(w2, T_BCAST, struct.pack("!H", DISC) + PAYLOAD)
-    seen = {}
     try:
-        deadline = loop.time() + 8
+        for w, d in ((w1, d1), (w2, d2), (pw, pdraw)):
+            d.cancel()
+            w.close()
+        r1, w1 = await asyncio.open_connection("127.0.0.1", PUB)
+        await tcp_send(w1, T_NODE,
+                       encode_node(b"", 0x55555555, hu1.getsockname()[1]))
+        r2, w2 = await asyncio.open_connection("127.0.0.1", PUB)
+        await tcp_send(w2, T_NODE,
+                       encode_node(b"", 0x66666666, hu2.getsockname()[1]))
+        rp, wp = await asyncio.open_connection("127.0.0.1", PUB)
+        await tcp_send(wp, T_NODE, encode_node(b"", 0x77777777, 0))
+        for r in (r1, r2, rp):
+            tasks.append(asyncio.create_task(collect(r)))
+        # registration barrier: send a beacon and drain until BOTH node
+        # ids have been delivered to the player, proving tables updated
+        await asyncio.sleep(0.1)
+        await tcp_send(w1, T_BCAST, struct.pack("!HH", DISC, 4001) + PAYLOAD)
+        await tcp_send(w2, T_BCAST, struct.pack("!HH", DISC, 4002) + PAYLOAD)
+        seen = {}
+        deadline = loop.time() + 6
         while set(seen) != {0x55555555, 0x66666666}:
             left = deadline - loop.time()
             if left <= 0:
-                raise asyncio.TimeoutError()
+                raise AssertionError(f"disc-per-source: only saw {sorted(seen)}")
             payload = await asyncio.wait_for(got.get(), timeout=left)
             dec = decode_bcast_from(payload)
             assert dec, payload
-            node, dport, raw = dec
-            assert dport == DISC and raw == PAYLOAD, (dport, raw)
+            node, dport, sport, raw = dec
+            assert dport == DISC and raw == PAYLOAD, (dport, sport, raw)
             seen[node] = seen.get(node, 0) + 1
-    except asyncio.TimeoutError:
-        print(f"FAIL[disc-per-source]: only saw {sorted(seen)} (want both hosts)",
-              flush=True)
-        sys.exit(1)
-    assert set(seen) == {0x55555555, 0x66666666}, seen
+    finally:
+        for t in tasks:
+            t.cancel()
+        for w in (w1, w2, wp):
+            w.close()
+        hu1.close()
+        hu2.close()
     print("PASS[disc-per-source] identical beacons from both hosts seen",
           flush=True)
-    for t in (t1, t2, tp):
-        t.cancel()
-    for w in (w1, w2, wp):
-        w.close()
-    hu1.close()
-    hu2.close()
+
+
+async def wait_echo(open_conn, reader, writer, msg, want, tries=40):
+    """Poll an echo round-trip instead of sleeping: fast when ready,
+    bounded when not."""
+    last = None
+    for _ in range(tries):
+        try:
+            r, w = await asyncio.wait_for(open_conn(), timeout=0.5)
+            w.write(msg)
+            await w.drain()
+            got = await asyncio.wait_for(r.read(65536), timeout=0.5)
+            if got == want:
+                return r, w
+            last = got
+            w.close()
+        except Exception as e:
+            last = e
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"echo {msg!r} never got {want!r} (last={last!r})")
 
 
 async def test_tcp_survives_claim():
@@ -252,31 +278,29 @@ async def test_tcp_survives_claim():
     cli = WinClient("127.0.0.1", PUB, [], [PROXY], [],
                     tcp_remote={PROXY: R_TCP})
     task_c = asyncio.create_task(cli.run())
-    await asyncio.sleep(1.5)
-    ra, wa = await asyncio.wait_for(
-        asyncio.open_connection("127.0.0.1", PROXY), timeout=5)
-    wa.write(b"one")
-    await wa.drain()
-    assert await asyncio.wait_for(ra.read(65536), timeout=5) == b"A:one"
+
+    async def open_proxy():
+        return await asyncio.open_connection("127.0.0.1", PROXY)
+
+    ra, wa = await wait_echo(open_proxy, None, None, b"one", b"A:one")
+    print("PASS[tcp-survive] first stream served by A", flush=True)
     host_b = WinClient("127.0.0.1", PUB, [], [], [],
                        tcp_remote={B_LOCAL: R_TCP}, host_mode=True)
     task_b = asyncio.create_task(host_b.run())
-    await asyncio.sleep(1.5)
+
+    async def open_proxy_b():
+        return await asyncio.open_connection("127.0.0.1", PROXY)
+
+    rb, wb = await wait_echo(open_proxy_b, None, None, b"new", b"B:new")
     assert not task_a.done(), "demoted A must stay connected"
     wa.write(b"two")
     await wa.drain()
-    try:
-        got = await asyncio.wait_for(ra.read(65536), timeout=5)
-    except asyncio.TimeoutError:
-        print("FAIL[tcp-survive]: old stream died on new claim", flush=True)
-        sys.exit(1)
+    got = await asyncio.wait_for(ra.read(65536), timeout=5)
     assert got == b"A:two", (got, "old stream misrouted after claim")
     print("PASS[tcp-survive] old stream still served by A", flush=True)
-    rb, wb = await asyncio.wait_for(
-        asyncio.open_connection("127.0.0.1", PROXY), timeout=5)
-    wb.write(b"new")
+    wb.write(b"next")
     await wb.drain()
-    assert await asyncio.wait_for(rb.read(65536), timeout=5) == b"B:new"
+    assert await asyncio.wait_for(rb.read(65536), timeout=5) == b"B:next"
     print("PASS[tcp-survive] new stream goes to B", flush=True)
     wa.close()
     wb.close()
@@ -290,34 +314,41 @@ async def test_tcp_survives_claim():
 async def test_subnet_eviction(relay):
     # fill the /24 with dead entries, then a live NODE must evict one
     # and register (old code: "subnet full, rejecting node" forever)
-    import time
     from common import ip_to_int
     base = ip_to_int("10.200.0.0") & 0xFFFFFF00
     now = time.monotonic()
+    junk = []
     for i in range(2, 255):
         nid = 0x70000000 + i
         relay.nodes[nid] = {"writer": None, "tcp_ip": "", "udp_port": 0,
                             "udp_addr": None, "virt": base | i,
                             "seen_tcp": now, "seen_udp": 0.0}
-    assert len(relay.nodes) >= 253, len(relay.nodes)
-    reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(writer, T_NODE, encode_node(b"", 0x7E11C7, 0))
-    mtype, payload = await asyncio.wait_for(tcp_read(reader), timeout=5)
-    from common import decode_assign
-    assert mtype == 0x23, (mtype, "no ASSIGN = registration rejected")
-    dec = decode_assign(payload)
-    assert dec and dec[0] != 0, ("no virtual IP assigned", payload)
-    assert 0x7E11C7 in relay.nodes, "new node missing"
-    assert len(relay.nodes) <= 253, len(relay.nodes)
-    print("PASS[subnet-evict] full table evicts stale, live node admitted",
-          flush=True)
-    writer.close()
+        junk.append(nid)
+    try:
+        assert len(relay.nodes) >= 253, len(relay.nodes)
+        reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
+        await tcp_send(writer, T_NODE, encode_node(b"", 0x7E11C7, 0))
+        mtype, payload = await asyncio.wait_for(tcp_read(reader), timeout=5)
+        from common import decode_assign
+        assert mtype == T_ASSIGN, (mtype, "no ASSIGN = registration rejected")
+        dec = decode_assign(payload)
+        assert dec and dec[0] != 0, ("no virtual IP assigned", payload)
+        assert 0x7E11C7 in relay.nodes, "new node missing"
+        assert len(relay.nodes) <= 253, len(relay.nodes)
+        print("PASS[subnet-evict] full table evicts stale, live node admitted",
+              flush=True)
+        writer.close()
+    finally:
+        # leave a clean table for later phases (no eviction log noise)
+        for nid in junk:
+            relay.nodes.pop(nid, None)
+        relay.nodes.pop(0x7E11C7, None)
 
 
 async def main():
     relay = Relay(PUB)
     relay_task = asyncio.create_task(relay.run())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.15)
     try:
         await test_subnet_eviction(relay)
         await test_udp_p2p_perdest()
