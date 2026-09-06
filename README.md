@@ -93,6 +93,10 @@ SHADOWLAN_WINEPREFIX=~/.wine python3 hook/test_late.py  # late-loaded plugin DLL
 ## Limits
 
 - IPv4 only; IPv6 passes through untouched
+- Same-machine peers talk over the real local stack (self-addressed
+  traffic is never tunneled); the tunnel carries what would leave the
+  NIC. Keep the relay subnet (default 10.200.0.0/24) clear of any real
+  local interface, or pick another with --subnet.
 - One game per relay port is the supported setup; `--token` is the room key (empty = open relay). Accidental double-claims no longer kill live sessions (new implicit joins follow the newest claim; addressed hook sessions are per-dest isolated).
 - Same-dest UDP with byte-identical LAN triples from two sites still last-writer-wins per dest (logged); the hook sends from its virtual IP so hook nodes don't collide, and `wclient` client ports are usually random ephemerals.
 - No encryption — trusted peers only (or wrap in WireGuard)

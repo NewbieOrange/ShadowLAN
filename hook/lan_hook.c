@@ -621,7 +621,7 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
 #ifdef LINUX_BUILD
     dt_reals();
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 0);
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 1);
     int rs = u ? u->real : -1;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
@@ -630,7 +630,7 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     return 1;
 #else
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 0);
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 1);
     SOCKET rs = u ? u->real : INVALID_SOCKET;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
@@ -1639,10 +1639,51 @@ static void dt_udp_tun_send(const unsigned char *d, size_t n) {
 /* Outbound sendto routing. Returns 1 when consumed: virtual peer IP ->
  * addressed P2P datagram; broadcast -> TCP BCAST frame; other LAN ->
  * UDP GAME datagram. Returns 0 (passthrough) otherwise. */
+/* Same-host shortcut: traffic addressed to this machine (loopback or any
+ * of its own interface addresses) must NOT enter the tunnel. On a real
+ * LAN such packets already loop locally, and several games' discovery
+ * relies on that self-loop (peer-list announcements sent to the local
+ * LAN IP, overlay IPC on 127.0.0.1). Interface list cached ~30s. */
+static int ipv4_is_local(unsigned long net_order) {
+    static unsigned long ips[16];
+    static int n = -1;
+    static long long next = 0;
+    unsigned long h = ntohl(net_order);
+    long long now = dt_now_ms();
+    char host[256];
+    struct addrinfo hints, *res = 0, *rp;
+    int i, hit = 0;
+    if ((h >> 24) == 127) return 1;
+    DLOCK();
+    if (n >= 0 && now < next) {
+        for (i = 0; i < n; i++) if (ips[i] == net_order) { hit = 1; break; }
+        DUNLOCK();
+        return hit;
+    }
+    DUNLOCK();
+    if (gethostname(host, sizeof(host)) != 0) host[0] = 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    if (host[0] && getaddrinfo(host, 0, &hints, &res) == 0) {
+        DLOCK();
+        n = 0;
+        for (rp = res; rp && n < (int)(sizeof(ips) / sizeof(ips[0])); rp = rp->ai_next)
+            if (rp->ai_family == AF_INET && rp->ai_addrlen >= sizeof(struct sockaddr_in))
+                ips[n++] = ((struct sockaddr_in *)rp->ai_addr)->sin_addr.s_addr;
+        next = dt_now_ms() + 30000;
+        for (i = 0; i < n; i++) if (ips[i] == net_order) hit = 1;
+        DUNLOCK();
+        freeaddrinfo(res);
+        return hit;
+    }
+    return 0;
+}
+
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     int game_port = ntohs(dst->sin_port);
+    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host loop stays real */
     {
         char lb[160];
         unsigned long a = 0; memcpy(&a, &dst->sin_addr.s_addr, 4);
@@ -1652,6 +1693,15 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         dlog(lb);
     }
     if (vnode && !ipv4_is_bcast(dst->sin_addr.s_addr)) {
+        if (ntohl(dst->sin_addr.s_addr) == g_myvirt) {
+            /* our own virtual address: loop to our own listeners, exactly
+             * like a NIC's self-echo of locally addressed traffic */
+            char myip[32];
+            if (dt_src_ip(myip, sizeof(myip)))
+                dt_direct_udp_in(game_port, (const unsigned char *)myip,
+                                 (int)strlen(myip), buf, len);
+            return 1;
+        }
         /* addressed P2P datagram: same slot scheme, dest-prefixed frame */
         DLOCK();
         struct dt_slot *sl = dt_slot_get(gsock, game_port, dst);
@@ -1728,6 +1778,7 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
  * other LAN -> plain OPEN (relay resolves the target). Returns 1 when
  * consumed (fake success; data follows via stream send), else 0. */
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
+    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     if (vnode) {
         /* addressed P2P stream */
