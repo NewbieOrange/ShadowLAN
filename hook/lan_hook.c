@@ -34,6 +34,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
+#include <dbghelp.h>
+#include <ctype.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2049,13 +2051,74 @@ static void dbg(const char *m) {
  * Only ever armed on the init thread while patching. */
 static jmp_buf g_seh_jb;
 static volatile LONG g_seh_armed = 0;
+/* Whole-init guard + minidump (see LanHookInit). Inner patch guard wins. */
+static jmp_buf g_init_jb;
+static volatile LONG g_init_armed = 0;
+static EXCEPTION_POINTERS *g_init_ep = NULL;
 static LONG WINAPI seh_filter(EXCEPTION_POINTERS *ep) {
-    if (g_seh_armed &&
-        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        g_seh_armed = 0;
-        longjmp(g_seh_jb, 1);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        if (g_seh_armed) {
+            g_seh_armed = 0;
+            longjmp(g_seh_jb, 1);
+        }
+        if (g_init_armed) {
+            g_init_ep = ep;
+            g_init_armed = 0;
+            longjmp(g_init_jb, 1);
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+/* Eager file log: opened FIRST in LanHookInit (before anything that can
+ * fault) and written unconditionally, so even a crash leaves breadcrumbs.
+ * Falls back to %TEMP%\\lan_hook.log when LAN_HOOK_LOGFILE is unset. */
+static FILE *g_logf = NULL;
+static void flog_open(void) {
+    char path[MAX_PATH];
+    DWORD n;
+    if (g_logf) return;
+    path[0] = 0;
+    n = GetEnvironmentVariableA("LAN_HOOK_LOGFILE", path, sizeof(path));
+    if (n == 0 || n >= sizeof(path)) {
+        char tmp[MAX_PATH];
+        if (GetTempPathA(sizeof(tmp), tmp) == 0) return;
+        snprintf(path, sizeof(path), "%slan_hook.log", tmp);
+        path[sizeof(path) - 1] = 0;
+    }
+    g_logf = fopen(path, "a");
+}
+static void flog(const char *m) {
+    if (!g_logf) flog_open();
+    if (g_logf) { fputs(m, g_logf); fputc('\n', g_logf); fflush(g_logf); }
+}
+static void write_minidump(void) {
+    HMODULE hd = GetModuleHandleA("dbghelp.dll");
+    if (!hd) hd = LoadLibraryA("dbghelp.dll");
+    if (!hd || !g_init_ep) return;
+    {
+        typedef BOOL (WINAPI *PFN_Dump)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+            PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
+            PMINIDUMP_CALLBACK_INFORMATION);
+        PFN_Dump fn = (PFN_Dump)GetProcAddress(hd, "MiniDumpWriteDump");
+        char path[MAX_PATH], full[MAX_PATH + 32];
+        HANDLE f;
+        MINIDUMP_EXCEPTION_INFORMATION ex;
+        if (!fn) return;
+        if (GetTempPathA(sizeof(path), path) == 0) return;
+        snprintf(full, sizeof(full), "%slan_hook_%lu.dmp",
+                 path, (unsigned long)GetCurrentProcessId());
+        full[sizeof(full) - 1] = 0;
+        f = CreateFileA(full, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE) return;
+        ex.ThreadId = GetCurrentThreadId();
+        ex.ExceptionPointers = g_init_ep;
+        ex.ClientPointers = FALSE;
+        fn(GetCurrentProcess(), GetCurrentProcessId(), f, MiniDumpNormal,
+           &ex, NULL, NULL);
+        CloseHandle(f);
+        flog("minidump written (see %TEMP%)");
+    }
 }
 
 /* Direct-tunnel UDP recv multiplex: tunnel queue first, then real socket.
@@ -2377,12 +2440,41 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
     return p_GetProcAddress(m, n);
 }
 
+/* Optional module allowlist (LAN_HOOK_MODULES=a.dll,b.dll): only patch
+ * modules whose file name contains one of these (case-insensitive).
+ * Escape hatch when a specific DLL (overlay, anti-tamper, ...) misbehaves.
+ * Empty = patch everything. */
+static int module_allowed(const char *path) {
+    const char *list = getenv("LAN_HOOK_MODULES");
+    if (!list || !list[0]) return 1;
+    const char *base = strrchr(path, '\\');
+    base = base ? base + 1 : path;
+    const char *slash = strrchr(base, '/');
+    base = slash ? slash + 1 : base;
+    char tmp[1024];
+    strncpy(tmp, list, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    for (char *t = strtok(tmp, ",;"); t; t = strtok(NULL, ",;")) {
+        while (*t == ' ') t++;
+        if (!*t) continue;
+        const char *a = base, *b = t;
+        /* case-insensitive substring */
+        for (; *a; a++) {
+            const char *x = a; const char *y = b;
+            while (*y && tolower((unsigned char)*x) == tolower((unsigned char)*y)) { x++; y++; }
+            if (!*y) return 1;
+        }
+    }
+    return 0;
+}
+
 static void patch_iat_inner(HMODULE mod) {
     if (!mod) return;
     {
         BYTE *base = (BYTE*)mod;
         IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        if (dos->e_lfanew <= 0 || dos->e_lfanew > 1024 * 1024) return;
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
         if (nt->Signature != IMAGE_NT_SIGNATURE) return;
         IMAGE_DATA_DIRECTORY *impdir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -2439,6 +2531,14 @@ static void patch_iat_inner(HMODULE mod) {
 /* Guarded entry points: a bad module is skipped, never fatal. */
 static void patch_iat(HMODULE mod) {
     if (!mod) return;
+    if (mod != g_hself) {
+        char path[MAX_PATH] = {0};
+        if (GetModuleFileNameA(mod, path, sizeof(path) - 1) &&
+            !module_allowed(path)) {
+            dbg("lan_hook: module not in allowlist, skipped\n");
+            return;
+        }
+    }
     if (setjmp(g_seh_jb) != 0) {
         dbg("lan_hook: skipped unreadable module\n");
         return;
@@ -2452,11 +2552,17 @@ static void patch_all(void) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) { patch_iat(GetModuleHandleA(NULL)); return; }
     MODULEENTRY32 me; me.dwSize = sizeof(me);
+    int n = 0;
     /* skip our own module: tunnel threads must call the real Winsock */
     if (Module32First(snap, &me)) do {
-        if (me.hModule != g_hself) patch_iat(me.hModule);
+        if (me.hModule != g_hself) { patch_iat(me.hModule); n++; }
     } while (Module32Next(snap, &me));
     CloseHandle(snap);
+    {
+        char lb[96];
+        snprintf(lb, sizeof(lb), "lan_hook: patched %d modules\n", n);
+        dbg(lb);
+    }
 }
 
 /* LoadLibrary hooks: patch newcomers too. */
@@ -2522,11 +2628,22 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     if (InterlockedCompareExchange(&done, 1, 0) != 0)
         return 0; /* already initialized */
     (void)unused;
+    flog_open();
+    flog("LanHookInit: enter");
     AddVectoredExceptionHandler(1, seh_filter);
+    if (setjmp(g_init_jb) != 0) {
+        /* guarded fault anywhere below: leave a dump, keep game alive */
+        flog("LanHookInit: guarded fault during init");
+        write_minidump();
+        return 2;
+    }
+    g_init_armed = 1;
     if (!g_dcs_init) { InitializeCriticalSection(&g_dcs); g_dcs_init = 1; }
+    flog("LanHookInit: resolving imports");
     hWS2 = GetModuleHandleA("ws2_32.dll");
     if (!hWS2) hWS2 = LoadLibraryA("ws2_32.dll");
     hKernel = GetModuleHandleA("kernel32.dll");
+    dbg("lan_hook: resolving imports\n");
     p_sendto = (PFN_sendto)GetProcAddress(hWS2, "sendto");
     p_recvfrom = (PFN_recvfrom)GetProcAddress(hWS2, "recvfrom");
     p_WSASendTo = (PFN_WSASendTo)GetProcAddress(hWS2, "WSASendTo");
@@ -2547,15 +2664,21 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_LoadLibraryExA = (PFN_LoadLibraryExA)GetProcAddress(hKernel, "LoadLibraryExA");
     p_LoadLibraryExW = (PFN_LoadLibraryExW)GetProcAddress(hKernel, "LoadLibraryExW");
     policy_init();
+    dbg("lan_hook: policy ready\n");
+    flog("LanHookInit: policy ready");
     {
         WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
     }
-    if (g_direct) dt_start();
+    if (g_direct) { dbg("lan_hook: starting tunnel\n"); flog("LanHookInit: starting tunnel"); dt_start(); }
+    dbg("lan_hook: patching modules\n");
+    flog("LanHookInit: patching modules");
     patch_all();
     patch_loader_iat();
     /* late GetProcAddress IAT swap for already-loaded modules */
     patch_all();
     dbg("lan_hook: installed\n");
+    flog("LanHookInit: installed");
+    g_init_armed = 0;
     return 0;
 }
 

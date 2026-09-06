@@ -5,10 +5,10 @@ CFLAGS=-O2 -Wall
 all: lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so
 
 lan_hook64.dll: lan_hook.c lan_hook.def
-	$(CC64) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32
+	$(CC64) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32 -ldbghelp
 
 lan_hook32.dll: lan_hook.c lan_hook.def
-	$(CC32) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32
+	$(CC32) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32 -ldbghelp
 
 injector.exe: injector.c
 	$(CC64) $(CFLAGS) -o $@ $<

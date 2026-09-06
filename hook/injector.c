@@ -130,7 +130,10 @@ int main(int argc, char **argv) {
                     DWORD st = 1;
                     GetExitCodeThread(th2, &st);
                     CloseHandle(th2);
-                    if (st != 0)
+                    if (st == 2)
+                        fprintf(stderr, "warning: LanHookInit hit a guarded fault; "
+                                "see %%TEMP%%\\lan_hook_*.dmp and the hook log\n");
+                    else if (st != 0)
                         fprintf(stderr, "warning: LanHookInit returned %lu\n", st);
                     else
                         printf("hook initialized\n");

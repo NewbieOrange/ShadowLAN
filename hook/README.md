@@ -49,7 +49,40 @@ LD_PRELOAD=./lan_hook.so LAN_HOOK_SERVER=RELAY_IP LAN_HOOK_PORT=47777 LAN_HOOK_T
 
 Env (or injector flags): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default
 `47777`), `LAN_HOOK_TOKEN`, `LAN_HOOK_PORTS` (`4444,27015` to limit hooked
-ports), `LAN_HOOK_DEBUG=1`.
+ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
+`LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these).
+
+## Troubleshooting
+
+**Game crashes or hangs at startup.** Capture a log first (no quotes around
+the path — `set` keeps them as part of the value):
+
+```bat
+set LAN_HOOK_LOGFILE=C:\hook.log
+injector.exe --server RELAY_IP --port 47777 --token SECRET --debug -- lan_hook64.dll game.exe
+```
+
+The tail shows how far init got (`enter` → `resolving imports` →
+`policy ready` → `starting tunnel` → `patching modules` →
+`patched N modules` → `installed`). The file opens first thing in init and
+falls back to `%TEMP%\lan_hook.log` when unset. A guarded fault also drops
+`%TEMP%\lan_hook_<pid>.dmp` (minidump with the exact crash address).
+Common causes:
+
+- Wrong bitness: 32-bit game needs `lan_hook32.dll` (check Task Manager →
+  Details → Platform column).
+- A specific DLL misbehaving: restrict patching with
+  `set LAN_HOOK_MODULES=game.exe,unityplayer.dll` (substring list).
+- Anti-tamper: some titles fault when imports change; the hook skips
+  unreadable modules automatically — the log names them.
+
+**`server=(unset)` in the injector line.** Upgrade `injector.exe`
+(pre-`--token` builds neither parse nor display it). Values shown come
+from the live environment; the game inherits them regardless.
+
+**Nothing happens after inject.** The game may not use LAN sockets at all
+(many "co-op" titles are online-only). Confirm with a Wireshark loopback
+capture: no UDP broadcasts / LAN connects = nothing to tunnel.
 
 ## Limits
 
