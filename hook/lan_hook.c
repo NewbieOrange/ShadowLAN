@@ -2279,6 +2279,28 @@ int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr 
 int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
                         const struct sockaddr *to, int tolen,
                         LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (g_direct && ov && !cr && to && to->sa_family == AF_INET && tolen >= (int)sizeof(struct sockaddr_in)) {
+        /* overlapped send to game destinations: run it through the
+         * tunnel synchronously (we copy, so no lifetime issues),
+         * else true async below */
+        size_t total = 0;
+        DWORD i;
+        for (i = 0; i < nb; i++) total += b[i].len;
+        {
+            unsigned char *tmp = (unsigned char *)malloc(total ? total : 1);
+            if (tmp) {
+                size_t off = 0;
+                for (i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
+                int consumed = dt_on_sendto((long long)s, tmp, total, (const struct sockaddr_in *)to);
+                free(tmp);
+                if (consumed) {
+                    if (sent) *sent = (DWORD)total;
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return 0;
+                }
+            }
+        }
+    }
     if (g_direct && !ov && !cr && to && to->sa_family == AF_INET && tolen >= (int)sizeof(struct sockaddr_in)) {
         /* gather bufs (usually 1) */
         size_t total = 0;
@@ -2297,6 +2319,43 @@ int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flag
 int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD flags,
                           struct sockaddr *from, LPINT fromlen,
                           LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (ov && g_direct && !cr && dt_sock_type((long long)s) == SOCK_DGRAM) {
+        /* overlapped poll: complete synchronously from our queue when
+         * data waits, else hand to the real provider for true async */
+        size_t total = 0;
+        DWORD i;
+        for (i = 0; i < nb; i++) total += b[i].len;
+        if (total > 0 && total <= 65536) {
+            unsigned char *tmp = (unsigned char *)malloc(total);
+            if (tmp) {
+                struct sockaddr_in tfrom; size_t on = 0;
+                int fl = sizeof(tfrom), pr;
+                { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+                pr = dt_udp_pop((long long)s, tmp, total, &tfrom, &on);
+                if (pr == 1) {
+                    size_t off = 0; DWORD k;
+                    for (k = 0; k < nb && off < on; k++) {
+                        size_t n = b[k].len;
+                        if (n > on - off) n = on - off;
+                        memcpy(b[k].buf, tmp + off, n);
+                        off += n;
+                    }
+                    free(tmp);
+                    if (recvd) *recvd = (DWORD)on;
+                    if (flags) *flags = 0;
+                    if (from && fromlen && *fromlen >= (int)sizeof(tfrom)) {
+                        memcpy(from, &tfrom, sizeof(tfrom));
+                        *fromlen = sizeof(tfrom);
+                    }
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return 0;
+                }
+                free(tmp);
+                if (pr == -1) { WSASetLastError(WSAEBADF); return SOCKET_ERROR; }
+            }
+        }
+        return p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, ov, cr);
+    }
     if (ov) return p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, ov, cr);
     if (g_direct && dt_sock_type((long long)s) == SOCK_DGRAM && nb == 1) {
         int fl = fromlen ? *fromlen : 0;
@@ -2380,6 +2439,29 @@ int WSAAPI hk_recv(SOCKET s, char *buf, int len, int flags) {
 }
 int WSAAPI hk_WSASend(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
                       LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (g_direct && ov && !cr) {
+        /* overlapped TCP send into our stream: synchronous, then
+         * signal like a completed operation, else true async below */
+        size_t total = 0;
+        DWORD i;
+        for (i = 0; i < nb; i++) total += b[i].len;
+        {
+            unsigned char *tmp = (unsigned char *)malloc(total ? total : 1);
+            if (tmp) {
+                size_t off = 0;
+                for (i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
+                int r = dt_stream_send((long long)s, tmp, total);
+                free(tmp);
+                if (r > 0) {
+                    if (sent) *sent = (DWORD)r;
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return 0;
+                }
+                if (r < 0) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+            }
+        }
+        return p_WSASend(s, b, nb, sent, flags, ov, cr);
+    }
     if (g_direct && !ov && !cr) {
         size_t total = 0;
         for (DWORD i = 0; i < nb; i++) total += b[i].len;
@@ -2397,6 +2479,41 @@ int WSAAPI hk_WSASend(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
 }
 int WSAAPI hk_WSARecv(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD flags,
                       LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (g_direct && ov && !cr) {
+        /* overlapped poll: single non-blocking pop from our stream,
+         * else true async below */
+        size_t total = 0;
+        DWORD i;
+        for (i = 0; i < nb; i++) total += b[i].len;
+        if (total > 0 && total <= 65536) {
+            unsigned char *tmp = (unsigned char *)malloc(total);
+            if (tmp) {
+                size_t on = 0;
+                int r = dt_tcp_wait((long long)s, tmp, total, &on, 0, 1);
+                if (r == 1) {
+                    size_t off = 0; DWORD k;
+                    for (k = 0; k < nb && off < on; k++) {
+                        size_t n = b[k].len;
+                        if (n > on - off) n = on - off;
+                        memcpy(b[k].buf, tmp + off, n);
+                        off += n;
+                    }
+                    free(tmp);
+                    if (recvd) *recvd = (DWORD)on;
+                    if (flags) *flags = 0;
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return 0;
+                }
+                free(tmp);
+                if (r == -1) {
+                    if (recvd) *recvd = 0;
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return 0;
+                }
+            }
+        }
+        return p_WSARecv(s, b, nb, recvd, flags, ov, cr);
+    }
     if (g_direct && !ov && !cr && nb == 1) {
         int nbk = dt_is_nonblock((long long)s);
         int tmo = dt_rcvtimeo_ms((long long)s);
