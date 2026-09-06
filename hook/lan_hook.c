@@ -34,6 +34,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -214,6 +215,16 @@ static void dlog(const char *m) {
     OutputDebugStringA("lan_hook: ");
     OutputDebugStringA(m);
     OutputDebugStringA("\n");
+    {
+        static FILE *lf = NULL;
+        static int tried = 0;
+        if (!tried) {
+            tried = 1;
+            const char *p = getenv("LAN_HOOK_LOGFILE");
+            if (p && p[0]) lf = fopen(p, "a");
+        }
+        if (lf) { fputs("lan_hook: ", lf); fputs(m, lf); fputc('\n', lf); fflush(lf); }
+    }
 #endif
 }
 static void dt_put32(unsigned char *b, unsigned v) {
@@ -2018,6 +2029,33 @@ static HMODULE hWS2 = 0, hKernel = 0;
 static void dbg(const char *m) {
     if (!g_debug) return;
     OutputDebugStringA(m);
+    /* Optional log file (LAN_HOOK_LOGFILE=path): the only way to see
+     * progress when DebugView is unavailable. Opened lazily, appended. */
+    {
+        static FILE *lf = NULL;
+        static int tried = 0;
+        if (!tried) {
+            tried = 1;
+            const char *p = getenv("LAN_HOOK_LOGFILE");
+            if (p && p[0]) lf = fopen(p, "a");
+        }
+        if (lf) { fputs(m, lf); fflush(lf); }
+    }
+}
+
+/* Crash guard for PE walking (packed/protected game binaries, odd modules).
+ * mingw has no __try/__except, so: a vectored handler longjmps out of an
+ * access violation back to the guarded region, which skips that module.
+ * Only ever armed on the init thread while patching. */
+static jmp_buf g_seh_jb;
+static volatile LONG g_seh_armed = 0;
+static LONG WINAPI seh_filter(EXCEPTION_POINTERS *ep) {
+    if (g_seh_armed &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        g_seh_armed = 0;
+        longjmp(g_seh_jb, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* Direct-tunnel UDP recv multiplex: tunnel queue first, then real socket.
@@ -2339,7 +2377,7 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
     return p_GetProcAddress(m, n);
 }
 
-static void patch_iat(HMODULE mod) {
+static void patch_iat_inner(HMODULE mod) {
     if (!mod) return;
     {
         BYTE *base = (BYTE*)mod;
@@ -2398,6 +2436,18 @@ static void patch_iat(HMODULE mod) {
     }
 }
 
+/* Guarded entry points: a bad module is skipped, never fatal. */
+static void patch_iat(HMODULE mod) {
+    if (!mod) return;
+    if (setjmp(g_seh_jb) != 0) {
+        dbg("lan_hook: skipped unreadable module\n");
+        return;
+    }
+    g_seh_armed = 1;
+    patch_iat_inner(mod);
+    g_seh_armed = 0;
+}
+
 static void patch_all(void) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) { patch_iat(GetModuleHandleA(NULL)); return; }
@@ -2417,7 +2467,7 @@ HMODULE WINAPI hk_LoadLibraryW(LPCWSTR n) { HMODULE h = p_LoadLibraryW(n); if (h
 HMODULE WINAPI hk_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExA(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
 HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExW(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
 
-static void patch_loader_iat(void) {
+static void patch_loader_iat_inner(void) {
     /* patch kernel32 LoadLibrary imports in exe so future DLLs get hooked */
     HMODULE exe = GetModuleHandleA(NULL);
     BYTE *base = (BYTE*)exe;
@@ -2453,9 +2503,27 @@ static void patch_loader_iat(void) {
     }
 }
 
-static DWORD WINAPI installer(LPVOID unused) {
+static void patch_loader_iat(void) {
+    if (setjmp(g_seh_jb) != 0) {
+        dbg("lan_hook: skipped unreadable exe imports\n");
+        return;
+    }
+    g_seh_armed = 1;
+    patch_loader_iat_inner();
+    g_seh_armed = 0;
+}
+
+/* Two-stage init: DllMain does nothing but record our handle (running
+ * under the loader lock is no place for threads or patching). The
+ * injector calls LanHookInit on a normal remote thread after
+ * LoadLibrary succeeds. Returns 0 on success. */
+__declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
+    static volatile LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0)
+        return 0; /* already initialized */
     (void)unused;
-    Sleep(50);
+    AddVectoredExceptionHandler(1, seh_filter);
+    if (!g_dcs_init) { InitializeCriticalSection(&g_dcs); g_dcs_init = 1; }
     hWS2 = GetModuleHandleA("ws2_32.dll");
     if (!hWS2) hWS2 = LoadLibraryA("ws2_32.dll");
     hKernel = GetModuleHandleA("kernel32.dll");
@@ -2496,9 +2564,6 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID r) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hself = h;
         DisableThreadLibraryCalls(h);
-        if (!g_dcs_init) { InitializeCriticalSection(&g_dcs); g_dcs_init = 1; }
-        HANDLE t = CreateThread(NULL, 0, installer, NULL, 0, NULL);
-        if (t) CloseHandle(t);
     }
     return TRUE;
 }

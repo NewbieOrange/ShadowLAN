@@ -4,11 +4,11 @@ CFLAGS=-O2 -Wall
 
 all: lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so
 
-lan_hook64.dll: lan_hook.c
-	$(CC64) -shared $(CFLAGS) -o $@ $< -lws2_32
+lan_hook64.dll: lan_hook.c lan_hook.def
+	$(CC64) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32
 
-lan_hook32.dll: lan_hook.c
-	$(CC32) -shared $(CFLAGS) -o $@ $< -lws2_32
+lan_hook32.dll: lan_hook.c lan_hook.def
+	$(CC32) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32
 
 injector.exe: injector.c
 	$(CC64) $(CFLAGS) -o $@ $<

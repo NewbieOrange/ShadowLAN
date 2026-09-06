@@ -17,6 +17,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -109,11 +110,49 @@ int main(int argc, char **argv) {
     DWORD code = 0; GetExitCodeThread(th, &code);
     CloseHandle(th); VirtualFreeEx(pi.hProcess, mem, 0, MEM_RELEASE);
     if (!code) { fprintf(stderr, "remote LoadLibrary failed\n"); TerminateProcess(pi.hProcess, 1); return 1; }
+    /* Stage 2: run LanHookInit on a normal remote thread (outside the
+     * loader lock). Resolve it via RVA so ASLR doesn't matter. */
+    {
+        HMODULE local = LoadLibraryA(dllfull);
+        if (local) {
+            FARPROC localInit = GetProcAddress(local, "LanHookInit");
+            if (localInit) {
+                uintptr_t rva = (uintptr_t)localInit - (uintptr_t)local;
+                LPTHREAD_START_ROUTINE rInit =
+                    (LPTHREAD_START_ROUTINE)((uintptr_t)code + rva);
+                HANDLE th2 = CreateRemoteThread(pi.hProcess, NULL, 0, rInit,
+                                                NULL, 0, NULL);
+                if (!th2) {
+                    fprintf(stderr, "warning: LanHookInit remote thread failed %lu (hook loaded but idle)\n",
+                            GetLastError());
+                } else {
+                    WaitForSingleObject(th2, INFINITE);
+                    DWORD st = 1;
+                    GetExitCodeThread(th2, &st);
+                    CloseHandle(th2);
+                    if (st != 0)
+                        fprintf(stderr, "warning: LanHookInit returned %lu\n", st);
+                    else
+                        printf("hook initialized\n");
+                }
+            } else {
+                fprintf(stderr, "warning: old DLL without LanHookInit (hook loaded but idle)\n");
+            }
+            FreeLibrary(local);
+        }
+    }
     ResumeThread(pi.hThread);
-    printf("injected %s -> pid %lu server=%s port=%s token=%s\n", dllfull, (unsigned long)pi.dwProcessId,
-           getenv("LAN_HOOK_SERVER") ? getenv("LAN_HOOK_SERVER") : "(unset)",
-           getenv("LAN_HOOK_PORT") ? getenv("LAN_HOOK_PORT") : "47777",
-           getenv("LAN_HOOK_TOKEN") ? "set" : "(unset)");
+    {
+        /* NOTE: getenv() is stale under mingw/msvcrt (startup snapshot),
+         * so read the live OS environment for display. The child always
+         * inherits the values set above regardless. */
+        char srv[256] = "(unset)", prt[32] = "47777", tok[16] = "(unset)";
+        if (GetEnvironmentVariableA("LAN_HOOK_SERVER", srv, sizeof(srv)) == 0) strcpy(srv, "(unset)");
+        if (GetEnvironmentVariableA("LAN_HOOK_PORT", prt, sizeof(prt)) == 0) strcpy(prt, "47777");
+        if (GetEnvironmentVariableA("LAN_HOOK_TOKEN", tok, sizeof(tok)) != 0) strcpy(tok, "set");
+        printf("injected %s -> pid %lu server=%s port=%s token=%s\n",
+               dllfull, (unsigned long)pi.dwProcessId, srv, prt, tok);
+    }
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return 0;
 }
