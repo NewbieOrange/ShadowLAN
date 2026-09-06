@@ -38,8 +38,14 @@ __declspec(dllexport) void run(int query_port, int answer_port) {
         int fl = sizeof(from);
         int n = recvfrom(s, buf, sizeof(buf) - 32, 0, (struct sockaddr *)&from, &fl);
         if (n > 0) {
-            int m = sprintf(buf, "PLUGINLOBBY answer %d", i);
+            /* lobby tools answer queries BOTH ways: broadcast on the
+             * answer port and a unicast reply to the querier's source
+             * endpoint (the unicast arrives with no prior session at the
+             * target: exercises the direct-delivery fallback) */
+            int m = sprintf(buf, "PLUGINLOBBY bcast %d", i);
             sendto(s, buf, m, 0, (struct sockaddr *)&to, sizeof(to));
+            m = sprintf(buf, "PLUGINLOBBY ucast %d", i);
+            sendto(s, buf, m, 0, (struct sockaddr *)&from, fl);
         } else {
             Sleep(25);
         }

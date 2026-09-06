@@ -1,8 +1,9 @@
 /* Harness for late-loaded module patching.
  *   test_late.exe host   : sleeps, LoadLibraryW(test_lateplug.dll), run()
  *   test_late.exe client : broadcasts queries on 45711, listens 45712
- * Client must print GOT-PLUG + LATE_OK when the plugin (loaded long after
- * hook install) received the query through the tunnel and answered. */
+ * Client must print GOT-BCAST + GOT-UCAST and LATE_OK when the plugin
+ * (loaded long after hook install) received the query through the tunnel
+ * and answered both ways. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
@@ -82,7 +83,8 @@ int main(int argc, char **argv) {
     memset(&qb, 0, sizeof(qb));
     qb.sin_family = AF_INET;
     qb.sin_addr.s_addr = INADDR_ANY;
-    qb.sin_port = 0; /* ephemeral: the plugin owns the query port here */
+    qb.sin_port = htons((unsigned short)qport); /* like a real lobby tool */
+    setsockopt(q, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
     if (bind(q, (struct sockaddr *)&qb, sizeof(qb))) { printf("qbind fail %d\n", WSAGetLastError()); return 1; }
     ioctlsocket(q, FIONBIO, &nb);
     setsockopt(q, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
@@ -91,7 +93,7 @@ int main(int argc, char **argv) {
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = INADDR_BROADCAST;
     dst.sin_port = htons((unsigned short)qport);
-    int got = 0;
+    int got = 0, got_b = 0, got_u = 0;
     for (int i = 0; i < 300 && !got; i++) {
         sendto(q, "PLUGINQUERY", 11, 0, (struct sockaddr *)&dst, sizeof(dst));
         if (xport) {
@@ -106,9 +108,17 @@ int main(int argc, char **argv) {
             int n = recvfrom(a, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
             if (n > 0) {
                 buf[n] = 0;
-                printf("GOT-PLUG %s from %s\n", buf, inet_ntoa(from.sin_addr));
-                got = 1;
+                printf("GOT-BCAST %s from %s\n", buf, inet_ntoa(from.sin_addr));
+                got_b = 1;
             }
+            fl = sizeof(from);
+            n = recvfrom(q, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+            if (n > 0) {
+                buf[n] = 0;
+                printf("GOT-UCAST %s from %s\n", buf, inet_ntoa(from.sin_addr));
+                got_u = 1;
+            }
+            got = got_b && got_u;
             Sleep(50);
         }
         Sleep(200);

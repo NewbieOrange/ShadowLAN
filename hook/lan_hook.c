@@ -238,6 +238,7 @@ static void dt_put16(unsigned char *b, unsigned v) { b[0] = (v >> 8) & 255; b[1]
 static unsigned dt_get16(const unsigned char *b) { return ((unsigned)b[0] << 8) | b[1]; }
 
 /* live socket introspection (no extra hooks needed except Win nonblock) */
+static void dt_sig_locked(long long gsock);
 static int dt_bound_port(long long gsock) {
     struct sockaddr_in a;
 #ifdef LINUX_BUILD
@@ -601,15 +602,15 @@ static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
 }
 /* Inbound game datagram for OUR hosted game -> real loopback socket.
  * Caller: UDP tunnel thread. Locking: takes DLOCK internally. */
-static void dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
-                             int cport, const unsigned char *raw, size_t rl) {
+static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
+                            int cport, const unsigned char *raw, size_t rl) {
     char ipstr[64];
-    if (iplen <= 0 || iplen >= (int)sizeof(ipstr) || rl > 65000) return;
+    if (iplen <= 0 || iplen >= (int)sizeof(ipstr) || rl > 65000) return 0;
     memcpy(ipstr, ipb, (size_t)iplen); ipstr[iplen] = 0;
     struct sockaddr_in cli; memset(&cli, 0, sizeof(cli));
     cli.sin_family = AF_INET; cli.sin_port = htons((unsigned short)cport);
     cli.sin_addr.s_addr = inet_addr(ipstr);
-    if (cli.sin_addr.s_addr == INADDR_NONE) return;
+    if (cli.sin_addr.s_addr == INADDR_NONE) return 0;
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)game_port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -620,17 +621,60 @@ static void dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     int rs = u ? u->real : -1;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
-    if (!u) return;
+    if (!u || rs < 0) return 0;
     r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+    return 1;
 #else
     DLOCK();
     struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli);
     SOCKET rs = u ? u->real : INVALID_SOCKET;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
-    if (!u || rs == INVALID_SOCKET) return;
+    if (!u || rs == INVALID_SOCKET) return 0;
     sendto(rs, (const char *)raw, (int)rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+    return 1;
 #endif
+}
+/* Addressed datagram with no hosted session on this side: the first packet
+ * of a unicast exchange (e.g. a lobby answer that unicast-replies to a
+ * broadcast query - the querier only ever broadcast, so no session triple
+ * exists). Deliver to every datagram socket that appears to listen on the
+ * game port (bound, or aliased via shared-port emulation), the way a real
+ * NIC would. from = sender's address on that same port. */
+static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
+                             const unsigned char *raw, size_t rl) {
+    char ipstr[64];
+    if (iplen <= 0 || iplen >= (int)sizeof(ipstr) || rl > 65000) return;
+    memcpy(ipstr, ipb, (size_t)iplen); ipstr[iplen] = 0;
+    struct sockaddr_in from; memset(&from, 0, sizeof(from));
+    from.sin_family = AF_INET;
+    from.sin_addr.s_addr = inet_addr(ipstr);
+    from.sin_port = htons((unsigned short)game_port);
+    if (from.sin_addr.s_addr == INADDR_NONE) return;
+    DLOCK();
+    for (int i = 0; i < DT_MAXUDP; i++) {
+        if (!g_uq[i].used || g_uq[i].closed) continue;
+        long long gs = g_uq[i].gsock;
+        int aliased = g_uq[i].vport;
+        DUNLOCK();
+        int bp = aliased ? aliased : dt_bound_port(gs);
+        int dg = dt_sock_type(gs) == SOCK_DGRAM;
+        DLOCK();
+        struct dt_udp *e = &g_uq[i];
+        if (!e->used || e->closed || !dg || bp != game_port) continue;
+        if (e->nq >= DT_MAXQ) continue;
+        struct dt_dgram *d = (struct dt_dgram *)malloc(sizeof(*d));
+        if (!d) continue;
+        d->p = (unsigned char *)malloc(rl ? rl : 1);
+        if (!d->p) { free(d); continue; }
+        if (rl) memcpy(d->p, raw, rl);
+        d->n = rl; d->from = from; d->next = NULL;
+        if (e->t) e->t->next = d; else e->h = d;
+        e->t = d; e->nq++;
+        dt_sig_locked(gs);
+        { char lb[96]; snprintf(lb, sizeof(lb), "udp direct sock=%lld n=%d", gs, (int)rl); dlog(lb); }
+    }
+    DUNLOCK();
 }
 static struct dt_stream *dt_stream_by_sock(long long s) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
@@ -1294,8 +1338,10 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
             int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
             if (8 + il2 + 2 > n) continue;
             int cport2 = dt_get16(buf + 8 + il2);
-            dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
-                             buf + 10 + il2, (size_t)(n - 10 - il2));
+            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
+                                  buf + 10 + il2, (size_t)(n - 10 - il2)))
+                dt_direct_udp_in(gp2, buf + 8, il2,
+                                 buf + 10 + il2, (size_t)(n - 10 - il2));
             continue;
         }
         if (buf[3] != DU_S2C) continue;
@@ -1352,8 +1398,10 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
             int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
             if (8 + il2 + 2 > n) continue;
             int cport2 = dt_get16(buf + 8 + il2);
-            dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
-                             buf + 10 + il2, (size_t)(n - 10 - il2));
+            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
+                                  buf + 10 + il2, (size_t)(n - 10 - il2)))
+                dt_direct_udp_in(gp2, buf + 8, il2,
+                                 buf + 10 + il2, (size_t)(n - 10 - il2));
             continue;
         }
         if (buf[3] != DU_S2C) continue;

@@ -30,7 +30,9 @@ plugin DLLs loaded long after install (game engines do this) are hooked.
 Shared UDP discovery ports are emulated: if a bind fails because another
 local socket owns the port, the hook binds ephemerally and aliases the
 socket to the requested port, matching `SO_REUSEADDR` broadcast semantics.
-Method: IAT patch, no asm blobs.
+Addressed datagrams with no prior session (a unicast reply to a broadcast
+query, a first join packet) are delivered to every socket listening on
+that game port, as a real NIC would. Method: IAT patch, no asm blobs.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
