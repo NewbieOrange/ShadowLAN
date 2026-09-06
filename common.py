@@ -5,6 +5,8 @@ import struct
 
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
+VERSION = "1.0.0"
+
 T_BCAST = 0x01        # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
 T_TCP_OPEN = 0x10     # payload: !I stream_id + !H game_port (implicit route)

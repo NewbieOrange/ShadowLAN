@@ -47,6 +47,7 @@
 /* ---------- shared policy ---------- */
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
+#define SHADOWLAN_VERSION "1.0.0"
 static int g_debug = 0;
 /* direct-tunnel mode: hook dials server itself (no wclient.py needed) */
 static char g_server[256] = {0};
@@ -514,20 +515,6 @@ static struct dt_hosted *dt_hs_by_sid(unsigned sid) {
         if (g_hs[i].used && g_hs[i].sid == sid) return &g_hs[i];
     return NULL;
 }
-static void dt_hs_push(unsigned sid, const unsigned char *p, size_t n) {
-    DLOCK();
-    struct dt_hosted *h = dt_hs_by_sid(sid);
-    if (h && !h->dead) {
-        struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
-        if (c) {
-            c->p = (unsigned char *)malloc(n ? n : 1);
-            if (c->p) { if (n) memcpy(c->p, p, n); c->n = n; c->off = 0; c->next = NULL;
-                if (h->t) h->t->next = c; else h->h = c; h->t = c;
-            } else free(c);
-        }
-    }
-    DUNLOCK();
-}
 static void dt_hs_close(unsigned sid, int notify) {
     struct dt_hosted hcp; int have = 0;
     DLOCK();
@@ -708,6 +695,7 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         dlog(lb);
     }
 }
+#ifndef LINUX_BUILD
 /* Passive wire observation (indirect/no-relay mode + debug): log real
  * send/recv frames so a working unhooked session can be compared
  * byte-for-byte against a tunneled one. Never alters behavior. */
@@ -726,6 +714,7 @@ static void dt_obsv(const char *dir, long long s, const struct sockaddr *a,
         hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", p[qi]);
     dlog(lb);
 }
+#endif
 static struct dt_stream *dt_stream_by_sock(long long s) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
         if (g_st[i].used && g_st[i].gsock == s) return &g_st[i];
@@ -795,10 +784,6 @@ static void dt_ev_unhook_ev(WSAEVENT ev) {
 }
 #else
 static void dt_sig_locked(long long gsock) { (void)gsock; }
-static void dt_sock_state(long long gsock, int *data, int *dead) {
-    (void)gsock; *data = 0; *dead = 0;
-}
-static void dt_ev_unhook_sock(long long sock) { (void)sock; }
 #endif
 static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
                         const struct sockaddr_in *from) {
@@ -2063,7 +2048,9 @@ static int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen,
 /* ================= Linux LD_PRELOAD test build ================= */
 static void ensure_init(void) {
     static int done = 0;
-    if (!done) { done = 1; policy_init(); if (g_direct) dt_start(); }
+    if (!done) { done = 1;
+        dlog("ShadowLAN hook v" SHADOWLAN_VERSION " init");
+        policy_init(); if (g_direct) dt_start(); }
 }
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest, socklen_t addrlen) {
@@ -3949,6 +3936,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
         if (t) CloseHandle(t);
     }
     dbg("lan_hook: installed\n");
+    flog("LanHookInit: ShadowLAN hook v" SHADOWLAN_VERSION);
     flog("LanHookInit: build " __DATE__ " " __TIME__);
     flog("LanHookInit: installed");
     g_init_armed = 0;

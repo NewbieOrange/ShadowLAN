@@ -12,7 +12,7 @@ Play broadcast-only LAN co-op games online, on Windows **and** Linux. One dedica
 
 1. Each node registers with the relay (`NODE` + token room) and gets a stable virtual IP.
 2. Discovery broadcasts fan out with sender identity; games see distinct servers at distinct IPs.
-3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node (per-dest flows, so identical LAN triples to different hosts don't collide); legacy traffic falls back to designated-host → beaconer → per-sender sticky-replier routing. A new host claim only steers NEW implicit joins — live streams keep flowing to their original targets.
+3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node (per-dest flows, so identical LAN triples to different hosts don't collide); implicit (unaddressed) traffic falls back to designated-host → beaconer → per-sender sticky-replier routing. A new host claim only steers NEW implicit joins — live streams keep flowing to their original targets.
 4. The hosting node bridges tunnel traffic to its local game at `127.0.0.1` — via `wclient --host`, or the hook, which auto-claims when the game calls `listen()`.
 
 ## Quickstart

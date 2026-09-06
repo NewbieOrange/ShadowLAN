@@ -6,7 +6,7 @@ Listens on ONE public port number for both protocols:
   UDP 0.0.0.0:P  -> game-UDP datagrams (low latency, stays UDP)
 
 No TUN/TAP, no virtual NIC, no driver. Any peer can host: the relay
-routes addressed (virtual-IP) and legacy traffic between peers grouped
+routes addressed (virtual-IP) and implicit (unaddressed) traffic between peers grouped
 by --token, and assigns each node a virtual LAN IP (default 10.200.0.0/24).
 """
 import argparse
@@ -16,6 +16,7 @@ import struct
 import time
 
 from common import (
+    VERSION,
     T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
     T_TCP_CLOSE, T_HELLO, T_NODE, T_ASSIGN, T_POPEN,
     U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_HELLO_HOST, U_NODE, UMAGIC, UVER,
@@ -79,7 +80,7 @@ class Relay:
         self.learned = {}
         # Per-dest flows: (dest_tag, game_port, cli_ip, cli_port) ->
         # [player_addr, seen]. dest_tag is ('n', dest_node) for addressed
-        # P2P or ('a', ip, port) for legacy fan-out. Scoping by dest means
+        # P2P or ('a', ip, port) for address-scope fan-out. Scoping by dest means
         # identical LAN triples (192.168.x.x, hook 127.0.0.1:5000x) to
         # different hosts no longer collide; same-dest collisions still
         # log and last-writer-wins (fix senders to use unique triples -
@@ -675,7 +676,7 @@ class Relay:
         asyncio.create_task(self.udp_consume(pproto))
         srv = await asyncio.start_server(self.handle_peer, "0.0.0.0", self.port)
         print(f"[tcp] relay 0.0.0.0:{self.port}", flush=True)
-        print(f"[up] relay port={self.port} "
+        print(f"[up] relay v{VERSION} port={self.port} "
               f"token={'set' if self.token else 'open'}", flush=True)
         async with srv:
             await srv.serve_forever()
