@@ -50,7 +50,18 @@ LD_PRELOAD=./lan_hook.so LAN_HOOK_SERVER=RELAY_IP LAN_HOOK_PORT=47777 LAN_HOOK_T
 Env (or injector flags): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default
 `47777`), `LAN_HOOK_TOKEN`, `LAN_HOOK_PORTS` (`4444,27015` to limit hooked
 ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
-`LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these).
+`LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these),
+`LAN_HOOK_CHILDREN=lobby.exe,game.exe` (inject only these children, empty =
+all), `LAN_HOOK_NOCHILD=1` (never inject children).
+
+## Sub-processes
+
+Injection follows `CreateProcessA/W`: a hooked launcher that spawns the
+real game (lobby helpers, Steam stubs, …) gets each child suspended,
+injected, initialized and resumed automatically — env included, so the
+room config carries over. Same-bitness only; failures launch unhooked
+rather than breaking the game. (On Linux this is free: `LD_PRELOAD` is
+inherited — covered by a local parent-spawns-sender inheritance test.)
 
 ## Troubleshooting
 

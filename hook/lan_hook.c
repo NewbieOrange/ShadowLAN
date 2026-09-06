@@ -34,6 +34,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <dbghelp.h>
 #include <ctype.h>
 #include <setjmp.h>
@@ -2031,6 +2032,12 @@ static PFN_ioctlsocket p_ioctlsocket = 0;
 static HMODULE g_hself = 0;
 static PFN_GetProcAddress p_GetProcAddress = 0;
 static HMODULE hWS2 = 0, hKernel = 0;
+BOOL WINAPI hk_CreateProcessA(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+                              LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID,
+                              LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+BOOL WINAPI hk_CreateProcessW(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+                              LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID,
+                              LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 
 static void dbg(const char *m) {
     if (!g_debug) return;
@@ -2446,6 +2453,10 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"select")) return (FARPROC)hk_select;
             if (!strcmp(n,"WSAPoll")) return (FARPROC)hk_WSAPoll;
         }
+        if (m == hKernel) {
+            if (!strcmp(n,"CreateProcessA")) return (FARPROC)hk_CreateProcessA;
+            if (!strcmp(n,"CreateProcessW")) return (FARPROC)hk_CreateProcessW;
+        }
     }
     return p_GetProcAddress(m, n);
 }
@@ -2525,6 +2536,10 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"WSAPoll")) rep = (FARPROC)hk_WSAPoll;
                 } else if (isk32 && !strcmp(fn,"GetProcAddress")) {
                     rep = (FARPROC)hk_GetProcAddress;
+                } else if (isk32 && !strcmp(fn,"CreateProcessA")) {
+                    rep = (FARPROC)hk_CreateProcessA;
+                } else if (isk32 && !strcmp(fn,"CreateProcessW")) {
+                    rep = (FARPROC)hk_CreateProcessW;
                 }
                 if (rep) {
                     DWORD old = 0;
@@ -2582,6 +2597,183 @@ HMODULE WINAPI hk_LoadLibraryA(LPCSTR n) { HMODULE h = p_LoadLibraryA(n); if (h 
 HMODULE WINAPI hk_LoadLibraryW(LPCWSTR n) { HMODULE h = p_LoadLibraryW(n); if (h && h != g_hself) patch_iat(h); return h; }
 HMODULE WINAPI hk_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExA(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
 HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExW(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
+
+/* Sub-process hooking: a launcher (lobby_connect, Steam stub, ...) that
+ * spawns the real game gets the hook carried into each child automatically.
+ * Same bitness only (Windows cannot cross-inject); failures fall back to
+ * launching unhooked rather than breaking the game. Filter with
+ * LAN_HOOK_CHILDREN=a.exe,b.exe (substring list, empty = all children);
+ * LAN_HOOK_NOCHILD=1 disables child injection entirely. */
+typedef BOOL (WINAPI *PFN_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR,
+    LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *PFN_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR,
+    LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+static PFN_CreateProcessA p_CreateProcessA = 0;
+static PFN_CreateProcessW p_CreateProcessW = 0;
+
+static int child_wanted(const char *image) {
+    const char *e = getenv("LAN_HOOK_NOCHILD");
+    if (e && e[0] == '1') return 0;
+    e = getenv("LAN_HOOK_CHILDREN");
+    if (!e || !e[0]) return 1;
+    if (!image || !image[0]) return 1;
+    {
+        char tmp[1024];
+        strncpy(tmp, e, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = 0;
+        for (char *t = strtok(tmp, ",;"); t; t = strtok(NULL, ",;")) {
+            while (*t == ' ') t++;
+            if (!*t) continue;
+            const char *a = image;
+            for (; *a; a++) {
+                const char *x = a; const char *y = t;
+                while (*y && tolower((unsigned char)*x) == tolower((unsigned char)*y)) { x++; y++; }
+                if (!*y) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* image path of the child for the name filter (app name, else argv[0]). */
+static void child_image(const char *app, const char *cmd, char *out, size_t n) {
+    const char *src;
+    int quoted = 0;
+    if (!n) return;
+    if (app && app[0]) {
+        strncpy(out, app, n - 1);
+        out[n - 1] = 0;
+        return;
+    }
+    if (!cmd) { out[0] = 0; return; }
+    src = cmd;
+    while (*src == ' ') src++;
+    if (*src == '"') { quoted = 1; src++; }
+    {
+        size_t i = 0;
+        for (; *src && i + 1 < n; src++) {
+            if (quoted ? (*src == '"') : (*src == ' ')) break;
+            out[i++] = *src;
+        }
+        out[i] = 0;
+    }
+}
+
+static void inject_child(PROCESS_INFORMATION *pi) {
+    char dllpath[MAX_PATH] = {0};
+    LPVOID mem;
+    size_t n;
+    HMODULE k;
+    LPTHREAD_START_ROUTINE fn;
+    HANDLE th;
+    DWORD code = 0;
+    if (!GetModuleFileNameA(g_hself, dllpath, sizeof(dllpath) - 1)) return;
+    n = strlen(dllpath) + 1;
+    mem = VirtualAllocEx(pi->hProcess, NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) return;
+    if (!WriteProcessMemory(pi->hProcess, mem, dllpath, n, NULL)) {
+        VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE);
+        return;
+    }
+    k = GetModuleHandleA("kernel32.dll");
+    fn = (LPTHREAD_START_ROUTINE)GetProcAddress(k, "LoadLibraryA");
+    th = CreateRemoteThread(pi->hProcess, NULL, 0, fn, mem, 0, NULL);
+    if (!th) { VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE); return; }
+    if (WaitForSingleObject(th, 30000) != WAIT_OBJECT_0) {
+        dbg("lan_hook: child LoadLibrary timed out, continuing unhooked\n");
+        CloseHandle(th);
+        VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE);
+        return;
+    }
+    GetExitCodeThread(th, &code);
+    CloseHandle(th);
+    VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE);
+    if (!code) {
+        dbg("lan_hook: child LoadLibrary failed (bitness?), continuing unhooked\n");
+        return;
+    }
+    {
+        /* remote base via enumeration (exit codes truncate 64-bit bases) */
+        FARPROC localInit = GetProcAddress(g_hself, "LanHookInit");
+        if (localInit) {
+            HMODULE mods[512];
+            DWORD need = 0;
+            if (EnumProcessModules(pi->hProcess, mods, sizeof(mods), &need)) {
+                DWORD cnt = need / sizeof(HMODULE);
+                DWORD i;
+                if (cnt > 512) cnt = 512;
+                for (i = 0; i < cnt; i++) {
+                    char path[MAX_PATH] = {0};
+                    if (GetModuleFileNameExA(pi->hProcess, mods[i], path, sizeof(path) - 1) &&
+                        _stricmp(path, dllpath) == 0) {
+                        uintptr_t rva = (uintptr_t)localInit - (uintptr_t)g_hself;
+                        LPTHREAD_START_ROUTINE rInit =
+                            (LPTHREAD_START_ROUTINE)((uintptr_t)mods[i] + rva);
+                        HANDLE th2 = CreateRemoteThread(pi->hProcess, NULL, 0, rInit, NULL, 0, NULL);
+                        if (th2) {
+                            DWORD st = 1;
+                            if (WaitForSingleObject(th2, 30000) == WAIT_OBJECT_0)
+                                GetExitCodeThread(th2, &st);
+                            CloseHandle(th2);
+                            if (st != 0) dbg("lan_hook: child init non-zero\n");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    dbg("lan_hook: child injected\n");
+}
+
+BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
+                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags,
+                              LPVOID env, LPCSTR dir, LPSTARTUPINFOA si,
+                              LPPROCESS_INFORMATION pi) {
+    char image[MAX_PATH] = {0};
+    BOOL wantSuspend;
+    BOOL ok;
+    if (!p_CreateProcessA) return FALSE;
+    child_image(app, cmd, image, sizeof(image));
+    if (!child_wanted(image)) {
+        dbg("lan_hook: child not in filter, launching unhooked\n");
+        return p_CreateProcessA(app, cmd, pa, ta, inh, flags, env, dir, si, pi);
+    }
+    wantSuspend = (flags & CREATE_SUSPENDED) != 0;
+    ok = p_CreateProcessA(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
+                          env, dir, si, pi);
+    if (!ok) return FALSE;
+    inject_child(pi);
+    if (!wantSuspend) ResumeThread(pi->hThread);
+    return TRUE;
+}
+
+BOOL WINAPI hk_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
+                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags,
+                              LPVOID env, LPCWSTR dir, LPSTARTUPINFOW si,
+                              LPPROCESS_INFORMATION pi) {
+    char image[MAX_PATH] = {0};
+    char appA[MAX_PATH] = {0}, cmdA[8192] = {0};
+    BOOL wantSuspend;
+    BOOL ok;
+    if (!p_CreateProcessW) return FALSE;
+    if (app) WideCharToMultiByte(CP_UTF8, 0, app, -1, appA, sizeof(appA) - 1, NULL, NULL);
+    if (cmd) WideCharToMultiByte(CP_UTF8, 0, cmd, -1, cmdA, sizeof(cmdA) - 1, NULL, NULL);
+    child_image(app ? appA : NULL, cmd ? cmdA : NULL, image, sizeof(image));
+    if (!child_wanted(image)) {
+        dbg("lan_hook: child not in filter, launching unhooked\n");
+        return p_CreateProcessW(app, cmd, pa, ta, inh, flags, env, dir, si, pi);
+    }
+    wantSuspend = (flags & CREATE_SUSPENDED) != 0;
+    ok = p_CreateProcessW(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
+                          env, dir, si, pi);
+    if (!ok) return FALSE;
+    inject_child(pi);
+    if (!wantSuspend) ResumeThread(pi->hThread);
+    return TRUE;
+}
 
 static void patch_loader_iat_inner(void) {
     /* patch kernel32 LoadLibrary imports in exe so future DLLs get hooked */
@@ -2669,6 +2861,8 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_WSARecv = (PFN_WSARecv)GetProcAddress(hWS2, "WSARecv");
     p_ioctlsocket = (PFN_ioctlsocket)GetProcAddress(hWS2, "ioctlsocket");
     p_GetProcAddress = (PFN_GetProcAddress)GetProcAddress(hKernel, "GetProcAddress");
+    p_CreateProcessA = (PFN_CreateProcessA)GetProcAddress(hKernel, "CreateProcessA");
+    p_CreateProcessW = (PFN_CreateProcessW)GetProcAddress(hKernel, "CreateProcessW");
     p_LoadLibraryA = (PFN_LoadLibraryA)GetProcAddress(hKernel, "LoadLibraryA");
     p_LoadLibraryW = (PFN_LoadLibraryW)GetProcAddress(hKernel, "LoadLibraryW");
     p_LoadLibraryExA = (PFN_LoadLibraryExA)GetProcAddress(hKernel, "LoadLibraryExA");
