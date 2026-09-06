@@ -190,6 +190,10 @@ static struct dt_slot g_sl[DT_MAXSLOT];
 static struct dt_frame *g_sqh = NULL, *g_sqt = NULL;
 static unsigned g_sid = 0;
 static volatile int g_tun_run = 0, g_tun_started = 0, g_tcp_up = 0;
+static volatile int g_have_assign = 0;   /* first ASSIGN (our vnode) seen */
+#ifndef LINUX_BUILD
+static void flog(const char *m);         /* defined below; lease logs use it */
+#endif
 static DTSOCK g_tcp = DTSOCK_BAD, g_udptun = DTSOCK_BAD;
 static int g_tun_conn = 0;
 static void dt_tun_setup(DTSOCK s);
@@ -440,6 +444,7 @@ static void dt_apply_assign(const unsigned char *p, size_t n) {
         }
         DUNLOCK();
     }
+    g_have_assign = 1;
     dlog("assign: membership updated");
 }
 /* Network-order address -> node id (0 = not a known virtual peer). */
@@ -1555,6 +1560,49 @@ static void dt_start(void) {
         if (t) CloseHandle(t);
     }
 #endif
+    /* Lease barrier: LAN titles enumerate their interfaces once, early,
+     * and trust peers only from subnets they see as local; the adapter
+     * shim can only answer if our virtual address already exists when
+     * that enumeration runs. A VPN service gets this ordering from the
+     * kernel (its interface predates the game); we get it by not
+     * finishing initialization until the relay's ASSIGN (our vnode) is
+     * in hand. The injector holds the game suspended through init, so
+     * the title simply starts a few hundred ms later. Bounded: a dead
+     * or overloaded relay must never brick the game. 0 disables. */
+    {
+        /* -1 (default): wait as long as it takes. Launching a game
+         * through ShadowLAN means launching it ON ShadowLAN: install is
+         * not complete until the relay has handed us our address, so
+         * the title's very first interface enumeration already sees it.
+         * LAN_HOOK_LEASE_WAIT=0 skips the wait; N>0 caps at N ms. */
+        long long budget = -1;
+        long long t0, last_warn = 0;
+        const char *wb = getenv("LAN_HOOK_LEASE_WAIT");
+        if (wb && wb[0]) {
+            long long v = atoll(wb);
+            if (v >= 0 && v <= 600000) budget = v;
+        }
+        t0 = dt_now_ms();
+        while (!g_have_assign && g_tun_run) {
+            long long e = dt_now_ms() - t0;
+            if (budget >= 0 && e >= budget) break;
+            if (budget < 0 && e - last_warn >= 5000) {
+                last_warn = e;
+#ifndef LINUX_BUILD
+                flog("LanHookInit: waiting for relay lease...");
+#else
+                dlog("waiting for relay lease...");
+#endif
+            }
+#ifdef LINUX_BUILD
+            usleep(20000);
+#else
+            Sleep(20);
+#endif
+        }
+        dlog(g_have_assign ? "lease acquired before install"
+                           : "lease not yet held; continuing unassigned");
+    }
 }
 
 /* --- hook call-ins: 1 = consumed (tunnel), 0 = passthrough to real --- */
@@ -1793,6 +1841,15 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
             if (getsockname((SOCKET)gsock, (struct sockaddr *)&sn, &sl) == 0)
 #endif
                 sport = ntohs(sn.sin_port);
+            {   /* shared-port alias: the app (and every baseline peer)
+                 * knows this socket by its logical port, not the
+                 * ephemeral one the real stack handed us */
+                int vp = -1;
+                DLOCK();
+                { struct dt_udp *e = dt_udp_entry(gsock, 0); if (e) vp = e->vport; }
+                DUNLOCK();
+                if (vp > 0) sport = vp;
+            }
             dt_put16(p, (unsigned)game_port);
             dt_put16(p + 2, (unsigned)sport);
         }

@@ -60,7 +60,12 @@ Env (or injector flags): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default
 ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
 `LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these),
 `LAN_HOOK_CHILDREN=lobby.exe,game.exe` (inject only these children, empty =
-all), `LAN_HOOK_NOCHILD=1` (never inject children).
+all), `LAN_HOOK_NOCHILD=1` (never inject children),
+`LAN_HOOK_TUNNEL_PORT=47584` (bind the tunnel UDP socket to that port too,
+so host-firewall program rules earned by the game also cover the tunnel;
+one hooked process per machine), `LAN_HOOK_LEASE_WAIT=-1` (game startup
+waits until the relay grants our address lease — installing means
+playing *on* ShadowLAN; `0` skips the wait, `N>0` caps at N ms).
 
 ## Sub-processes
 
