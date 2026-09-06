@@ -689,7 +689,7 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         dt_sig_locked(gs);
         if (g_debug) {
             char lb[320]; int hp = 0;
-            size_t hn = rl < 96 ? rl : 96;
+            size_t hn = rl < 130 ? rl : 130;
             hp = snprintf(lb, sizeof(lb), "udp direct sock=%lld n=%d hex=", gs, (int)rl);
             for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
                 hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", raw[qi]);
@@ -1138,7 +1138,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                 int sport = (int)dt_get16(pl + 7);
                 {
                     char lb[320]; int hp = 0;
-                    size_t hn = ml - 9 < 80 ? ml - 9 : 80;
+                    size_t hn = ml - 9 < 110 ? ml - 9 : 110;
                     hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d sp=%d n=%u hex=",
                                   node, bport, sport, ml - 9);
                     for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
@@ -1718,11 +1718,31 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         return 0;   /* same-host loop stays on the real stack */
     }
     {
-        char lb[160];
+        char lb[224];
         unsigned long a = 0; memcpy(&a, &dst->sin_addr.s_addr, 4);
-        snprintf(lb, sizeof(lb), "on_sendto fd=%lld port=%d addr=%lu.%lu.%lu.%lu vnode=%u",
-                 gsock, game_port, (a & 255), ((a >> 8) & 255), ((a >> 16) & 255),
-                 ((a >> 24) & 255), vnode);
+        {
+            int rp = 0, vp = -1;
+            struct sockaddr_in sn;
+#ifdef LINUX_BUILD
+            socklen_t sl = sizeof(sn);
+            if (getsockname((int)gsock, (struct sockaddr *)&sn, &sl) == 0) rp = ntohs(sn.sin_port);
+#else
+            int sl = sizeof(sn);
+            if (getsockname((SOCKET)gsock, (struct sockaddr *)&sn, &sl) == 0) rp = ntohs(sn.sin_port);
+#endif
+            DLOCK();
+            { struct dt_udp *e = dt_udp_entry(gsock, 0); if (e) vp = e->vport; }
+            DUNLOCK();
+#ifdef LINUX_BUILD
+            snprintf(lb, sizeof(lb), "on_sendto pid=%d fd=%lld port=%d addr=%lu.%lu.%lu.%lu vnode=%u realp=%d vport=%d",
+                     (int)getpid(), gsock, game_port, (a & 255), ((a >> 8) & 255), ((a >> 16) & 255),
+                     ((a >> 24) & 255), vnode, rp, vp);
+#else
+            snprintf(lb, sizeof(lb), "on_sendto pid=%u fd=%lld port=%d addr=%lu.%lu.%lu.%lu vnode=%u realp=%d vport=%d",
+                     (unsigned)GetCurrentProcessId(), gsock, game_port, (a & 255), ((a >> 8) & 255), ((a >> 16) & 255),
+                     ((a >> 24) & 255), vnode, rp, vp);
+#endif
+        }
         dlog(lb);
     }
     if (vnode && !ipv4_is_bcast(dst->sin_addr.s_addr)) {
