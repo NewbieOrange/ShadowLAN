@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
                     CloseHandle(th2);
                     if (st == 2)
                         fprintf(stderr, "warning: LanHookInit hit a guarded fault; "
-                                "see %%TEMP%%\\lan_hook_*.dmp and the hook log\n");
+                                "see lan_hook_<pid>.dmp next to the game and the hook log\n");
                     else if (st != 0)
                         fprintf(stderr, "warning: LanHookInit returned %lu\n", st);
                     else

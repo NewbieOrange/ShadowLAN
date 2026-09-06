@@ -2095,13 +2095,19 @@ static void write_minidump(void) {
             PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
             PMINIDUMP_CALLBACK_INFORMATION);
         PFN_Dump fn = (PFN_Dump)GetProcAddress(hd, "MiniDumpWriteDump");
-        char path[MAX_PATH], full[MAX_PATH + 32];
+        char full[MAX_PATH + 32], dir[MAX_PATH];
+        char *s;
         HANDLE f;
         MINIDUMP_EXCEPTION_INFORMATION ex;
         if (!fn) return;
-        if (GetTempPathA(sizeof(path), path) == 0) return;
-        snprintf(full, sizeof(full), "%slan_hook_%lu.dmp",
-                 path, (unsigned long)GetCurrentProcessId());
+        /* Game binary's directory only: dumps stay with the game. If it
+         * is not writable there is no dump (by design). */
+        if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+        s = strrchr(dir, '\\');
+        if (!s) return;
+        *s = 0;
+        snprintf(full, sizeof(full), "%s\\lan_hook_%lu.dmp",
+                 dir, (unsigned long)GetCurrentProcessId());
         full[sizeof(full) - 1] = 0;
         f = CreateFileA(full, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2112,7 +2118,12 @@ static void write_minidump(void) {
         fn(GetCurrentProcess(), GetCurrentProcessId(), f, MiniDumpNormal,
            &ex, NULL, NULL);
         CloseHandle(f);
-        flog("minidump written (see %TEMP%)");
+        {
+            char lb[MAX_PATH + 48];
+            snprintf(lb, sizeof(lb), "minidump written: %s", full);
+            lb[sizeof(lb) - 1] = 0;
+            flog(lb);
+        }
     }
 }
 

@@ -66,7 +66,7 @@ The tail shows how far init got (`enter` → `resolving imports` →
 `policy ready` → `starting tunnel` → `patching modules` →
 `patched N modules` → `installed`). The file opens first thing in init;
 unset or empty means no file logging at all. A guarded fault still drops
-`%TEMP%\lan_hook_<pid>.dmp` (minidump with the exact crash address).
+`lan_hook_<pid>.dmp` next to the game binary with the exact crash address.
 Common causes:
 
 - Wrong bitness: 32-bit game needs `lan_hook32.dll` (check Task Manager →
