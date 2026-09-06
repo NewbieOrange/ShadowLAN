@@ -9,11 +9,12 @@ import socket
 import sys
 import tempfile
 
-sys.path.insert(0, "/root/my_vnet")
+HOOKDIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HOOKDIR))
 from server import Relay
 from wclient import WinClient
 
-HOOK = "/root/my_vnet/hook/lan_hook.so"
+HOOK = os.path.join(HOOKDIR, "lan_hook.so")
 PUB = 47820
 UDP_REAL = 47921
 RELAY_GAME_PORT = 47331

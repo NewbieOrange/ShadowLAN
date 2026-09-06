@@ -13,10 +13,12 @@ Asserts all three paths work with nobody co-located but the bridges.
 Scenario B repeats discovery against a token relay.
 """
 import asyncio
+import os
 import socket
 import sys
 
-sys.path.insert(0, "/root/my_vnet")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 

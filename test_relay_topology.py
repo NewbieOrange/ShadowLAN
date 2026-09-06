@@ -13,10 +13,12 @@ Phase 2: B claims -> A demoted but stays connected; C's joins echo "B:".
 Phase 3: game A killed -> C's UDP gets exactly one "B:" reply.
 """
 import asyncio
+import os
 import socket
 import sys
 
-sys.path.insert(0, "/root/my_vnet")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 

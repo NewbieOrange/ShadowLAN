@@ -8,12 +8,13 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, "/root/my_vnet")
+HOOKDIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HOOKDIR))
 from server import Relay
 
-HOOK = "/root/my_vnet/hook/lan_hook.so"
-HOST_SENDER = "/root/my_vnet/hook/hook_sender_host.py"
-P2P_SENDER = "/root/my_vnet/hook/hook_sender_p2p.py"
+HOOK = os.path.join(HOOKDIR, "lan_hook.so")
+HOST_SENDER = os.path.join(HOOKDIR, "hook_sender_host.py")
+P2P_SENDER = os.path.join(HOOKDIR, "hook_sender_p2p.py")
 PUB = 47793
 DISC = 45031
 A_TCP, A_UDP = 47601, 47602
