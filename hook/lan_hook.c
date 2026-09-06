@@ -11,9 +11,9 @@
  *
  * Windows: IAT patch (no asm blobs) + GetProcAddress/LoadLibrary guards.
  * Build (Linux, mingw installed):
- *   x86_64-w64-mingw32-gcc -shared -O2 -o lan_hook64.dll lan_hook.c -lws2_32
- *   i686-w64-mingw32-gcc   -shared -O2 -o lan_hook32.dll lan_hook.c -lws2_32
- *   x86_64-w64-mingw32-gcc -O2 -o injector.exe injector.c
+ *   x86_64-w64-mingw32-gcc -shared -O2 -Wall -o lan_hook64.dll lan_hook.c lan_hook.def -lws2_32 -ldbghelp
+ *   i686-w64-mingw32-gcc -shared -O2 -Wall -o lan_hook32.dll lan_hook.c lan_hook.def -lws2_32 -ldbghelp
+ *   x86_64-w64-mingw32-gcc -O2 -Wall -o injector.exe injector.c -lpsapi
  * Linux self-test:
  *   gcc -shared -fPIC -DLINUX_BUILD -O2 -o lan_hook.so lan_hook.c -ldl -lpthread
  */
@@ -117,13 +117,11 @@ static int ipv4_is_bcast(unsigned long net_order) {
     return 0;
 }
 
-/* Per-socket original-peer tables live in the direct-tunnel section below
- * (DLOCK-protected). */
-
 /* ================= DIRECT TUNNEL CORE (hook dials server itself) ============= */
 /* Speaks server.py framing so no wclient.py is needed on the game PC.
- * Direct mode: TCP broadcast+game-TCP over one TCP link, game-UDP over UDP.
- * Include discovery UDP ports in server --udp too (unicast replies). */
+ * Tunnel mode (LAN_HOOK_SERVER set): broadcast+game-TCP over one TCP link,
+ * game-UDP over UDP. Include discovery UDP ports in the relay --udp list
+ * too (unicast discovery replies). Without LAN_HOOK_SERVER: passthrough. */
 #ifdef LINUX_BUILD
 #include <errno.h>
 #include <fcntl.h>
@@ -1374,7 +1372,7 @@ static unsigned dt_next_sid(void) {
     return (unsigned)InterlockedIncrement((volatile LONG *)&g_sid);
 #endif
 }
-/* UDP sendto: bcast->TCP BCAST, unicast LAN->UDP GAME. -1 game-port means skip */
+/* Raw tunnel-UDP transmit to the relay. */
 static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     struct sockaddr_in sa;
     if (dt_resolve(&sa) != 0) { dlog("udp game: resolve failed"); return; }
@@ -1391,6 +1389,9 @@ static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     else dlog("udp game: no tunnel sock yet");
 #endif
 }
+/* Outbound sendto routing. Returns 1 when consumed: virtual peer IP ->
+ * addressed P2P datagram; broadcast -> TCP BCAST frame; other LAN ->
+ * UDP GAME datagram. Returns 0 (passthrough) otherwise. */
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
@@ -1472,6 +1473,9 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
     if (st) *sid_out = sid;
     return st;
 }
+/* Outbound connect routing. Virtual peer IP -> addressed POPEN stream;
+ * other LAN -> plain OPEN (relay resolves the target). Returns 1 when
+ * consumed (fake success; data follows via stream send), else 0. */
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     if (vnode) {
@@ -2071,7 +2075,7 @@ static LONG WINAPI seh_filter(EXCEPTION_POINTERS *ep) {
 }
 /* Eager file log: opened FIRST in LanHookInit (before anything that can
  * fault) and written unconditionally, so even a crash leaves breadcrumbs.
- * Falls back to %TEMP%\\lan_hook.log when LAN_HOOK_LOGFILE is unset. */
+ * Unset or empty LAN_HOOK_LOGFILE means no file logging at all. */
 static FILE *g_logf = NULL;
 static void flog_open(void) {
     char path[MAX_PATH];

@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Windows client. Runs next to the game client. No TUN/TAP, no driver.
+"""ShadowLAN symmetric client (Windows + Linux). Runs next to the game. No TUN/TAP, no driver.
 
-Connects to ONE specific IP:port on the host:
-  TCP server_ip:port -> discovery + game-TCP
+Connects to ONE specific IP:port on the relay:
+  TCP server_ip:port -> discovery + game-TCP + membership
   UDP server_ip:port -> game-UDP
 
-What it does per game (ports from CLI):
+Player mode (default) per game (ports from CLI):
 - Snoops local discovery broadcasts with SO_REUSEADDR (gets a copy
-  without disturbing the game), forwards to host over TCP.
-- Re-broadcasts host discoveries locally to 255.255.255.255 so the
-  broadcast-only game sees a "LAN" server. The game then connects to
+  without disturbing the game), forwards to relay over TCP.
+- Re-broadcasts relay discoveries locally to 255.255.255.255 so the
+  broadcast-only game sees "LAN" servers. The game then connects to
   this PC's IP, which is our local proxy.
-- Listens on game TCP/UDP ports locally, tunnels to host.
+- Listens on game TCP/UDP ports locally, tunnels to relay.
 
-Windows notes:
-- Stdlib only, no admin. Allow Python through Windows Firewall once.
-- If bind fails with 10013 (game uses exclusive bind), see README
-  fallback; most Unity/Unreal/legacy LAN titles use reusable binds.
+Host mode (--host): bridges inbound relay traffic to the LOCAL game
+instead (this PC hosts); skips proxy listeners. Either mode registers
+a node id for virtual-IP P2P mesh play.
+
+Notes:
+- Stdlib only, no admin. Allow Python through the firewall once.
+- If bind fails with 10013 on Windows (game uses exclusive bind), use
+  the hook instead; most Unity/Unreal/legacy LAN titles use reusable binds.
 """
 import argparse
 import asyncio
@@ -511,8 +515,8 @@ class WinClient:
 def main():
     ap = argparse.ArgumentParser(description="ShadowLAN symmetric client (no TUN/TAP)")
     ap.add_argument("--server", required=True, help="relay public IP (specific IP)")
-    ap.add_argument("--port", type=int, required=True, help="host public port (TCP+UDP, same number)")
-    ap.add_argument("--disc", default="", help="discovery UDP ports, comma (same as host)")
+    ap.add_argument("--port", type=int, required=True, help="relay public port (TCP+UDP, same number)")
+    ap.add_argument("--disc", default="", help="discovery UDP ports to snoop, comma")
     ap.add_argument("--tcp", default="", help="game TCP ports, comma")
     ap.add_argument("--udp", default="", help="game UDP ports, comma")
     ap.add_argument("--rebroadcast-ip", default="255.255.255.255")

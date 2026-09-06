@@ -14,7 +14,7 @@ T_TCP_DATA_S2C = 0x12 # payload: !I stream_id + raw
 T_TCP_CLOSE = 0x13    # payload: !I stream_id
 T_HELLO = 0x20        # payload: !H token_len + token (designated-host claim)
 T_NODE = 0x22         # payload: !H tlen + token + !I node_id + !H udp_port
-T_ASSIGN = 0x23       # relay->peer: !I my_virt + !H n + n*(!I node + !I virt)
+T_ASSIGN = 0x23       # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
 T_POPEN = 0x24        # payload: !I sid + !I dest_node + !H port (P2P open)
 
 # UDP tunnel datagrams: MAGIC + VER + TYPE + payload
@@ -23,7 +23,7 @@ UVER = 0x01
 U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
 U_GAME_P2P = 0x12  # payload: !I dest_node + std triple+raw
-U_HELLO_HOST = 0x10  # payload: !H token_len + token (uplink UDP heartbeat)
+U_HELLO_HOST = 0x10  # payload: !H token_len + token (host UDP heartbeat)
 U_NODE = 0x11        # payload: !H tlen + token + !I node_id + !H udp_port
 # game payload both dirs: !H game_port + !H iplen + ip + !H port + raw
 

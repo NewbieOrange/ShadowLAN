@@ -55,7 +55,7 @@ Then the host starts the LAN game, everyone else opens the LAN browser and joins
 ## Injector options (Windows)
 
 ```bat
-injector.exe [--server HOST] [--port PORT] [--token SECRET] [--relay IP] [--ports LIST] [-e KEY=VAL]... [--debug] [--]
+injector.exe [--server HOST] [--port PORT] [--token SECRET] [--ports LIST] [-e KEY=VAL]... [--debug] [--]
 <hook.dll> <game.exe> [game args...]
 ```
 
