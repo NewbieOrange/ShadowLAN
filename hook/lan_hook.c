@@ -2451,8 +2451,73 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
     }
 }
 
+/* Ordinal imports: MinGW import libs bind ws2_32 (and kernel32) by
+ * ordinal, so name-based IAT patching is blind to them. Goldberg's
+ * steam_api64.dll imports all of its socket I/O this way (sendto,
+ * recvfrom, socket, ...), which hid its discovery traffic entirely.
+ * Resolve ordinals through the exporting module's export table. The
+ * small cache avoids re-walking; concurrent duplicate inserts are
+ * benign (same bytes). */
+#define ORD_MAXMAP 128
+static struct { HMODULE mod; DWORD ord; char name[40]; } g_ordmap[ORD_MAXMAP];
+static int g_ordmap_n = 0;
+
+static const char *export_name_for_ordinal(HMODULE mod, DWORD ord) {
+    BYTE *base;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_DATA_DIRECTORY *expdir;
+    IMAGE_EXPORT_DIRECTORY *exp;
+    DWORD *names;
+    WORD *nameords;
+    DWORD j;
+    int i;
+    if (!mod || !ord) return 0;
+    for (i = 0; i < g_ordmap_n; i++)
+        if (g_ordmap[i].mod == mod && g_ordmap[i].ord == ord)
+            return g_ordmap[i].name;
+    base = (BYTE*)mod;
+    dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew <= 0 || dos->e_lfanew > 1024 * 1024) return 0;
+    nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    expdir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!expdir->VirtualAddress || !expdir->Size) return 0;
+    exp = (IMAGE_EXPORT_DIRECTORY*)(base + expdir->VirtualAddress);
+    if (!exp->AddressOfNames || !exp->AddressOfNameOrdinals) return 0;
+    names = (DWORD*)(base + exp->AddressOfNames);
+    nameords = (WORD*)(base + exp->AddressOfNameOrdinals);
+    for (j = 0; j < exp->NumberOfNames; j++) {
+        if ((DWORD)(nameords[j] + exp->Base) == ord) {
+            const char *nm = (const char*)(base + names[j]);
+            size_t k;
+            for (k = 0; nm[k] && k < 39; k++) {
+                if (nm[k] < 32 || nm[k] > 126) return 0; /* sanity */
+            }
+            if (g_ordmap_n < ORD_MAXMAP) {
+                g_ordmap[g_ordmap_n].mod = mod;
+                g_ordmap[g_ordmap_n].ord = ord;
+                strncpy(g_ordmap[g_ordmap_n].name, nm, 39);
+                g_ordmap[g_ordmap_n].name[39] = 0;
+                g_ordmap_n++;
+                return g_ordmap[g_ordmap_n - 1].name;
+            }
+            return nm; /* cache full: direct pointer, module stays loaded */
+        }
+    }
+    return 0;
+}
+
 /* If game resolves exports dynamically, hand out our hooks. */
 FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
+    if (n && !((ULONG_PTR)n >> 16)) {
+        /* by ordinal: map through the target's exports, then match by
+         * name below like any other lookup */
+        const char *onm = export_name_for_ordinal(m, (DWORD)(ULONG_PTR)n);
+        if (!onm) return p_GetProcAddress(m, n);
+        n = onm;
+    }
     if (n && ((ULONG_PTR)n >> 16)) {
         char mod[MAX_PATH] = {0};
         GetModuleFileNameA(m, mod, sizeof(mod)-1);
@@ -2532,13 +2597,27 @@ static void patch_iat_inner(HMODULE mod) {
             IMAGE_THUNK_DATA *orig = desc->OriginalFirstThunk ?
                 (IMAGE_THUNK_DATA*)(base + desc->OriginalFirstThunk) : 0;
             IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
+            HMODULE hExp = GetModuleHandleA(dll);
             for (; iat->u1.Function; iat++, orig ? orig++ : 0) {
-                if (IMAGE_SNAP_BY_ORDINAL(iat->u1.Ordinal)) continue;
-                IMAGE_IMPORT_BY_NAME *nm = 0;
-                if (orig) nm = (IMAGE_IMPORT_BY_NAME*)(base + orig->u1.AddressOfData);
-                else nm = (IMAGE_IMPORT_BY_NAME*)(base + iat->u1.AddressOfData);
-                if (!nm) continue;
-                char *fn = (char*)nm->Name;
+                char *fn = 0;
+                char ordname[40];
+                /* Ordinal-ness must come from the import lookup table:
+                 * the loader overwrites the IAT with resolved addresses,
+                 * so testing the IAT slot itself misses every ordinal
+                 * import (this hid MinGW-linked socket I/O entirely). */
+                IMAGE_THUNK_DATA *lu = orig ? orig : iat;
+                if (IMAGE_SNAP_BY_ORDINAL(lu->u1.Ordinal)) {
+                    const char *rn = export_name_for_ordinal(
+                        hExp, IMAGE_ORDINAL(lu->u1.Ordinal));
+                    if (!rn) continue;
+                    strncpy(ordname, rn, sizeof(ordname) - 1);
+                    ordname[sizeof(ordname) - 1] = 0;
+                    fn = ordname;
+                } else {
+                    IMAGE_IMPORT_BY_NAME *nm = (IMAGE_IMPORT_BY_NAME*)(base + lu->u1.AddressOfData);
+                    if (!nm) continue;
+                    fn = (char*)nm->Name;
+                }
                 FARPROC rep = 0;
                 if (isws2) {
                     if (!strcmp(fn,"sendto")) rep = (FARPROC)hk_sendto;
@@ -2813,15 +2892,28 @@ static void patch_loader_iat_inner(void) {
             if (_stricmp(dll, "kernel32.dll")) continue;
             IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
             IMAGE_THUNK_DATA *orig = desc->OriginalFirstThunk ? (IMAGE_THUNK_DATA*)(base + desc->OriginalFirstThunk) : 0;
+            HMODULE hExp = GetModuleHandleA("kernel32.dll");
             for (; iat->u1.Function; iat++, orig ? orig++ : 0) {
-                IMAGE_IMPORT_BY_NAME *nm = (IMAGE_IMPORT_BY_NAME*)(base +
-                    (orig ? orig->u1.AddressOfData : iat->u1.AddressOfData));
-                if (!nm || IMAGE_SNAP_BY_ORDINAL(iat->u1.Ordinal)) continue;
+                char *fn = 0;
+                char ordname[40];
+                IMAGE_THUNK_DATA *lu = orig ? orig : iat;
+                if (IMAGE_SNAP_BY_ORDINAL(lu->u1.Ordinal)) {
+                    const char *rn = export_name_for_ordinal(
+                        hExp, IMAGE_ORDINAL(lu->u1.Ordinal));
+                    if (!rn) continue;
+                    strncpy(ordname, rn, sizeof(ordname) - 1);
+                    ordname[sizeof(ordname) - 1] = 0;
+                    fn = ordname;
+                } else {
+                    IMAGE_IMPORT_BY_NAME *nm = (IMAGE_IMPORT_BY_NAME*)(base + lu->u1.AddressOfData);
+                    if (!nm) continue;
+                    fn = (char*)nm->Name;
+                }
                 FARPROC rep = 0;
-                if (!strcmp((char*)nm->Name, "LoadLibraryA")) rep = (FARPROC)hk_LoadLibraryA;
-                else if (!strcmp((char*)nm->Name, "LoadLibraryW")) rep = (FARPROC)hk_LoadLibraryW;
-                else if (!strcmp((char*)nm->Name, "LoadLibraryExA")) rep = (FARPROC)hk_LoadLibraryExA;
-                else if (!strcmp((char*)nm->Name, "LoadLibraryExW")) rep = (FARPROC)hk_LoadLibraryExW;
+                if (!strcmp(fn, "LoadLibraryA")) rep = (FARPROC)hk_LoadLibraryA;
+                else if (!strcmp(fn, "LoadLibraryW")) rep = (FARPROC)hk_LoadLibraryW;
+                else if (!strcmp(fn, "LoadLibraryExA")) rep = (FARPROC)hk_LoadLibraryExA;
+                else if (!strcmp(fn, "LoadLibraryExW")) rep = (FARPROC)hk_LoadLibraryExW;
                 if (rep) {
                     DWORD old = 0;
                     if (VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
