@@ -723,7 +723,7 @@ static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
 #ifdef LINUX_BUILD
                 { char lb[128]; snprintf(lb, sizeof(lb), "udp push gsock=%lld nq=%d n=%zu", gsock, e->nq, n); dlog(lb); }
 #else
-                dlog("udp push ok");
+                { char lb[128]; snprintf(lb, sizeof(lb), "udp push gsock=%lld nq=%d n=%d", gsock, e->nq, (int)n); dlog(lb); }
 #endif
             } else free(d);
         }
@@ -1038,7 +1038,15 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                 dt_dispatch_bcast((int)dt_get16(pl + 1), pl + 3, ml - 3);
             } else if (t == DT_BCAST_FROM && ml >= 7) {
                 unsigned node = dt_get32(pl + 1);
-                { char lb[96]; snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d n=%u", node, (int)dt_get16(pl + 5), ml - 7); dlog(lb); }
+                {
+                    char lb[192]; int hp = 0;
+                    size_t hn = ml - 7 < 16 ? ml - 7 : 16;
+                    hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d n=%u hex=",
+                                  node, (int)dt_get16(pl + 5), ml - 7);
+                    for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
+                        hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", pl[7 + qi]);
+                    dlog(lb);
+                }
                 dt_dispatch_bcast_from(node, (int)dt_get16(pl + 5), pl + 7, ml - 7);
             } else if (t == DT_ASSIGN && ml >= 2) {
                 dt_apply_assign(pl + 1, ml - 1);
@@ -2244,6 +2252,15 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
         struct sockaddr_in tfrom; size_t on = 0;
         int pr = dt_udp_pop((long long)s, (unsigned char *)buf, (size_t)len, &tfrom, &on);
         if (pr == 1) {
+            if (g_debug) {
+                unsigned long av = 0; memcpy(&av, &tfrom.sin_addr.s_addr, 4);
+                char lb[128];
+                snprintf(lb, sizeof(lb), "grecv sock=%lld n=%d src=%lu.%lu.%lu.%lu:%d",
+                         (long long)s, (int)on, (av & 255), ((av >> 8) & 255),
+                         ((av >> 16) & 255), ((av >> 24) & 255),
+                         (int)ntohs(tfrom.sin_port));
+                dlog(lb);
+            }
             if (from && fromlen && *fromlen >= (int)sizeof(tfrom)) {
                 memcpy(from, &tfrom, sizeof(tfrom)); *fromlen = sizeof(tfrom);
             }
@@ -2256,6 +2273,12 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
         int rr = select(0, &rf, NULL, NULL, nb ? &ztv : &tv);
         if (rr > 0) {
             int n = p_recvfrom(s, buf, len, flags, from, fromlen);
+            if (g_debug) {
+                char lb[96];
+                snprintf(lb, sizeof(lb), "grecv REAL-WIRE sock=%lld n=%d err=%d",
+                         (long long)s, n, n == SOCKET_ERROR ? WSAGetLastError() : 0);
+                dlog(lb);
+            }
             return n;
         }
         if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
@@ -2331,7 +2354,7 @@ int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD
             unsigned char *tmp = (unsigned char *)malloc(total);
             if (tmp) {
                 struct sockaddr_in tfrom; size_t on = 0;
-                int fl = sizeof(tfrom), pr;
+                int pr;
                 { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
                 pr = dt_udp_pop((long long)s, tmp, total, &tfrom, &on);
                 if (pr == 1) {
@@ -2388,6 +2411,16 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     int r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
         DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
+        if (g_debug) {
+            const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
+            unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
+            char lb[160];
+            snprintf(lb, sizeof(lb), "bind pid=%u sock=%lld %lu.%lu.%lu.%lu:%d",
+                     (unsigned)GetCurrentProcessId(), (long long)s,
+                     (addr & 255), ((addr >> 8) & 255), ((addr >> 16) & 255),
+                     ((addr >> 24) & 255), (int)ntohs(ba->sin_port));
+            dlog(lb);
+        }
     }
     return r;
 }
@@ -2656,6 +2689,13 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
 int WSAAPI hk_WSAEventSelect(SOCKET s, WSAEVENT hEvent, long lNetworkEvents) {
     int r = p_WSAEventSelect ? p_WSAEventSelect(s, hEvent, lNetworkEvents) : SOCKET_ERROR;
     if (g_direct) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+    if (g_debug) {
+        char lb[128];
+        snprintf(lb, sizeof(lb), "evsel pid=%u sock=%lld ev=%p mask=0x%lx",
+                 (unsigned)GetCurrentProcessId(), (long long)s, (void *)hEvent,
+                 (unsigned long)lNetworkEvents);
+        dlog(lb);
+    }
     dt_ev_unhook_sock((long long)s);
     if (r == 0 && hEvent && lNetworkEvents) {
         int i, done = 0;
@@ -2864,6 +2904,14 @@ static int module_allowed(const char *path) {
 
 static void patch_iat_inner(HMODULE mod) {
     if (!mod) return;
+    int patched = 0;
+    char modname[MAX_PATH] = {0};
+    if (g_debug) {
+        GetModuleFileNameA(mod, modname, sizeof(modname) - 1);
+        char *bs = strrchr(modname, '\\');
+        memmove(modname, bs ? bs + 1 : modname,
+                strlen(bs ? bs + 1 : modname) + 1);
+    }
     {
         BYTE *base = (BYTE*)mod;
         IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
@@ -2939,6 +2987,11 @@ static void patch_iat_inner(HMODULE mod) {
                     if (VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
                         iat->u1.Function = (ULONG_PTR)rep;
                         VirtualProtect(&iat->u1.Function, sizeof(void*), old, &old);
+                        if (g_debug && patched < 256) {
+                            char lb[160];
+                            snprintf(lb, sizeof(lb), "patch iat %s!%s", modname, fn);
+                            dlog(lb); patched++;
+                        }
                     }
                 }
             }
