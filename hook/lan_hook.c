@@ -179,7 +179,7 @@ struct dt_chunk { unsigned char *p; size_t n, off; struct dt_chunk *next; };
 struct dt_dgram { unsigned char *p; size_t n; struct sockaddr_in from; struct dt_dgram *next; };
 struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in orig;
                    struct dt_chunk *h, *t; size_t total; int dead; };
-struct dt_udp { int used; long long gsock; struct dt_dgram *h, *t; int nq; int closed; };
+struct dt_udp { int used; long long gsock; struct dt_dgram *h, *t; int nq; int closed; int vport; };
 struct dt_slot { int used; long long gsock; int game_port; struct sockaddr_in orig; };
 struct dt_frame { unsigned char type; unsigned char *p; size_t n; struct dt_frame *next; };
 
@@ -650,6 +650,7 @@ static struct dt_udp *dt_udp_entry(long long s, int create) {
         if (!g_uq[i].used) {
             g_uq[i].used = 1; g_uq[i].gsock = s;
             g_uq[i].h = g_uq[i].t = NULL; g_uq[i].nq = 0; g_uq[i].closed = 0;
+            g_uq[i].vport = 0;
             return &g_uq[i];
         }
     return NULL;
@@ -842,6 +843,7 @@ static void dt_dispatch_bcast_from(unsigned node, int port,
         struct dt_udp *e = NULL;
         for (int j = 0; j < DT_MAXUDP; j++)
             if (g_uq[j].used && g_uq[j].gsock == gs) { e = &g_uq[j]; break; }
+        if (e && e->vport) bp = e->vport;   /* shared-port member */
         if (e && bp == port) {
             if (e->nq < DT_MAXQ) {
                 struct dt_dgram *d = (struct dt_dgram *)malloc(sizeof(*d));
@@ -2099,6 +2101,7 @@ typedef int (WSAAPI *PFN_connect)(SOCKET, const struct sockaddr*, int);
 typedef int (WSAAPI *PFN_bind)(SOCKET, const struct sockaddr*, int);
 typedef int (WSAAPI *PFN_WSAConnect)(SOCKET, const struct sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
 typedef int (WSAAPI *PFN_getpeername)(SOCKET, struct sockaddr*, int*);
+typedef int (WSAAPI *PFN_getsockname)(SOCKET, struct sockaddr*, int*);
 typedef int (WSAAPI *PFN_closesocket)(SOCKET);
 typedef int (WSAAPI *PFN_listen)(SOCKET, int);
 typedef int (WSAAPI *PFN_send)(SOCKET, const char*, int, int);
@@ -2122,6 +2125,7 @@ static PFN_WSASendTo p_WSASendTo = 0; static PFN_WSARecvFrom p_WSARecvFrom = 0;
 static PFN_connect p_connect = 0; static PFN_WSAConnect p_WSAConnect = 0;
 static PFN_bind p_bind = 0;
 static PFN_getpeername p_getpeername = 0; static PFN_closesocket p_closesocket = 0;
+static PFN_getsockname p_getsockname = 0;
 static PFN_listen p_listen = 0;
 static PFN_send p_send = 0; static PFN_recv p_recv = 0;
 static PFN_WSASend p_WSASend = 0; static PFN_WSARecv p_WSARecv = 0;
@@ -2409,6 +2413,34 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
  * find it and its arrivals are silently dropped. */
 int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     int r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
+    /* Shared discovery ports: several game processes bind one UDP port
+     * (SO_REUSEADDR). If the real stack refuses it - another socket on
+     * this machine owns the port - bind ephemerally instead but register
+     * the socket as a member of the requested port, so tunnel fanout and
+     * getsockname still present it as bound there. Without this, the
+     * second binder goes deaf: inbound traffic for the shared port no
+     * longer matches its (fallback) bound port. */
+    if (r != 0 && g_direct && a && a->sa_family == AF_INET &&
+        ((const struct sockaddr_in *)a)->sin_port != 0 &&
+        (WSAGetLastError() == WSAEADDRINUSE || WSAGetLastError() == WSAEACCES) &&
+        dt_sock_type((long long)s) == SOCK_DGRAM) {
+        struct sockaddr_in sa = *(const struct sockaddr_in *)a;
+        int want = ntohs(sa.sin_port);
+        sa.sin_port = 0;
+        if (p_bind && p_bind(s, (struct sockaddr *)&sa, l) == 0) {
+            DLOCK();
+            struct dt_udp *e = dt_udp_entry((long long)s, 1);
+            if (e) e->vport = want;
+            DUNLOCK();
+            r = 0;
+            if (g_debug) {
+                char lb[128];
+                snprintf(lb, sizeof(lb), "bind alias pid=%u sock=%lld vport=%d",
+                         (unsigned)GetCurrentProcessId(), (long long)s, want);
+                dlog(lb);
+            }
+        }
+    }
     if (g_debug && g_direct && a && a->sa_family == AF_INET) {
         const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
         unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
@@ -2422,6 +2454,18 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     }
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
         DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
+    }
+    return r;
+}
+int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
+    int r = p_getsockname ? p_getsockname(s, a, l) : SOCKET_ERROR;
+    if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
+        int vp = 0;
+        DLOCK();
+        struct dt_udp *e = dt_udp_entry((long long)s, 0);
+        if (e) vp = e->vport;
+        DUNLOCK();
+        if (vp) ((struct sockaddr_in *)a)->sin_port = htons((unsigned short)vp);
     }
     return r;
 }
@@ -2858,6 +2902,7 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"bind")) return (FARPROC)hk_bind;
             if (!strcmp(n,"WSAConnect")) return (FARPROC)hk_WSAConnect;
             if (!strcmp(n,"getpeername")) return (FARPROC)hk_getpeername;
+            if (!strcmp(n,"getsockname")) return (FARPROC)hk_getsockname;
             if (!strcmp(n,"closesocket")) return (FARPROC)hk_closesocket;
             if (!strcmp(n,"listen")) return (FARPROC)hk_listen;
             if (!strcmp(n,"send")) return (FARPROC)hk_send;
@@ -2972,6 +3017,7 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"bind")) rep = (FARPROC)hk_bind;
                     else if (!strcmp(fn,"WSAConnect")) rep = (FARPROC)hk_WSAConnect;
                     else if (!strcmp(fn,"getpeername")) rep = (FARPROC)hk_getpeername;
+                    else if (!strcmp(fn,"getsockname")) rep = (FARPROC)hk_getsockname;
                     else if (!strcmp(fn,"closesocket")) rep = (FARPROC)hk_closesocket;
                     else if (!strcmp(fn,"listen")) rep = (FARPROC)hk_listen;
                     else if (!strcmp(fn,"send")) rep = (FARPROC)hk_send;
@@ -3375,6 +3421,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_bind = (PFN_bind)GetProcAddress(hWS2, "bind");
     p_WSAConnect = (PFN_WSAConnect)GetProcAddress(hWS2, "WSAConnect");
     p_getpeername = (PFN_getpeername)GetProcAddress(hWS2, "getpeername");
+    p_getsockname = (PFN_getsockname)GetProcAddress(hWS2, "getsockname");
     p_closesocket = (PFN_closesocket)GetProcAddress(hWS2, "closesocket");
     p_listen = (PFN_listen)GetProcAddress(hWS2, "listen");
     p_send = (PFN_send)GetProcAddress(hWS2, "send");

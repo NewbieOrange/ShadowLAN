@@ -59,14 +59,15 @@ def cleanup():
     time.sleep(0.5)
 
 
-def launch(mode, winlog, outpath):
+def launch(mode, winlog, outpath, ports=None):
     env = dict(os.environ)
     env.update({"WINEDEBUG": "-all", "WINEPREFIX": WINEPREFIX,
                 "LAN_HOOK_LOGFILE": winlog, "LAN_HOOK_DEBUG": "1"})
     h = winpath(HOOKDIR)
+    portargs = " ".join(str(p) for p in (ports or (PUB + 1, PUB + 2)))
     cmd = (f'timeout 120 {WINE} "{h}\\injector.exe" --server 127.0.0.1 '
            f'--port {PUB} --debug -- "{h}\\lan_hook64.dll" '
-           f'"{h}\\test_late.exe" {mode} {PUB + 1} {PUB + 2} > {outpath} 2>&1')
+           f'"{h}\\test_late.exe" {mode} {portargs} > {outpath} 2>&1')
     return subprocess.Popen(["bash", "-c", cmd], env=env)
 
 
@@ -109,11 +110,36 @@ def main():
     hlog = os.path.join(tmp, "host-hook.log")
     clog = os.path.join(tmp, "cli-hook.log")
     cout = os.path.join(tmp, "cli.out")
+    ok = False
+    # ---- phase A: shared-port alias (SO_REUSEADDR semantics) ----
+    khlog = os.path.join(tmp, "klash-hook.log")
+    kout = os.path.join(tmp, "klash.out")
+    clash = launch("clash", winpath(khlog), kout, ports=(PUB + 3,))
+    aliased = wait_for(khlog, r"bind alias .*vport=%d" % (PUB + 3), 90)
+    done = None
+    if not aliased:
+        print("clash never aliased the busy port")
+    else:
+        print("clash aliased:", aliased)
+        acli = launch("client", os.path.join(tmp, "aclihook.log"),
+                      os.path.join(tmp, "acli.out"),
+                      ports=(PUB + 4, PUB + 5, PUB + 3))
+        done = wait_for(kout, r"CLASH_", 90)
+        acli.kill()
+        clash.kill()
+    okA = done is not None and "CLASH_OK" in open(
+        kout, errors="replace").read()
+    print("phase A:", "CLASH_OK" if okA else done)
+    if not okA:
+        dump_tail(kout, 6)
+        dump_tail(khlog, 8)
+    cleanup()   # wine children outlive their bash wrappers
+    # ---- phase B: late-loaded plugin end-to-end ----
     host = launch("host", winpath(hlog), os.path.join(tmp, "host.out"))
     # serialize: cold Wine instances race on shared prefix services, so
     # do not bring the client up until the late plugin really is serving
     served = wait_for(hlog, r"bind pid=\d+ sock=\d+ 0\.0\.0\.0:%d" % (PUB + 1), 90)
-    ok = False
+    okB = False
     cli = None
     if not served:
         print("host never bound the query port")
@@ -121,8 +147,10 @@ def main():
         print("host serving:", served)
         cli = launch("client", winpath(clog), cout)
         done = wait_for(cout, r"LATE_", 120)
-        ok = done is not None and "LATE_OK" in open(cout, errors="replace").read()
+        okB = done is not None and "LATE_OK" in open(
+            os.path.join(tmp, "cli.out"), errors="replace").read()
         print("client:", done)
+    ok = okA and okB
     if cli:
         cli.kill()
     host.kill()

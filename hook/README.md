@@ -27,6 +27,9 @@ is a pure passthrough. One source builds both the Windows DLL and the Linux
 `LoadLibrary` re-patch: every patched module's `LoadLibrary*` imports are
 swapped too, plus a slow differential module sweep as a safety net, so
 plugin DLLs loaded long after install (game engines do this) are hooked.
+Shared UDP discovery ports are emulated: if a bind fails because another
+local socket owns the port, the hook binds ephemerally and aliases the
+socket to the requested port, matching `SO_REUSEADDR` broadcast semantics.
 Method: IAT patch, no asm blobs.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
