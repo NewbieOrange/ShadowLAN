@@ -1,12 +1,13 @@
 /* Launcher with env-from-args.
  *
- *   injector.exe [--server HOST] [--port PORT] [--relay IP] [--ports LIST]
- *                [-e KEY=VAL]... [--] <hook.dll> <game.exe> [game args...]
+ *   injector.exe [--server HOST] [--port PORT] [--token SECRET]
+ *                [--ports LIST] [-e KEY=VAL]... [--debug] [--]
+ *                <hook.dll> <game.exe> [game args...]
  *
  * Each option maps to the hook's env (child inherits it):
- *   --server -> LAN_HOOK_SERVER   (direct-tunnel mode; empty = 127.0.0.1 relay)
+ *   --server -> LAN_HOOK_SERVER   (relay address; required)
  *   --port   -> LAN_HOOK_PORT     (default 47777)
- *   --relay  -> LAN_HOOK_RELAY    (relay-mode dest, default 127.0.0.1)
+ *   --token  -> LAN_HOOK_TOKEN    (room key, must match relay --token)
  *   --ports  -> LAN_HOOK_PORTS    (e.g. 4444,27015,7777; empty = all LAN)
  *   -e K=V   -> generic extra env
  *   --debug  -> LAN_HOOK_DEBUG=1
@@ -22,10 +23,10 @@
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: injector.exe [--server HOST] [--port PORT] [--relay IP]\n"
+        "usage: injector.exe [--server HOST] [--port PORT] [--token SECRET]\n"
         "                    [--ports LIST] [-e KEY=VAL]... [--debug] [--]\n"
         "                    <hook.dll> <game.exe> [game args...]\n"
-        "example: injector.exe --server 203.0.113.10 --port 47777 -- lan_hook64.dll game.exe -windowed\n");
+        "example: injector.exe --server 203.0.113.10 --port 47777 --token SECRET -- lan_hook64.dll game.exe -windowed\n");
 }
 
 static int starts_with(const char *s, const char *pre) {
@@ -33,7 +34,7 @@ static int starts_with(const char *s, const char *pre) {
 }
 
 int main(int argc, char **argv) {
-    const char *server = NULL, *port = NULL, *relay = NULL, *ports = NULL;
+    const char *server = NULL, *port = NULL, *token = NULL, *ports = NULL;
     int debug = 0;
     int i = 1;
     /* collect leading options; stop at "--" or first non-option */
@@ -45,8 +46,8 @@ int main(int argc, char **argv) {
         else if (starts_with(a, "--server=")) server = a + 9;
         else if (!strcmp(a, "--port") && i + 1 < argc) port = argv[++i];
         else if (starts_with(a, "--port=")) port = a + 7;
-        else if (!strcmp(a, "--relay") && i + 1 < argc) relay = argv[++i];
-        else if (starts_with(a, "--relay=")) relay = a + 8;
+        else if (!strcmp(a, "--token") && i + 1 < argc) token = argv[++i];
+        else if (starts_with(a, "--token=")) token = a + 8;
         else if (!strcmp(a, "--ports") && i + 1 < argc) ports = argv[++i];
         else if (starts_with(a, "--ports=")) ports = a + 8;
         else if (!strcmp(a, "--debug")) debug = 1;
@@ -71,7 +72,7 @@ int main(int argc, char **argv) {
     }
     if (server) SetEnvironmentVariableA("LAN_HOOK_SERVER", server);
     if (port) SetEnvironmentVariableA("LAN_HOOK_PORT", port);
-    if (relay) SetEnvironmentVariableA("LAN_HOOK_RELAY", relay);
+    if (token) SetEnvironmentVariableA("LAN_HOOK_TOKEN", token);
     if (ports) SetEnvironmentVariableA("LAN_HOOK_PORTS", ports);
     if (debug) SetEnvironmentVariableA("LAN_HOOK_DEBUG", "1");
 
@@ -109,9 +110,10 @@ int main(int argc, char **argv) {
     CloseHandle(th); VirtualFreeEx(pi.hProcess, mem, 0, MEM_RELEASE);
     if (!code) { fprintf(stderr, "remote LoadLibrary failed\n"); TerminateProcess(pi.hProcess, 1); return 1; }
     ResumeThread(pi.hThread);
-    printf("injected %s -> pid %lu server=%s port=%s\n", dllfull, (unsigned long)pi.dwProcessId,
-           getenv("LAN_HOOK_SERVER") ? getenv("LAN_HOOK_SERVER") : "(relay)",
-           getenv("LAN_HOOK_PORT") ? getenv("LAN_HOOK_PORT") : "47777");
+    printf("injected %s -> pid %lu server=%s port=%s token=%s\n", dllfull, (unsigned long)pi.dwProcessId,
+           getenv("LAN_HOOK_SERVER") ? getenv("LAN_HOOK_SERVER") : "(unset)",
+           getenv("LAN_HOOK_PORT") ? getenv("LAN_HOOK_PORT") : "47777",
+           getenv("LAN_HOOK_TOKEN") ? "set" : "(unset)");
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return 0;
 }

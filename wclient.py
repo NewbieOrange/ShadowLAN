@@ -509,8 +509,8 @@ class WinClient:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Windows LAN-coop client (no TUN/TAP)")
-    ap.add_argument("--server", required=True, help="host public IP (specific IP)")
+    ap = argparse.ArgumentParser(description="ShadowLAN symmetric client (no TUN/TAP)")
+    ap.add_argument("--server", required=True, help="relay public IP (specific IP)")
     ap.add_argument("--port", type=int, required=True, help="host public port (TCP+UDP, same number)")
     ap.add_argument("--disc", default="", help="discovery UDP ports, comma (same as host)")
     ap.add_argument("--tcp", default="", help="game TCP ports, comma")
