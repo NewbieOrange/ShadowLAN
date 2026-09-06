@@ -911,10 +911,14 @@ static int dt_recv_all(SOCKET s, unsigned char *b, size_t n) {
 }
 #endif
 
-static void dt_dispatch_bcast_from(unsigned node, int port,
+static void dt_dispatch_bcast_from(unsigned node, int port, int sport,
                                      const unsigned char *raw, size_t n) {
     struct sockaddr_in fake; memset(&fake, 0, sizeof(fake));
-    fake.sin_family = AF_INET; fake.sin_port = htons((unsigned short)port);
+    fake.sin_family = AF_INET;
+    /* App-facing source port: the sender's real socket port when known
+     * (a LAN browser cross-checks it against the port embedded in the
+     * announcement payload); fall back to the destination port. */
+    fake.sin_port = htons((unsigned short)(sport > 0 ? sport : port));
     {
         unsigned virt = node ? dt_node_virt(node) : 0;
         fake.sin_addr.s_addr = virt ? htonl(virt) : g_fakeip;
@@ -947,8 +951,8 @@ static void dt_dispatch_bcast_from(unsigned node, int port,
     }
     DUNLOCK();
 }
-static void dt_dispatch_bcast(int port, const unsigned char *raw, size_t n) {
-    dt_dispatch_bcast_from(0, port, raw, n);
+static void dt_dispatch_bcast(int port, int sport, const unsigned char *raw, size_t n) {
+    dt_dispatch_bcast_from(0, port, sport, raw, n);
 }
 static void dt_dispatch_s2c(unsigned sid, const unsigned char *raw, size_t n) {
     DLOCK();
@@ -1124,20 +1128,23 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
             if (!pl) goto redial;
             if (dt_recv_all(s, pl, ml)) goto redial;
             unsigned char t = pl[0];
-            if (t == DT_BCAST && ml >= 3) {
-                dt_dispatch_bcast((int)dt_get16(pl + 1), pl + 3, ml - 3);
-            } else if (t == DT_BCAST_FROM && ml >= 7) {
+            if (t == DT_BCAST && ml >= 5) {
+                dt_dispatch_bcast((int)dt_get16(pl + 1), (int)dt_get16(pl + 3),
+                                  pl + 5, ml - 5);
+            } else if (t == DT_BCAST_FROM && ml >= 9) {
                 unsigned node = dt_get32(pl + 1);
+                int bport = (int)dt_get16(pl + 5);
+                int sport = (int)dt_get16(pl + 7);
                 {
                     char lb[320]; int hp = 0;
-                    size_t hn = ml - 7 < 80 ? ml - 7 : 80;
-                    hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d n=%u hex=",
-                                  node, (int)dt_get16(pl + 5), ml - 7);
+                    size_t hn = ml - 9 < 80 ? ml - 9 : 80;
+                    hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d sp=%d n=%u hex=",
+                                  node, bport, sport, ml - 9);
                     for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
-                        hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", pl[7 + qi]);
+                        hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", pl[9 + qi]);
                     dlog(lb);
                 }
-                dt_dispatch_bcast_from(node, (int)dt_get16(pl + 5), pl + 7, ml - 7);
+                dt_dispatch_bcast_from(node, bport, sport, pl + 9, ml - 9);
             } else if (t == DT_ASSIGN && ml >= 2) {
                 dt_apply_assign(pl + 1, ml - 1);
             } else if (t == DT_S2C && ml >= 5) {
@@ -1752,11 +1759,24 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     int port = 0;
     if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
     if (ipv4_is_bcast(dst->sin_addr.s_addr)) {
-        unsigned char *p = (unsigned char *)malloc(2 + len);
+        unsigned char *p = (unsigned char *)malloc(4 + len);
         if (!p) return 1;
-        dt_put16(p, (unsigned)game_port);
-        if (len) memcpy(p + 2, buf, len);
-        dt_tcp_queue(DT_BCAST, p, 2 + len);
+        {
+            int sport = 0;
+            struct sockaddr_in sn;
+#ifdef LINUX_BUILD
+            socklen_t sl = sizeof(sn);
+            if (getsockname((int)gsock, (struct sockaddr *)&sn, &sl) == 0)
+#else
+            int sl = sizeof(sn);
+            if (getsockname((SOCKET)gsock, (struct sockaddr *)&sn, &sl) == 0)
+#endif
+                sport = ntohs(sn.sin_port);
+            dt_put16(p, (unsigned)game_port);
+            dt_put16(p + 2, (unsigned)sport);
+        }
+        if (len) memcpy(p + 4, buf, len);
+        dt_tcp_queue(DT_BCAST, p, 4 + len);
         free(p);
         DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
         /* NIC-style local echo: many LAN discovery schemes seed their

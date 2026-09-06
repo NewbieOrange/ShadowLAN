@@ -6,7 +6,7 @@ import struct
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
 T_BCAST = 0x01        # payload: !H disc_port + raw (legacy, unattributed)
-T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + raw
+T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
 T_TCP_OPEN = 0x10     # payload: !I stream_id + !H game_port (implicit route)
 T_TCP_DATA_C2S = 0x11 # payload: !I stream_id + raw
 T_TCP_DATA_S2C = 0x12 # payload: !I stream_id + raw
@@ -229,16 +229,22 @@ def decode_pdat(data):
     return dest, game_port, ip, cport, raw
 
 
-def encode_bcast_from(node: int, disc_port: int, raw: bytes) -> bytes:
-    return struct.pack("!IH", node & 0xFFFFFFFF, disc_port & 0xFFFF) + raw
+def encode_bcast_from(node: int, disc_port: int, src_port: int,
+                      raw: bytes) -> bytes:
+    return (struct.pack("!IHH", node & 0xFFFFFFFF, disc_port & 0xFFFF,
+                        src_port & 0xFFFF) + raw)
 
 
 def decode_bcast_from(payload: bytes):
+    """-> (node, disc_port, src_port, raw); src_port 0 for legacy frames."""
     try:
         if len(payload) < 6:
             return None
         node, dport = struct.unpack("!IH", payload[:6])
-        return node, dport, payload[6:]
+        if len(payload) >= 8:
+            (sport,) = struct.unpack("!H", payload[6:8])
+            return node, dport, sport, payload[8:]
+        return node, dport, 0, payload[6:]
     except struct.error:
         return None
 

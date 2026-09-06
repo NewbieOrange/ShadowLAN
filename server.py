@@ -327,13 +327,18 @@ class Relay:
                     # the edge and distinct hosts stay visible.
                     self.beaconers[writer] = time.monotonic()
                     src_node = self.writer_node.get(owner, 0)
+                    if len(payload) >= 4:
+                        (sport,) = struct.unpack("!H", payload[2:4])
+                        raw = payload[4:]
+                    else:   # legacy bridge frame: no source port
+                        sport, raw = 0, payload[2:]
                     for w in list(self.players) + ([self.host_writer] if self.host_writer else []):
                         if w is writer or w.is_closing():
                             continue
                         try:
                             if src_node and id(w) in self.writer_node:
                                 await self.r_send(w, T_BCAST_FROM,
-                                                  encode_bcast_from(src_node, dport, payload[2:]))
+                                                  encode_bcast_from(src_node, dport, sport, raw))
                             else:
                                 await self.r_send(w, T_BCAST, payload)
                         except (ConnectionResetError, BrokenPipeError, RuntimeError):

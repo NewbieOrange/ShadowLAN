@@ -185,7 +185,8 @@ class WinClient:
                 continue
             if self.tcp_writer:
                 try:
-                    await self.tcp_send(T_BCAST, struct.pack("!H", disc_port) + raw)
+                    await self.tcp_send(T_BCAST,
+                              struct.pack("!HH", disc_port, disc_port) + raw)
                 except (ConnectionResetError, BrokenPipeError, RuntimeError):
                     pass
 
@@ -194,10 +195,10 @@ class WinClient:
             while True:
                 mtype, payload = await tcp_read(reader)
                 if mtype == T_BCAST:
-                    if len(payload) < 2:
+                    if len(payload) < 4:
                         continue
                     (dport,) = struct.unpack("!H", payload[:2])
-                    raw = payload[2:]
+                    raw = payload[4:]
                     self.rebroadcast(dport, raw)
                 elif mtype == T_BCAST_FROM:
                     # attributed beacon from another node; source faking
@@ -205,7 +206,7 @@ class WinClient:
                     dec = decode_bcast_from(payload)
                     if not dec:
                         continue
-                    _node, dport, raw = dec
+                    _node, dport, _sport, raw = dec
                     self.rebroadcast(dport, raw)
                 elif mtype == T_TCP_DATA_S2C:
                     sid = struct.unpack("!I", payload[:4])[0]
