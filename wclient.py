@@ -74,6 +74,12 @@ class WinClient:
         self.dedup = Dedup()
         self.tcp_writer = None
         self.send_lock = asyncio.Lock()
+        # persistent broadcast socket (lazy): one socket for all re-emits,
+        # so our own source port is stable and the snoop can ignore it
+        # without a cache (see _own_echo)
+        self.bcast_sock = None
+        self.bcast_port = 0
+        self._route_ip = None
         # stream_id -> StreamWriter to local game (client side)
         self.local_tcp = {}
         self.next_stream = 1
@@ -92,18 +98,79 @@ class WinClient:
         async with self.send_lock:
             await tcp_send(self.tcp_writer, mtype, payload)
 
+    def _bcast_socket(self):
+        if self.bcast_sock is None:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except OSError:
+                    pass
+                s.bind(("0.0.0.0", 0))
+                self.bcast_sock = s
+                try:
+                    self.bcast_port = s.getsockname()[1]
+                except OSError:
+                    self.bcast_port = 0
+            except OSError as e:
+                print(f"[bcast] socket failed: {e}", flush=True)
+                return None
+        return self.bcast_sock
+
+    def _close_bcast(self):
+        s, self.bcast_sock = self.bcast_sock, None
+        self.bcast_port = 0
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _own_echo(self, addr):
+        # Is this snooped packet our own re-emit coming back? Decidable
+        # without a cache: our re-emits all leave from one stable source
+        # port. The local-IP check keeps a remote game that happens to
+        # share the port number from ever looking like us (then it just
+        # falls through to the relay dedup backstop).
+        try:
+            if not self.bcast_port or addr[1] != self.bcast_port:
+                return False
+        except (IndexError, TypeError):
+            return False
+        ip = addr[0]
+        if ip == "127.0.0.1":
+            return True
+        if self._route_ip is None:
+            try:
+                t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                t.connect((self.server_ip, self.port))
+                self._route_ip = t.getsockname()[0]
+                t.close()
+            except OSError:
+                self._route_ip = ""
+        return bool(self._route_ip) and ip == self._route_ip
+
     def rebroadcast(self, disc_port, raw):
         dst_ip, dst_port = self.rebroadcast_ip, disc_port
         if self.rebroadcast_to:
             from common import parse_hostport
             dst_ip, dst_port = parse_hostport(self.rebroadcast_to, disc_port)
+        s = self._bcast_socket()
+        if s is None:
+            return
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.sendto(raw, (dst_ip, dst_port))
-            s.close()
-        except OSError as e:
-            print(f"[bcast] re-emit {dst_ip}:{dst_port} failed: {e}", flush=True)
+        except OSError:
+            # socket died under us (rare): rebuild once and retry
+            self._close_bcast()
+            s = self._bcast_socket()
+            if s is None:
+                return
+            try:
+                s.sendto(raw, (dst_ip, dst_port))
+            except OSError as e:
+                print(f"[bcast] re-emit {dst_ip}:{dst_port} failed: {e}", flush=True)
 
     async def bcast_snoop(self, disc_port):
         loop = asyncio.get_running_loop()
@@ -116,7 +183,9 @@ class WinClient:
         await loop.create_datagram_endpoint(lambda: proto, sock=sock)
         print(f"[bcast] snooping {self.disc_bind}:{disc_port}", flush=True)
         while True:
-            raw, _ = await proto.q.get()
+            raw, addr = await proto.q.get()
+            if self._own_echo(addr):
+                continue
             key = hashlib.sha256(b"B" + struct.pack("!H", disc_port) + raw).digest()
             if self.dedup.hit(key):
                 continue
@@ -505,6 +574,7 @@ class WinClient:
                     pass
                 self.udp_tun = None
                 self.udp_tun_proto = None
+            self._close_bcast()
             for t in list(live):
                 if not t.done():
                     t.cancel()
