@@ -22,9 +22,11 @@ import argparse
 import asyncio
 import hashlib
 import os
+import random
 import socket
 import struct
 import sys
+import time
 
 if os.name == "nt":
     try:
@@ -33,17 +35,20 @@ if os.name == "nt":
         pass
 
 from common import (
-    T_BCAST, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C, T_TCP_CLOSE,
-    U_GAME_C2S, U_GAME_S2C, Dedup, QueueProto,
-    decode_udp_game, encode_udp_game, make_reuse_udp,
-    parse_ports, tcp_read, tcp_send,
+    T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
+    T_TCP_CLOSE, T_HELLO, T_NODE, U_GAME_C2S, U_GAME_S2C, U_NODE,
+    Dedup, QueueProto,
+    decode_udp_game, encode_udp_game, encode_hello, encode_udp_hello,
+    encode_node, encode_udp_node, decode_bcast_from,
+    make_reuse_udp, parse_ports, tcp_read, tcp_send,
 )
 
 
 class WinClient:
     def __init__(self, server_ip, port, disc_ports, tcp_ports, udp_ports,
                  rebroadcast_ip="255.255.255.255", rebroadcast_to=None,
-                 disc_bind="0.0.0.0", tcp_remote=None, udp_remote=None):
+                 disc_bind="0.0.0.0", tcp_remote=None, udp_remote=None,
+                 host_mode=False, token=""):
         self.server_ip = server_ip
         self.port = port
         self.disc_ports = disc_ports
@@ -53,6 +58,12 @@ class WinClient:
         # production: equal (remote defaults to local).
         self.tcp_remote = tcp_remote or {}
         self.udp_remote = udp_remote or {}
+        # --host: bridge inbound relay traffic to the LOCAL game instead
+        # of proxying a local game client out (skips proxy listeners).
+        self.host_mode = host_mode
+        self.token = token.encode() if isinstance(token, str) else (token or b"")
+        # virtual-IP membership: stable random node id per process
+        self.node_id = random.getrandbits(32) or 1
         self.rebroadcast_ip = rebroadcast_ip
         self.rebroadcast_to = rebroadcast_to
         self.disc_bind = disc_bind
@@ -62,11 +73,16 @@ class WinClient:
         # stream_id -> StreamWriter to local game (client side)
         self.local_tcp = {}
         self.next_stream = 1
+        # hosted streams: relay sid -> StreamWriter to local game server
+        self.host_game = {}
+        self.host_pending = {}  # sid -> bytearray (OPEN/DATA race)
         # game UDP port -> (transport, proto) local listener
         self.udp_local = {}
         # tunnel UDP transport/proto (ephemeral -> server:port)
         self.udp_tun = None
         self.udp_tun_proto = None
+        # hosted UDP: (tunnel_addr, game_port, cli_ip, cli_port) -> socket
+        self.udp_host_socks = {}
 
     async def tcp_send(self, mtype, payload):
         async with self.send_lock:
@@ -118,6 +134,16 @@ class WinClient:
                     if self.dedup.hit(hashlib.sha256(b"B" + payload).digest()):
                         continue
                     self.rebroadcast(dport, raw)
+                elif mtype == T_BCAST_FROM:
+                    # attributed beacon from another node; source faking
+                    # needs the hook, wclient just re-emits the payload
+                    dec = decode_bcast_from(payload)
+                    if not dec:
+                        continue
+                    _node, dport, raw = dec
+                    if self.dedup.hit(hashlib.sha256(b"BF" + payload).digest()):
+                        continue
+                    self.rebroadcast(dport, raw)
                 elif mtype == T_TCP_DATA_S2C:
                     sid = struct.unpack("!I", payload[:4])[0]
                     w = self.local_tcp.get(sid)
@@ -132,8 +158,74 @@ class WinClient:
                     w = self.local_tcp.pop(sid, None)
                     if w and not w.is_closing():
                         w.close()
+                    w = self.host_game.pop(sid, None)
+                    self.host_pending.pop(sid, None)
+                    if w and not w.is_closing():
+                        w.close()
+                elif mtype == T_TCP_OPEN:
+                    # inbound: relay routes another player's stream to our
+                    # local game server (--host bridge)
+                    if len(payload) < 6:
+                        continue
+                    sid, gport = struct.unpack("!IH", payload[:6])
+                    rev_tcp = {v: k for k, v in self.tcp_remote.items()}
+                    asyncio.create_task(
+                        self.host_dial(sid, rev_tcp.get(gport, gport)))
+                elif mtype == T_TCP_DATA_C2S:
+                    # inbound game data for a hosted stream
+                    if len(payload) < 4:
+                        continue
+                    (sid,) = struct.unpack("!I", payload[:4])
+                    w = self.host_game.get(sid)
+                    if w and not w.is_closing():
+                        w.write(payload[4:])
+                        try:
+                            await w.drain()
+                        except (ConnectionResetError, BrokenPipeError):
+                            pass
+                    else:
+                        self.host_pending.setdefault(sid, bytearray()).extend(payload[4:])
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
+
+    async def host_dial(self, sid, gport):
+        """Bridge one inbound relay stream to the local game server."""
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", gport)
+        except OSError as e:
+            print(f"[tcp] host dial 127.0.0.1:{gport} failed: {e}", flush=True)
+            self.host_pending.pop(sid, None)
+            try:
+                await self.tcp_send(T_TCP_CLOSE, struct.pack("!I", sid))
+            except Exception:
+                pass
+            return
+        early = self.host_pending.pop(sid, None)
+        if early:
+            writer.write(bytes(early))
+            try:
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+        self.host_game[sid] = writer
+        print(f"[tcp] hosted stream {sid} -> 127.0.0.1:{gport}", flush=True)
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                await self.tcp_send(T_TCP_DATA_S2C, struct.pack("!I", sid) + chunk)
+        except (ConnectionResetError, BrokenPipeError, RuntimeError):
+            pass
+        finally:
+            self.host_game.pop(sid, None)
+            self.host_pending.pop(sid, None)
+            if not writer.is_closing():
+                writer.close()
+            try:
+                await self.tcp_send(T_TCP_CLOSE, struct.pack("!I", sid))
+            except Exception:
+                pass
 
     async def tcp_local_listener(self, gport):
         rport = self.tcp_remote.get(gport, gport)
@@ -206,57 +298,170 @@ class WinClient:
     async def udp_tun_read(self):
         # tunnel replies carry REMOTE port; map back to local listen port
         rev_udp = {v: k for k, v in self.udp_remote.items()}
+        loop = asyncio.get_running_loop()
         while True:
-            data, _ = await self.udp_tun_proto.q.get()
+            data, addr = await self.udp_tun_proto.q.get()
             dec = decode_udp_game(data)
             if not dec:
                 continue
             mtype, gport, cip, cport, raw = dec
-            if mtype != U_GAME_S2C:
-                continue
-            local = rev_udp.get(gport, gport)
-            loc = self.udp_local.get(local)
-            if not loc:
-                continue
-            transport, _proto = loc
+            if mtype == U_GAME_S2C:
+                local = rev_udp.get(gport, gport)
+                loc = self.udp_local.get(local)
+                if not loc:
+                    continue
+                transport, _proto = loc
+                try:
+                    transport.sendto(raw, (cip, cport))
+                except OSError:
+                    pass
+            elif mtype == U_GAME_C2S:
+                # inbound: another player's datagram for our local game
+                await self.udp_host_recv(gport, cip, cport, raw, addr, loop)
+
+    async def udp_host_recv(self, gport, cip, cport, raw, tunnel_addr, loop):
+        rev_udp = {v: k for k, v in self.udp_remote.items()}
+        local = rev_udp.get(gport, gport)
+        key = (tunnel_addr, local, cip, cport)
+        s = self.udp_host_socks.get(key)
+        if s is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setblocking(False)
+            s.bind(("0.0.0.0", 0))
+            self.udp_host_socks[key] = s
+            asyncio.create_task(self.udp_host_readloop(key, s, local, loop))
+        try:
+            await loop.sock_sendto(s, raw, ("127.0.0.1", local))
+        except OSError:
+            pass
+
+    def _unmap_udp(self, local):
+        """Local port -> remote (real) game port for tunnel replies."""
+        for lcl, rmt in self.udp_remote.items():
+            if lcl == local:
+                return rmt
+        return local
+
+    async def udp_host_readloop(self, key, s, local, loop):
+        _tunnel, _port, cip, cport = key
+        remote = self._unmap_udp(local)
+        while True:
             try:
-                transport.sendto(raw, (cip, cport))
-            except OSError:
-                pass
+                data, _ = await asyncio.wait_for(loop.sock_recvfrom(s, 65535), timeout=30)
+            except asyncio.TimeoutError:
+                break
+            except (asyncio.CancelledError, OSError):
+                break
+            pkt = encode_udp_game(U_GAME_S2C, remote, cip, cport, data)
+            try:
+                self.udp_tun.sendto(pkt, (self.server_ip, self.port))
+            except (OSError, AttributeError):
+                break
+        self.udp_host_socks.pop(key, None)
+        s.close()
+
+    def send_udp_hello(self):
+        if not self.udp_tun:
+            return
+        try:
+            self.udp_tun.sendto(encode_udp_hello(self.token),
+                                (self.server_ip, self.port))
+        except OSError:
+            pass
+
+    def udp_port(self):
+        try:
+            t = self.udp_tun
+            if t is None:
+                return 0
+            s = t.get_extra_info("socket")
+            if s is None:
+                return 0
+            return s.getsockname()[1]
+        except OSError:
+            return 0
+
+    def send_udp_node(self):
+        if not self.udp_tun:
+            return
+        try:
+            self.udp_tun.sendto(
+                encode_udp_node(self.token, self.node_id, self.udp_port()),
+                (self.server_ip, self.port))
+        except OSError:
+            pass
+
+    async def send_tcp_node(self):
+        try:
+            await self.tcp_send(
+                T_NODE, encode_node(self.token, self.node_id, self.udp_port()))
+        except (ConnectionResetError, BrokenPipeError, RuntimeError,
+                AttributeError):
+            pass
+
+    async def hello_loop(self):
+        n = 0
+        while True:
+            self.send_udp_node()
+            if self.host_mode:
+                self.send_udp_hello()
+            if n % 2 == 0:
+                await self.send_tcp_node()  # refresh mapping ~60s
+            n += 1
+            await asyncio.sleep(30)
 
     async def run(self):
         backoff = 1
-        while True:
-            try:
-                print(f"[peer] dialing {self.server_ip}:{self.port} (TCP) ...", flush=True)
-                reader, writer = await asyncio.open_connection(self.server_ip, self.port)
-            except OSError as e:
-                print(f"[peer] dial failed: {e}, retry {backoff}s", flush=True)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 10)
-                continue
-            print("[peer] TCP connected", flush=True)
-            backoff = 1
-            self.tcp_writer = writer
-            self.local_tcp.clear()
-            tasks = [asyncio.create_task(self.tcp_reader_loop(reader))]
-            for d in self.disc_ports:
-                tasks.append(asyncio.create_task(self.bcast_snoop(d)))
-            for g in self.tcp_ports:
-                tasks.append(asyncio.create_task(self.tcp_local_listener(g)))
-            if self.udp_ports and self.udp_tun is None:
-                await self.udp_setup()
-            # wait until TCP drops; listeners die with it
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
+        live = set()  # per-connection child tasks (also reaped on teardown)
+        try:
+            while True:
+                cycle_t0 = time.monotonic()
+                try:
+                    print(f"[peer] dialing {self.server_ip}:{self.port} (TCP) ...", flush=True)
+                    reader, writer = await asyncio.open_connection(self.server_ip, self.port)
+                except OSError as e:
+                    print(f"[peer] dial failed: {e}, retry {backoff}s", flush=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 10)
+                    continue
+                print("[peer] TCP connected", flush=True)
+                backoff = 1
+                self.tcp_writer = writer
+                self.local_tcp.clear()
+                if self.host_mode:
+                    try:
+                        await self.tcp_send(T_HELLO, encode_hello(self.token))
+                    except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                        self.tcp_writer = None
+                        continue
+                await self.send_tcp_node()  # register node (+real UDP port later)
+                tasks = [asyncio.create_task(self.tcp_reader_loop(reader))]
+                for d in self.disc_ports:
+                    tasks.append(asyncio.create_task(self.bcast_snoop(d)))
+                if not self.host_mode:
+                    for g in self.tcp_ports:
+                        tasks.append(asyncio.create_task(self.tcp_local_listener(g)))
+                tasks.append(asyncio.create_task(self.hello_loop()))
+                live.update(tasks)
+                if (self.udp_ports or self.host_mode) and self.udp_tun is None:
+                    await self.udp_setup()
+                    await self.send_tcp_node()  # re-announce with real UDP port
+                # wait until TCP drops; listeners die with it
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                live.difference_update(tasks)
             try:
                 writer.close()
             except Exception:
                 pass
             self.tcp_writer = None
-            # reset UDP tunnel (NAT may have changed); local listeners persist
-            # keep udp_local transports open across reconnects
             if self.udp_tun:
                 try:
                     self.udp_tun.close()
@@ -264,18 +469,43 @@ class WinClient:
                     pass
                 self.udp_tun = None
                 self.udp_tun_proto = None
-                # force re-setup next loop (re-create tunnel, reuse local)
-                # mark so udp_setup recreates tunnel but not duplicate locals:
-                saved = self.udp_local
-                self.udp_local = saved
-                # simplest: clear locals too; they will rebind (REUSEADDR ok)
-                for tr, _ in saved.values():
+                # clear locals too; they will rebind (REUSEADDR ok)
+                for tr, _ in self.udp_local.values():
                     try:
                         tr.close()
                     except Exception:
                         pass
                 self.udp_local = {}
             print("[peer] disconnected, reconnecting...", flush=True)
+            if time.monotonic() - cycle_t0 < 1.0:
+                await asyncio.sleep(1.0)  # instant failure (e.g. bind clash): don't hot-loop
+        finally:
+            # external teardown: close the link (unblocks the reader) and
+            # reap children so no listeners/transports leak past us
+            if self.tcp_writer is not None:
+                try:
+                    self.tcp_writer.close()
+                except Exception:
+                    pass
+                self.tcp_writer = None
+            for tr, _ in self.udp_local.values():
+                try:
+                    tr.close()
+                except Exception:
+                    pass
+            self.udp_local = {}
+            if self.udp_tun:
+                try:
+                    self.udp_tun.close()
+                except Exception:
+                    pass
+                self.udp_tun = None
+                self.udp_tun_proto = None
+            for t in list(live):
+                if not t.done():
+                    t.cancel()
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
 
 
 def main():
@@ -286,25 +516,16 @@ def main():
     ap.add_argument("--tcp", default="", help="game TCP ports, comma")
     ap.add_argument("--udp", default="", help="game UDP ports, comma")
     ap.add_argument("--rebroadcast-ip", default="255.255.255.255")
-    ap.add_argument("--rebroadcast-to", default=None, help="test override IP:PORT")
-    ap.add_argument("--disc-bind", default="0.0.0.0")
-    ap.add_argument("--tcp-remote", default="", help="test-only map local:remote,comma")
-    ap.add_argument("--udp-remote", default="", help="test-only map local:remote,comma")
+    ap.add_argument("--host", action="store_true",
+                    help="bridge mode: serve inbound relay traffic to the LOCAL game "
+                         "(this PC hosts); skips proxy listeners")
+    ap.add_argument("--token", default="",
+                    help="room key: must match relay --token (empty = open relay)")
     a = ap.parse_args()
 
-    def parse_map(s):
-        m = {}
-        for part in s.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            l, r = part.split(":")
-            m[int(l)] = int(r)
-        return m
-
     c = WinClient(a.server, a.port, parse_ports(a.disc), parse_ports(a.tcp),
-                  parse_ports(a.udp), a.rebroadcast_ip, a.rebroadcast_to,
-                  a.disc_bind, parse_map(a.tcp_remote), parse_map(a.udp_remote))
+                  parse_ports(a.udp), a.rebroadcast_ip,
+                  host_mode=a.host, token=a.token)
     try:
         asyncio.run(c.run())
     except KeyboardInterrupt:

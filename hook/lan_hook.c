@@ -1,10 +1,10 @@
 /* Universal LAN->relay hook. Windows DLL + Linux LD_PRELOAD test build.
  *
- * Idea: keep ports, rewrite IP. Any RFC1918 / link-local / broadcast /
- * multicast IPv4 destination becomes LAN_HOOK_RELAY (default 127.0.0.1),
- * where wclient.py already listens on the same game ports. Inbound packets
- * from the relay are spoofed back to the original LAN IP so the
- * broadcast-only game believes it talks to LAN.
+ * Direct-tunnel mode (needs LAN_HOOK_SERVER): game traffic to LAN IPs is
+ * tunneled to the ShadowLAN relay - TCP streams multiplexed over one TCP
+ * link, game UDP over UDP, discovery over either. Without LAN_HOOK_SERVER
+ * the hook is a pure passthrough. Hosting games auto-claim designated-host
+ * via listen(); all peers get virtual LAN IPs for P2P mesh play.
  *
  * No TUN/TAP, no driver, no admin. Per-process: only the injected game
  * is affected.
@@ -40,7 +40,6 @@
 #endif
 
 /* ---------- shared policy ---------- */
-static unsigned long g_relay_ip = 0x0100007f; /* 127.0.0.1 network order */
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
 static int g_debug = 0;
@@ -48,13 +47,13 @@ static int g_debug = 0;
 static char g_server[256] = {0};
 static int g_srvport = 47777;
 static int g_direct = 0;
+/* hosting claim: set when the local game serves (listen() hook) */
+static volatile int g_claimed = 0;
+static volatile int g_hello_conn = 0; /* hello already sent on this link */
+static unsigned char g_token[256];
+static int g_token_len = 0;
 
 static void policy_init(void) {
-    const char *r = getenv("LAN_HOOK_RELAY");
-    if (r && r[0]) {
-        unsigned long v = inet_addr(r);
-        if (v != INADDR_NONE) g_relay_ip = v;
-    }
     const char *p = getenv("LAN_HOOK_PORTS");
     if (p && p[0]) {
         char tmp[512]; strncpy(tmp, p, sizeof(tmp) - 1); tmp[sizeof(tmp)-1] = 0;
@@ -62,6 +61,13 @@ static void policy_init(void) {
             g_only_ports[g_nports++] = atoi(t);
     }
     if (getenv("LAN_HOOK_DEBUG") && getenv("LAN_HOOK_DEBUG")[0] == '1') g_debug = 1;
+    const char *tk = getenv("LAN_HOOK_TOKEN");
+    if (tk && tk[0]) {
+        size_t tl = strlen(tk);
+        if (tl > sizeof(g_token)) tl = sizeof(g_token);
+        memcpy(g_token, tk, tl);
+        g_token_len = (int)tl;
+    }
     const char *s = getenv("LAN_HOOK_SERVER");
     if (s && s[0]) {
         strncpy(g_server, s, sizeof(g_server) - 1);
@@ -108,84 +114,11 @@ static int ipv4_is_bcast(unsigned long net_order) {
     return 0;
 }
 
-/* socket -> original peers. UDP uses FIFO queue (one request can yield
- * many replies, so we pop in order but keep last for extra replies);
- * TCP getpeername peeks last without consuming. */
-#define MAPN 256
-#define MAPQ 8
-struct mapent {
-    long long sock; struct sockaddr_in q[MAPQ]; int qn, qhead;
-    struct sockaddr_in last; int has_last; int used;
-};
-static struct mapent g_map[MAPN];
-#ifdef LINUX_BUILD
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK() pthread_mutex_lock(&g_mu)
-#define UNLOCK() pthread_mutex_unlock(&g_mu)
-#else
-static CRITICAL_SECTION g_cs; static int g_cs_init = 0;
-#define LOCK() EnterCriticalSection(&g_cs)
-#define UNLOCK() LeaveCriticalSection(&g_cs)
-#endif
-
-static void map_save(long long s, const struct sockaddr_in *orig) {
-    LOCK();
-    struct mapent *e = 0;
-    int freei = -1;
-    for (int i = 0; i < MAPN; i++) {
-        if (g_map[i].used && g_map[i].sock == s) { e = &g_map[i]; break; }
-        if (!g_map[i].used && freei < 0) freei = i;
-    }
-    if (!e) {
-        if (freei < 0) { UNLOCK(); return; }
-        e = &g_map[freei]; e->used = 1; e->sock = s; e->qn = 0; e->qhead = 0; e->has_last = 0;
-    }
-    if (e->qn < MAPQ) {
-        e->q[(e->qhead + e->qn) % MAPQ] = *orig; e->qn++;
-    } else {
-        e->q[e->qhead] = *orig; e->qhead = (e->qhead + 1) % MAPQ;
-    }
-    e->last = *orig; e->has_last = 1;
-    UNLOCK();
-}
-/* peek last (TCP getpeername: never consume) */
-static int map_lookup(long long s, struct sockaddr_in *out) {
-    int ok = 0; LOCK();
-    for (int i = 0; i < MAPN; i++)
-        if (g_map[i].used && g_map[i].sock == s && g_map[i].has_last) { *out = g_map[i].last; ok = 1; break; }
-    UNLOCK(); return ok;
-}
-/* pop oldest, else last (UDP recvfrom: ordered replies + multi-reply bcast) */
-static int map_next_udp(long long s, struct sockaddr_in *out) {
-    int ok = 0; LOCK();
-    for (int i = 0; i < MAPN; i++) {
-        if (g_map[i].used && g_map[i].sock == s) {
-            if (g_map[i].qn > 0) {
-                *out = g_map[i].q[g_map[i].qhead];
-                g_map[i].qhead = (g_map[i].qhead + 1) % MAPQ; g_map[i].qn--;
-                ok = 1;
-            } else if (g_map[i].has_last) { *out = g_map[i].last; ok = 1; }
-            break;
-        }
-    }
-    UNLOCK(); return ok;
-}
-static void map_drop(long long s) {
-    LOCK();
-    for (int i = 0; i < MAPN; i++)
-        if (g_map[i].used && g_map[i].sock == s) g_map[i].used = 0;
-    UNLOCK();
-}
-static int from_relay(const struct sockaddr_in *in) {
-    return in && in->sin_addr.s_addr == g_relay_ip;
-}
-
-/* rewrite dest copy in place; returns 1 if rewritten (and saves orig) */
-/* (inlined at call sites to keep Linux + Windows paths explicit) */
+/* Per-socket original-peer tables live in the direct-tunnel section below
+ * (DLOCK-protected). */
 
 /* ================= DIRECT TUNNEL CORE (hook dials server itself) ============= */
 /* Speaks server.py framing so no wclient.py is needed on the game PC.
- * Relay mode (no LAN_HOOK_SERVER) keeps the old 127.0.0.1 rewrite above.
  * Direct mode: TCP broadcast+game-TCP over one TCP link, game-UDP over UDP.
  * Include discovery UDP ports in server --udp too (unicast replies). */
 #ifdef LINUX_BUILD
@@ -202,12 +135,39 @@ typedef SOCKET DTSOCK;
 #endif
 
 #define DT_BCAST 0x01
+#define DT_BCAST_FROM 0x02
 #define DT_OPEN  0x10
 #define DT_C2S   0x11
 #define DT_S2C   0x12
 #define DT_CLOSE 0x13
+#define DT_HELLO 0x20
+#define DT_NODE 0x22
+#define DT_ASSIGN 0x23
+#define DT_POPEN 0x24
 #define DU_C2S 0x01
 #define DU_S2C 0x02
+#define DU_HELLO 0x10
+#define DU_NODE 0x11
+#define DU_PDAT 0x12
+/* virtual-IP membership (assigned by relay per token room) */
+static volatile unsigned g_node = 0;
+static unsigned g_myvirt = 0;      /* numeric, e.g. 0x0AC80002 */
+static unsigned char g_vnetb[4];   /* subnet bytes, network order */
+static int g_vbits = 24;
+#define DT_MAXMEMB 256
+static struct { unsigned node, virt; } g_members[DT_MAXMEMB]; /* virt numeric */
+static int g_nmembers = 0;
+static unsigned dt_rand_state = 0;
+static unsigned dt_rand(void) {
+    unsigned x = dt_rand_state;
+    if (!x) x = 0x9e3779b9u;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    dt_rand_state = x;
+    return x ? x : 1;
+}
+/* hosting claim: set when the local game serves (listen() hook).
+ * The claimer becomes the relay's designated host, so any peer —
+ * hook or wclient --host — can host with client-only software. */
 #define DT_MAXSTREAM 128
 #define DT_MAXUDP 128
 #define DT_MAXSLOT 256
@@ -339,6 +299,326 @@ static void dt_tcp_queue(unsigned char type, const unsigned char *p, size_t n) {
     if (g_sqt) g_sqt->next = f; else g_sqh = f;
     g_sqt = f;
     DUNLOCK();
+}
+/* Forward declarations: these helpers live further down the file. */
+static int dt_resolve(struct sockaddr_in *out);
+#ifdef LINUX_BUILD
+static void dt_reals(void);
+static ssize_t (*r_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+static int (*r_close)(int);
+static int (*r_connect)(int, const struct sockaddr *, socklen_t);
+#endif
+/* HELLO payload: !H token_len + token (matches common.encode_hello). */
+static size_t dt_hello_payload(unsigned char *out) {
+    out[0] = (unsigned char)((g_token_len >> 8) & 255);
+    out[1] = (unsigned char)(g_token_len & 255);
+    if (g_token_len) memcpy(out + 2, g_token, (size_t)g_token_len);
+    return (size_t)(2 + g_token_len);
+}
+static void dt_send_hello(void) {
+    unsigned char p[2 + 256];
+    dt_tcp_queue(DT_HELLO, p, dt_hello_payload(p));
+}
+static void dt_send_udp_hello(void) {
+    unsigned char d[4 + 2 + 256];
+    struct sockaddr_in sa;
+    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_HELLO;
+    size_t n = 4 + dt_hello_payload(d + 4);
+    if (dt_resolve(&sa) != 0) return;
+#ifdef LINUX_BUILD
+    dt_reals();
+    int u = g_udptun;
+    if (u >= 0) r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+#else
+    DTSOCK u = g_udptun;
+    if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
+#endif
+}
+/* Called when the local game starts serving: claim designated-host. */
+static void dt_claim(void) {
+    if (!g_direct) return;
+    g_claimed = 1;
+    DLOCK();
+    int need = !g_hello_conn;
+    if (need) g_hello_conn = 1;
+    DUNLOCK();
+    if (!need) return;  /* current link already hello'd */
+    dlog("hosting claim: game serves locally");
+    dt_send_hello();      /* queued; flushes on (re)connect */
+    dt_send_udp_hello();  /* best-effort now; 15s tick refreshes */
+}
+static int dt_tun_udp_port(void) {
+#ifdef LINUX_BUILD
+    struct sockaddr_in a; socklen_t l = sizeof(a);
+    if (g_udptun < 0) return 0;
+    if (getsockname(g_udptun, (struct sockaddr *)&a, &l) != 0) return 0;
+#else
+    struct sockaddr_in a; int l = sizeof(a);
+    if (g_udptun == INVALID_SOCKET) return 0;
+    if (getsockname(g_udptun, (struct sockaddr *)&a, &l) != 0) return 0;
+#endif
+    return ntohs(a.sin_port);
+}
+static void dt_send_node(void) {
+    unsigned char p[2 + 256 + 6];
+    size_t h = dt_hello_payload(p);
+    p[h] = (unsigned char)((g_node >> 24) & 255);
+    p[h + 1] = (unsigned char)((g_node >> 16) & 255);
+    p[h + 2] = (unsigned char)((g_node >> 8) & 255);
+    p[h + 3] = (unsigned char)(g_node & 255);
+    {
+        int pt = dt_tun_udp_port();
+        p[h + 4] = (unsigned char)((pt >> 8) & 255);
+        p[h + 5] = (unsigned char)(pt & 255);
+    }
+    dt_tcp_queue(DT_NODE, p, h + 6);
+}
+static void dt_send_udp_node(void) {
+    unsigned char d[4 + 2 + 256 + 6];
+    struct sockaddr_in sa;
+    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_NODE;
+    size_t h = dt_hello_payload(d + 4);
+    d[4 + h] = (unsigned char)((g_node >> 24) & 255);
+    d[5 + h] = (unsigned char)((g_node >> 16) & 255);
+    d[6 + h] = (unsigned char)((g_node >> 8) & 255);
+    d[7 + h] = (unsigned char)(g_node & 255);
+    {
+        int pt = dt_tun_udp_port();
+        d[8 + h] = (unsigned char)((pt >> 8) & 255);
+        d[9 + h] = (unsigned char)(pt & 255);
+    }
+    size_t n = 4 + h + 6;
+    if (dt_resolve(&sa) != 0) return;
+#ifdef LINUX_BUILD
+    dt_reals();
+    int u = g_udptun;
+    if (u >= 0) r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+#else
+    DTSOCK u = g_udptun;
+    if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
+#endif
+}
+/* Numeric IP (0x0AC80002 for 10.200.0.2) from network-order bytes. */
+static unsigned dt_ipnum(const unsigned char *b) {
+    return ((unsigned)b[0] << 24) | ((unsigned)b[1] << 16) |
+           ((unsigned)b[2] << 8) | (unsigned)b[3];
+}
+/* ASSIGN: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt),
+ * all multi-byte fields big-endian on the wire. */
+static void dt_apply_assign(const unsigned char *p, size_t n) {
+    if (n < 11) return;
+    {
+        int bits = p[8];
+        int cnt = ((int)p[9] << 8) | p[10];
+        if (bits <= 0 || bits > 32 || cnt < 0 || cnt > DT_MAXMEMB) return;
+        if (n != (size_t)(11 + 8 * cnt)) return;
+        DLOCK();
+        g_myvirt = dt_ipnum(p);
+        memcpy(g_vnetb, p + 4, 4);
+        g_vbits = bits;
+        g_nmembers = 0;
+        for (int i = 0; i < cnt && i < DT_MAXMEMB; i++) {
+            g_members[g_nmembers].node = dt_ipnum(p + 11 + 8 * i);
+            g_members[g_nmembers].virt = dt_ipnum(p + 15 + 8 * i);
+            g_nmembers++;
+        }
+        DUNLOCK();
+    }
+    dlog("assign: membership updated");
+}
+/* Network-order address -> node id (0 = not a known virtual peer). */
+static unsigned dt_virt_node(unsigned long inaddr) {
+    unsigned node = 0;
+    unsigned char ab[4];
+    memcpy(ab, &inaddr, 4);
+    DLOCK();
+    if (g_nmembers > 0 && g_vbits > 0 && g_vbits <= 32) {
+        int full = g_vbits / 8, rem = g_vbits % 8, ok = 1;
+        if (memcmp(g_vnetb, ab, (size_t)full) != 0) ok = 0;
+        else if (rem) {
+            unsigned m = (0xFFu << (8 - rem)) & 0xFFu;
+            if (((unsigned)g_vnetb[full] & m) != ((unsigned)ab[full] & m)) ok = 0;
+        }
+        if (ok && memcmp(g_vnetb, ab, 4) != 0) {
+            unsigned v = dt_ipnum(ab);
+            for (int i = 0; i < g_nmembers; i++)
+                if (g_members[i].virt == v) { node = g_members[i].node; break; }
+        }
+    }
+    DUNLOCK();
+    return node;
+}
+/* node id -> virtual IP (0 = unknown). */
+static unsigned dt_node_virt(unsigned node) {
+    unsigned virt = 0;
+    DLOCK();
+    for (int i = 0; i < g_nmembers; i++)
+        if (g_members[i].node == node) { virt = g_members[i].virt; break; }
+    DUNLOCK();
+    return virt;
+}
+/* ---- hosted (inbound) sessions: relay routes remote players to us ---- */
+#define DT_MAXHOST 64
+#define DT_MAXUSESS 64
+struct dt_hosted {
+    int used; unsigned sid;
+#ifdef LINUX_BUILD
+    int real;
+#else
+    SOCKET real;
+#endif
+    struct dt_chunk *h, *t; int dead;
+};
+static struct dt_hosted g_hs[DT_MAXHOST];
+struct dt_usess {
+    int used; int game_port; struct sockaddr_in cli;
+#ifdef LINUX_BUILD
+    int real;
+#else
+    SOCKET real;
+#endif
+    long long last;
+};
+static struct dt_usess g_us[DT_MAXUSESS];
+static long long dt_now_ms(void) {
+#ifdef LINUX_BUILD
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#else
+    return (long long)GetTickCount();
+#endif
+}
+static struct dt_hosted *dt_hs_by_sid(unsigned sid) {
+    for (int i = 0; i < DT_MAXHOST; i++)
+        if (g_hs[i].used && g_hs[i].sid == sid) return &g_hs[i];
+    return NULL;
+}
+static void dt_hs_push(unsigned sid, const unsigned char *p, size_t n) {
+    DLOCK();
+    struct dt_hosted *h = dt_hs_by_sid(sid);
+    if (h && !h->dead) {
+        struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
+        if (c) {
+            c->p = (unsigned char *)malloc(n ? n : 1);
+            if (c->p) { if (n) memcpy(c->p, p, n); c->n = n; c->off = 0; c->next = NULL;
+                if (h->t) h->t->next = c; else h->h = c; h->t = c;
+            } else free(c);
+        }
+    }
+    DUNLOCK();
+}
+static void dt_hs_close(unsigned sid, int notify) {
+    struct dt_hosted hcp; int have = 0;
+    DLOCK();
+    struct dt_hosted *h = dt_hs_by_sid(sid);
+    if (h) { hcp = *h; have = 1; h->used = 0; h->h = h->t = NULL; }
+    DUNLOCK();
+    if (!have) return;
+    struct dt_chunk *c = hcp.h;
+    while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+#ifdef LINUX_BUILD
+    dt_reals();
+    if (hcp.real >= 0) r_close(hcp.real);
+#else
+    if (hcp.real != INVALID_SOCKET) closesocket(hcp.real);
+#endif
+    if (notify) { unsigned char b[4]; dt_put32(b, sid); dt_tcp_queue(DT_CLOSE, b, 4); }
+}
+/* Open a real loopback connection to our own game server. */
+static int dt_host_open(unsigned sid, int port) {
+    struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
+    lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)port);
+    lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef LINUX_BUILD
+    dt_reals();
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    if (r_connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { r_close(s); return -1; }
+#else
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return -1;
+    if (connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { closesocket(s); return -1; }
+#endif
+    DLOCK();
+    struct dt_hosted *h = NULL;
+    for (int i = 0; i < DT_MAXHOST; i++)
+        if (!g_hs[i].used) { h = &g_hs[i]; break; }
+    if (h) { h->used = 1; h->sid = sid; h->real = s; h->h = h->t = NULL; h->dead = 0; }
+    DUNLOCK();
+    if (!h) {
+#ifdef LINUX_BUILD
+        r_close(s);
+#else
+        closesocket(s);
+#endif
+        return -1;
+    }
+    return 0;
+}
+static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
+                                      size_t rl, const struct sockaddr_in *cli) {
+    (void)raw; (void)rl;
+    long long now = dt_now_ms();
+    for (int i = 0; i < DT_MAXUSESS; i++)
+        if (g_us[i].used && g_us[i].game_port == game_port &&
+            g_us[i].cli.sin_addr.s_addr == cli->sin_addr.s_addr &&
+            g_us[i].cli.sin_port == cli->sin_port)
+            return &g_us[i];
+    for (int i = 0; i < DT_MAXUSESS; i++)
+        if (!g_us[i].used || now - g_us[i].last > 45000) {
+            if (g_us[i].used) {
+#ifdef LINUX_BUILD
+                dt_reals(); r_close(g_us[i].real);
+#else
+                closesocket(g_us[i].real);
+#endif
+            }
+            g_us[i].used = 1; g_us[i].game_port = game_port;
+            g_us[i].cli = *cli; g_us[i].last = now;
+#ifdef LINUX_BUILD
+            dt_reals();
+            g_us[i].real = socket(AF_INET, SOCK_DGRAM, 0);
+            if (g_us[i].real < 0) { g_us[i].used = 0; continue; }
+#else
+            g_us[i].real = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (g_us[i].real == INVALID_SOCKET) { g_us[i].used = 0; continue; }
+#endif
+            return &g_us[i];
+        }
+    return NULL;
+}
+/* Inbound game datagram for OUR hosted game -> real loopback socket.
+ * Caller: UDP tunnel thread. Locking: takes DLOCK internally. */
+static void dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
+                             int cport, const unsigned char *raw, size_t rl) {
+    char ipstr[64];
+    if (iplen <= 0 || iplen >= (int)sizeof(ipstr) || rl > 65000) return;
+    memcpy(ipstr, ipb, (size_t)iplen); ipstr[iplen] = 0;
+    struct sockaddr_in cli; memset(&cli, 0, sizeof(cli));
+    cli.sin_family = AF_INET; cli.sin_port = htons((unsigned short)cport);
+    cli.sin_addr.s_addr = inet_addr(ipstr);
+    if (cli.sin_addr.s_addr == INADDR_NONE) return;
+    struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
+    lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)game_port);
+    lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef LINUX_BUILD
+    dt_reals();
+    DLOCK();
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli);
+    int rs = u ? u->real : -1;
+    if (u) u->last = dt_now_ms();
+    DUNLOCK();
+    if (!u) return;
+    r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+#else
+    DLOCK();
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli);
+    SOCKET rs = u ? u->real : INVALID_SOCKET;
+    if (u) u->last = dt_now_ms();
+    DUNLOCK();
+    if (!u || rs == INVALID_SOCKET) return;
+    sendto(rs, (const char *)raw, (int)rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+#endif
 }
 static struct dt_stream *dt_stream_by_sock(long long s) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
@@ -472,16 +752,21 @@ static int dt_recv_all(SOCKET s, unsigned char *b, size_t n) {
 }
 #endif
 
-static void dt_dispatch_bcast(int port, const unsigned char *raw, size_t n) {
+static void dt_dispatch_bcast_from(unsigned node, int port,
+                                     const unsigned char *raw, size_t n) {
     struct sockaddr_in fake; memset(&fake, 0, sizeof(fake));
     fake.sin_family = AF_INET; fake.sin_port = htons((unsigned short)port);
-    fake.sin_addr.s_addr = g_fakeip;
+    {
+        unsigned virt = node ? dt_node_virt(node) : 0;
+        fake.sin_addr.s_addr = virt ? htonl(virt) : g_fakeip;
+    }
     DLOCK();
     for (int i = 0; i < DT_MAXUDP; i++) {
         if (!g_uq[i].used || g_uq[i].closed) continue;
         long long gs = g_uq[i].gsock;
         DUNLOCK();
         int bp = dt_bound_port(gs);
+        { char lb[128]; snprintf(lb, sizeof(lb), "fanout port=%d sock=%lld bound=%d", port, gs, bp); dlog(lb); }
         DLOCK();
         /* re-find (table may shift); keep simple: match by gsock again */
         struct dt_udp *e = NULL;
@@ -501,6 +786,9 @@ static void dt_dispatch_bcast(int port, const unsigned char *raw, size_t n) {
     }
     DUNLOCK();
 }
+static void dt_dispatch_bcast(int port, const unsigned char *raw, size_t n) {
+    dt_dispatch_bcast_from(0, port, raw, n);
+}
 static void dt_dispatch_s2c(unsigned sid, const unsigned char *raw, size_t n) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sid(sid);
@@ -519,7 +807,31 @@ static void dt_dispatch_close(unsigned sid) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sid(sid);
     if (st) st->dead = 1;
+    struct dt_hosted *h = dt_hs_by_sid(sid);
+    if (h) h->dead = 1;
     DUNLOCK();
+}
+/* Inbound game data for a hosted stream -> real loopback socket. */
+static void dt_host_data(unsigned sid, const unsigned char *p, size_t n) {
+#ifdef LINUX_BUILD
+    dt_reals();
+#endif
+    DLOCK();
+    struct dt_hosted *h = dt_hs_by_sid(sid);
+#ifdef LINUX_BUILD
+    int rs = h ? h->real : -1;
+    int dead = h ? h->dead : 1;
+#else
+    SOCKET rs = h ? h->real : INVALID_SOCKET;
+    int dead = h ? h->dead : 1;
+#endif
+    DUNLOCK();
+    if (!h || dead) return;
+#ifdef LINUX_BUILD
+    while (n) { ssize_t k = r_send(rs, p, n, 0); if (k <= 0) break; p += k; n -= (size_t)k; }
+#else
+    while (n) { int k = send(rs, (const char *)p, (int)n, 0); if (k <= 0) break; p += k; n -= (size_t)k; }
+#endif
 }
 
 /* TCP tunnel thread: one link carrying BCAST + all TCP streams */
@@ -564,6 +876,12 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
 #endif
         g_tcp_up = 1;
         dlog("tunnel TCP up");
+        DLOCK();
+        int need_hello = g_claimed && !g_hello_conn;
+        if (need_hello) g_hello_conn = 1;
+        DUNLOCK();
+        if (need_hello) dt_send_hello(); /* reclaim after redial, once */
+        dt_send_node(); /* (re)register membership + UDP endpoint */
         /* Re-announce live TCP streams: the server drops per-connection
          * streams on disconnect. Requeue OPENs at the FRONT (ahead of any
          * still-queued DATA) and drop stale queued OPENs to avoid dups. */
@@ -646,14 +964,31 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
             unsigned char t = pl[0];
             if (t == DT_BCAST && ml >= 3) {
                 dt_dispatch_bcast((int)dt_get16(pl + 1), pl + 3, ml - 3);
+            } else if (t == DT_BCAST_FROM && ml >= 7) {
+                unsigned node = dt_get32(pl + 1);
+                { char lb[96]; snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d n=%u", node, (int)dt_get16(pl + 5), ml - 7); dlog(lb); }
+                dt_dispatch_bcast_from(node, (int)dt_get16(pl + 5), pl + 7, ml - 7);
+            } else if (t == DT_ASSIGN && ml >= 2) {
+                dt_apply_assign(pl + 1, ml - 1);
             } else if (t == DT_S2C && ml >= 5) {
                 dt_dispatch_s2c(dt_get32(pl + 1), pl + 5, ml - 5);
             } else if (t == DT_CLOSE && ml >= 5) {
                 dt_dispatch_close(dt_get32(pl + 1));
+            } else if (t == DT_OPEN && ml >= 7) {
+                /* inbound: another player joins OUR game */
+                unsigned sid = dt_get32(pl + 1);
+                int gport = (int)dt_get16(pl + 5);
+                if (dt_host_open(sid, gport) != 0) {
+                    unsigned char b[4]; dt_put32(b, sid);
+                    dt_tcp_queue(DT_CLOSE, b, 4);
+                } else dlog("hosted TCP stream up");
+            } else if (t == DT_C2S && ml >= 5) {
+                dt_host_data(dt_get32(pl + 1), pl + 5, ml - 5);
             }
         }
 redial:
         g_tcp_up = 0;
+        g_hello_conn = 0; /* next link re-hellos once */
         dlog("tunnel TCP redial");
 #ifdef LINUX_BUILD
         r_close(s);
@@ -669,6 +1004,162 @@ redial:
         dt_msleep(1000);
     }
     if (pl) free(pl);
+#ifdef LINUX_BUILD
+    return NULL;
+#else
+    return 0;
+#endif
+}
+
+/* Hosted poller: serves loopback sockets owned by inbound sessions. */
+#ifdef LINUX_BUILD
+static void *dt_hosted_thread(void *u) {
+#else
+static DWORD WINAPI dt_hosted_thread(LPVOID u) {
+#endif
+    (void)u;
+#ifdef LINUX_BUILD
+    dt_reals();
+#endif
+    unsigned char buf[65536];
+    for (;;) {
+        if (!g_tun_run) break;
+        /* snapshot live fds */
+        struct { long long fd; unsigned sid; int udp; int gport;
+                 struct sockaddr_in cli; int slot; } fds[DT_MAXHOST + DT_MAXUSESS];
+        int nfds = 0;
+        long long now = dt_now_ms();
+        DLOCK();
+        for (int i = 0; i < DT_MAXHOST && nfds < (int)(sizeof(fds) / sizeof(fds[0])); i++) {
+            if (g_hs[i].used && !g_hs[i].dead) {
+#ifdef LINUX_BUILD
+                if (g_hs[i].real < 0) continue;
+#else
+                if (g_hs[i].real == INVALID_SOCKET) continue;
+#endif
+                fds[nfds].fd = (long long)g_hs[i].real;
+                fds[nfds].sid = g_hs[i].sid; fds[nfds].udp = 0; nfds++;
+            }
+        }
+        for (int i = 0; i < DT_MAXUSESS && nfds < (int)(sizeof(fds) / sizeof(fds[0])); i++) {
+            if (g_us[i].used) {
+#ifdef LINUX_BUILD
+                if (g_us[i].real < 0) { g_us[i].used = 0; continue; }
+#else
+                if (g_us[i].real == INVALID_SOCKET) { g_us[i].used = 0; continue; }
+#endif
+                if (now - g_us[i].last > 45000) {
+                    /* expire idle session */
+#ifdef LINUX_BUILD
+                    int rs = g_us[i].real;
+#else
+                    DTSOCK rs = g_us[i].real;
+#endif
+                    g_us[i].used = 0;
+                    DUNLOCK();
+#ifdef LINUX_BUILD
+                    r_close(rs);
+#else
+                    closesocket(rs);
+#endif
+                    DLOCK();
+                    continue;
+                }
+                fds[nfds].fd = (long long)g_us[i].real;
+                fds[nfds].sid = 0; fds[nfds].udp = 1;
+                fds[nfds].gport = g_us[i].game_port;
+                fds[nfds].cli = g_us[i].cli; fds[nfds].slot = i; nfds++;
+            }
+        }
+        DUNLOCK();
+        if (!nfds) { dt_msleep(100); continue; }
+        fd_set rf; FD_ZERO(&rf);
+#ifdef LINUX_BUILD
+        int maxfd = -1;
+        for (int i = 0; i < nfds; i++) {
+            FD_SET((int)fds[i].fd, &rf);
+            if ((int)fds[i].fd > maxfd) maxfd = (int)fds[i].fd;
+        }
+        struct timeval tv = {0, 100000};
+        int r = select(maxfd + 1, &rf, NULL, NULL, &tv);
+#else
+        for (int i = 0; i < nfds; i++) FD_SET((SOCKET)fds[i].fd, &rf);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
+        int r = select(0, &rf, NULL, NULL, &tv);
+#endif
+        if (!g_tun_run) break;
+        if (r <= 0) continue;
+        for (int i = 0; i < nfds; i++) {
+#ifdef LINUX_BUILD
+            if (!FD_ISSET((int)fds[i].fd, &rf)) continue;
+#else
+            if (!FD_ISSET((SOCKET)fds[i].fd, &rf)) continue;
+#endif
+            if (!fds[i].udp) {
+                /* hosted TCP: game -> tunnel */
+#ifdef LINUX_BUILD
+                ssize_t n = r_recv((int)fds[i].fd, buf, sizeof(buf), 0);
+#else
+                int n = recv((SOCKET)fds[i].fd, (char *)buf, (int)sizeof(buf), 0);
+#endif
+                if (n <= 0) {
+                    dt_hs_close(fds[i].sid, 1);
+                } else {
+                    unsigned char *p = (unsigned char *)malloc(4 + (size_t)n);
+                    if (p) {
+                        dt_put32(p, fds[i].sid);
+                        memcpy(p + 4, buf, (size_t)n);
+                        dt_tcp_queue(DT_S2C, p, 4 + (size_t)n);
+                        free(p);
+                    }
+                }
+            } else {
+                /* hosted UDP: game -> tunnel (only our game talks here) */
+#ifdef LINUX_BUILD
+                ssize_t n = r_recv((int)fds[i].fd, buf, sizeof(buf), 0);
+#else
+                int n = recv((SOCKET)fds[i].fd, (char *)buf, (int)sizeof(buf), 0);
+#endif
+                if (n <= 0) continue;
+                const char *mip = NULL; int ml = 0;
+                /* rebuild caller triple from snapshot */
+                char ipb[64]; int iplen;
+                {
+                    unsigned long a = ntohl(fds[i].cli.sin_addr.s_addr);
+                    iplen = snprintf(ipb, sizeof(ipb), "%lu.%lu.%lu.%lu",
+                                     (a >> 24) & 255, (a >> 16) & 255,
+                                     (a >> 8) & 255, a & 255);
+                    mip = ipb; ml = iplen;
+                }
+                size_t pktn = 4 + 2 + 2 + (size_t)ml + 2 + (size_t)n;
+                unsigned char *d = (unsigned char *)malloc(pktn);
+                if (!d) continue;
+                d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_S2C;
+                dt_put16(d + 4, (unsigned)fds[i].gport);
+                dt_put16(d + 6, (unsigned)ml);
+                memcpy(d + 8, mip, (size_t)ml);
+                dt_put16(d + 8 + ml, (unsigned)ntohs(fds[i].cli.sin_port));
+                memcpy(d + 10 + ml, buf, (size_t)n);
+                {
+                    struct sockaddr_in sa;
+                    if (dt_resolve(&sa) == 0) {
+#ifdef LINUX_BUILD
+                        r_sendto(g_udptun, d, pktn, 0, (struct sockaddr *)&sa, sizeof(sa));
+#else
+                        if (g_udptun != INVALID_SOCKET)
+                            sendto(g_udptun, (const char *)d, (int)pktn, 0,
+                                   (struct sockaddr *)&sa, sizeof(sa));
+#endif
+                    }
+                }
+                free(d);
+                DLOCK();
+                for (int j = 0; j < DT_MAXUSESS; j++)
+                    if (g_us[j].used && j == fds[i].slot) { g_us[j].last = dt_now_ms(); break; }
+                DUNLOCK();
+            }
+        }
+    }
 #ifdef LINUX_BUILD
     return NULL;
 #else
@@ -693,6 +1184,20 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
     }
     for (;;) {
         if (!g_tun_run) break;
+        {
+            static long long last_nd = 0;
+            long long nown = dt_now_ms();
+            if (nown - last_nd > 30000) {
+                last_nd = nown;
+                dt_send_node();      /* TCP: membership + UDP endpoint */
+                dt_send_udp_node();  /* UDP: refresh NAT mapping */
+            }
+        }
+        {
+            static long long last_hb = 0;
+            long long nowhb = dt_now_ms();
+            if (g_claimed && nowhb - last_hb > 15000) { last_hb = nowhb; dt_send_udp_hello(); }
+        }
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         struct timeval tv = {0, 200000};
         int r = select(s + 1, &rf, NULL, NULL, &tv);
@@ -701,7 +1206,17 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         unsigned char buf[65535];
         ssize_t n = r_recv(s, buf, sizeof(buf), 0);
         if (n <= 0) continue;
-        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1 || buf[3] != DU_S2C) continue;
+        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
+        if (buf[3] == DU_C2S) {
+            /* inbound: another player targets OUR hosted game */
+            int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
+            if (8 + il2 + 2 > n) continue;
+            int cport2 = dt_get16(buf + 8 + il2);
+            dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
+                             buf + 10 + il2, (size_t)(n - 10 - il2));
+            continue;
+        }
+        if (buf[3] != DU_S2C) continue;
         dlog("udp tun: S2C in");
         int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
         if (8 + il + 2 > n) continue;
@@ -727,6 +1242,20 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
     }
     for (;;) {
         if (!g_tun_run) break;
+        {
+            static long long last_nd = 0;
+            long long nown = dt_now_ms();
+            if (nown - last_nd > 30000) {
+                last_nd = nown;
+                dt_send_node();      /* TCP: membership + UDP endpoint */
+                dt_send_udp_node();  /* UDP: refresh NAT mapping */
+            }
+        }
+        {
+            static long long last_hb = 0;
+            long long nowhb = dt_now_ms();
+            if (g_claimed && nowhb - last_hb > 15000) { last_hb = nowhb; dt_send_udp_hello(); }
+        }
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
         int r = select(0, &rf, NULL, NULL, &tv);
@@ -735,7 +1264,17 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         unsigned char buf[65535];
         int n = recv(s, (char *)buf, (int)sizeof(buf), 0);
         if (n <= 0) continue;
-        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1 || buf[3] != DU_S2C) continue;
+        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
+        if (buf[3] == DU_C2S) {
+            /* inbound: another player targets OUR hosted game */
+            int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
+            if (8 + il2 + 2 > n) continue;
+            int cport2 = dt_get16(buf + 8 + il2);
+            dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
+                             buf + 10 + il2, (size_t)(n - 10 - il2));
+            continue;
+        }
+        if (buf[3] != DU_S2C) continue;
         int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
         if (8 + il + 2 > n) continue;
         int mp = dt_get16(buf + 8 + il);
@@ -758,6 +1297,16 @@ static void dt_start(void) {
     if (g_tun_started || !g_direct) return;
     g_tun_started = 1; g_tun_run = 1;
     g_fakeip = inet_addr("192.168.7.1");
+    if (!g_node) {
+        /* stable-ish random node id (loopback tests fork rarely collide) */
+#ifdef LINUX_BUILD
+        dt_rand_state = (unsigned)dt_now_ms() ^ ((unsigned)getpid() << 16);
+#else
+        dt_rand_state = (unsigned)GetTickCount() ^ (GetCurrentProcessId() << 16);
+#endif
+        g_node = dt_rand() | 1;
+    }
+    dt_send_udp_node(); /* early NAT mapping; 30s tick + T_NODE refresh it */
     /* Create the UDP tunnel socket synchronously: game threads may send
      * within microseconds of the first intercepted call, before a
      * background thread would get scheduled. */
@@ -788,6 +1337,7 @@ static void dt_start(void) {
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         pthread_create(&t, &a, dt_tcp_thread, NULL);
         pthread_create(&t, &a, dt_udp_thread, NULL);
+        pthread_create(&t, &a, dt_hosted_thread, NULL);
         pthread_attr_destroy(&a);
     }
 #else
@@ -796,6 +1346,8 @@ static void dt_start(void) {
         HANDLE t = CreateThread(NULL, 0, dt_tcp_thread, NULL, 0, NULL);
         if (t) CloseHandle(t);
         t = CreateThread(NULL, 0, dt_udp_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+        t = CreateThread(NULL, 0, dt_hosted_thread, NULL, 0, NULL);
         if (t) CloseHandle(t);
     }
 #endif
@@ -810,11 +1362,57 @@ static unsigned dt_next_sid(void) {
 #endif
 }
 /* UDP sendto: bcast->TCP BCAST, unicast LAN->UDP GAME. -1 game-port means skip */
+static void dt_udp_tun_send(const unsigned char *d, size_t n) {
+    struct sockaddr_in sa;
+    if (dt_resolve(&sa) != 0) { dlog("udp game: resolve failed"); return; }
+#ifdef LINUX_BUILD
+    dt_reals();
+    int u = g_udptun;
+    if (u >= 0) {
+        ssize_t k = r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+        if (k < 0) dlog("udp game: tunnel send failed");
+    } else dlog("udp game: no tunnel sock yet");
+#else
+    DTSOCK u = g_udptun;
+    if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
+    else dlog("udp game: no tunnel sock yet");
+#endif
+}
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
+    unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
+    int game_port = ntohs(dst->sin_port);
+    {
+        char lb[160];
+        unsigned long a = 0; memcpy(&a, &dst->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "on_sendto fd=%lld port=%d addr=%lu.%lu.%lu.%lu vnode=%u",
+                 gsock, game_port, (a & 255), ((a >> 8) & 255), ((a >> 16) & 255),
+                 ((a >> 24) & 255), vnode);
+        dlog(lb);
+    }
+    if (vnode && !ipv4_is_bcast(dst->sin_addr.s_addr)) {
+        /* addressed P2P datagram: same slot scheme, dest-prefixed frame */
+        DLOCK();
+        struct dt_slot *sl = dt_slot_get(gsock, game_port, dst);
+        int slot = sl ? (int)(sl - g_sl) : -1;
+        DUNLOCK();
+        if (slot < 0) return 1;
+        const char *mip = "127.0.0.1"; int ml = 9, mark = 50000 + slot;
+        size_t n = 4 + 4 + 2 + 2 + (size_t)ml + 2 + len;
+        unsigned char *d = (unsigned char *)malloc(n);
+        if (!d) return 1;
+        d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_PDAT;
+        dt_put32(d + 4, vnode);
+        dt_put16(d + 8, (unsigned)game_port); dt_put16(d + 10, (unsigned)ml);
+        memcpy(d + 12, mip, (size_t)ml); dt_put16(d + 12 + ml, (unsigned)mark);
+        if (len) memcpy(d + 14 + ml, buf, len);
+        dt_udp_tun_send(d, n);
+        free(d);
+        DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        return 1;
+    }
     int port = 0;
     if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
-    int game_port = ntohs(dst->sin_port);
     if (ipv4_is_bcast(dst->sin_addr.s_addr)) {
         unsigned char *p = (unsigned char *)malloc(2 + len);
         if (!p) return 1;
@@ -839,30 +1437,14 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     dt_put16(d + 4, (unsigned)game_port); dt_put16(d + 6, (unsigned)ml);
     memcpy(d + 8, mip, (size_t)ml); dt_put16(d + 8 + ml, (unsigned)mark);
     if (len) memcpy(d + 10 + ml, buf, len);
-    {
-        struct sockaddr_in sa;
-        if (dt_resolve(&sa) == 0) {
-#ifdef LINUX_BUILD
-            dt_reals();
-            int u = g_udptun;
-            if (u >= 0) {
-                ssize_t k = r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
-                if (k < 0) dlog("udp game: tunnel send failed");
-            } else dlog("udp game: no tunnel sock yet");
-#else
-            DTSOCK u = g_udptun;
-            if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
-#endif
-        } else dlog("udp game: resolve failed");
-    }
+    dt_udp_tun_send(d, n);
     free(d);
     DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
     return 1;
 }
-static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
-    int port = 0;
-    if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
-    if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
+static struct dt_stream *dt_stream_alloc(long long gsock,
+                                         const struct sockaddr_in *dst,
+                                         unsigned *sid_out) {
     unsigned sid = dt_next_sid();
     if (!sid) sid = dt_next_sid();
     DLOCK();
@@ -874,7 +1456,27 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
         st->h = st->t = NULL; st->total = 0; st->dead = 0;
     }
     DUNLOCK();
-    if (!st) return 1; /* table full: fake success, data dropped */
+    if (st) *sid_out = sid;
+    return st;
+}
+static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
+    unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
+    if (vnode) {
+        /* addressed P2P stream */
+        if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
+        unsigned sid = 0;
+        if (!dt_stream_alloc(gsock, dst, &sid)) return 1;
+        unsigned char ob[10];
+        dt_put32(ob, sid); dt_put32(ob + 4, vnode);
+        dt_put16(ob + 8, (unsigned)ntohs(dst->sin_port));
+        dt_tcp_queue(DT_POPEN, ob, 10);
+        return 1;
+    }
+    int port = 0;
+    if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
+    if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
+    unsigned sid = 0;
+    if (!dt_stream_alloc(gsock, dst, &sid)) return 1; /* table full */
     unsigned char ob[6]; dt_put32(ob, sid); dt_put16(ob + 4, (unsigned)ntohs(dst->sin_port));
     dt_tcp_queue(DT_OPEN, ob, 6);
     return 1;
@@ -919,6 +1521,7 @@ static int dt_getpeer(long long gsock, struct sockaddr_in *out) {
 }
 /* peek for poll/select hooks: tunnel data pending? (no consume) */
 static int dt_udp_has(long long gsock) {
+
     int r = 0; DLOCK();
     struct dt_udp *e = dt_udp_entry(gsock, 0);
     r = (e && !e->closed && e->h) ? 1 : 0;
@@ -930,9 +1533,20 @@ static int dt_stream_has(long long gsock) {
     if (st) r = (st->h || st->dead) ? 1 : 0; /* dead reads EOF = readable */
     DUNLOCK(); return r;
 }
+/* Timeout sockets park in poll()/select() BEFORE ever calling recvfrom,
+ * so the wait hooks must register DGRAM interest too — otherwise fan-out
+ * finds no entry and tunnel broadcasts are dropped. */
+static void dt_udp_ensure(long long gsock) {
+    if (dt_sock_type(gsock) != SOCK_DGRAM) return;
+    DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+}
 static int dt_fd_readable(long long gsock) {
+    dt_udp_ensure(gsock);
     return dt_udp_has(gsock) || dt_stream_has(gsock);
 }
+/* Timeout sockets park in poll()/select() BEFORE ever calling recvfrom,
+ * so the wait hooks must register DGRAM interest too — otherwise fan-out
+ * finds no entry and tunnel broadcasts are dropped. */
 static void dt_on_close(long long gsock) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
@@ -946,7 +1560,6 @@ static void dt_on_close(long long gsock) {
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
     DUNLOCK();
     if (sid) { unsigned char b[4]; dt_put32(b, sid); dt_tcp_queue(DT_CLOSE, b, 4); }
-    map_drop(gsock);
 #ifndef LINUX_BUILD
     DLOCK();
     for (int i = 0; i < (int)(sizeof(g_nbt) / sizeof(g_nbt[0])); i++)
@@ -1006,15 +1619,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                          (const struct sockaddr_in *)dest))
             return (ssize_t)len;
     }
-    struct sockaddr_in cp; const struct sockaddr *dp = dest;
-    if (dest && dest->sa_family == AF_INET && addrlen >= sizeof(cp)) {
-        memcpy(&cp, dest, sizeof(cp));
-        int port = 0;
-        if (sockaddr_is_lan_target(dest, &port)) {
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip; map_save(sockfd, &o); dp = (struct sockaddr*)&cp;
-        }
-    }
-    return real_sendto(sockfd, buf, len, flags, dp, addrlen);
+    return real_sendto(sockfd, buf, len, flags, dest, addrlen);
 }
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                  struct sockaddr *src, socklen_t *addrlen) {
@@ -1059,14 +1664,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
     struct sockaddr_in from; socklen_t fl = sizeof(from);
     struct sockaddr *sp = src ? src : (struct sockaddr*)&from;
     socklen_t *lp = src ? addrlen : &fl;
-    ssize_t n = real_recvfrom(sockfd, buf, len, flags, sp, lp);
-    if (n >= 0 && sp->sa_family == AF_INET) {
-        struct sockaddr_in *in = (struct sockaddr_in*)sp;
-        if (from_relay(in)) {
-            struct sockaddr_in o; if (map_next_udp(sockfd, &o)) *in = o;
-        }
-    }
-    return n;
+    return real_recvfrom(sockfd, buf, len, flags, sp, lp);
 }
 ssize_t send(int s, const void *buf, size_t len, int flags) {
     static ssize_t (*real_send)(int, const void *, size_t, int) = 0;
@@ -1106,17 +1704,22 @@ int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
     if (g_direct && a && a->sa_family == AF_INET && l >= sizeof(struct sockaddr_in)) {
         if (dt_on_connect((long long)s, (const struct sockaddr_in *)a)) return 0;
     }
-    struct sockaddr_in cp; const struct sockaddr *ap = a;
-    if (a && a->sa_family == AF_INET && l >= sizeof(cp)) {
-        memcpy(&cp, a, sizeof(cp));
-        int port = 0;
-        if (sockaddr_is_lan_target(a, &port)) {
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip; map_save(s, &o); ap = (struct sockaddr*)&cp;
-        }
-    }
-    return real_connect(s, ap, l);
+    return real_connect(s, a, l);
 }
 int connect(int s, const struct sockaddr *a, socklen_t l) { return my_connect_hook(s, a, l); }
+int listen(int s, int backlog) {
+    static int (*real_listen)(int, int) = 0;
+    ensure_init();
+    if (!real_listen) real_listen = dlsym(RTLD_NEXT, "listen");
+    int r = real_listen(s, backlog);
+    /* game serves a TCP port -> claim designated-host on the relay */
+    if (r == 0 && g_direct && dt_sock_type((long long)s) == SOCK_STREAM) {
+        struct sockaddr_in a; socklen_t l = sizeof(a);
+        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET)
+            dt_claim();
+    }
+    return r;
+}
 int getpeername(int s, struct sockaddr *a, socklen_t *l) {
     static int (*real_gp)(int, struct sockaddr*, socklen_t*) = 0;
     ensure_init();
@@ -1125,18 +1728,12 @@ int getpeername(int s, struct sockaddr *a, socklen_t *l) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
     }
-    int r = real_gp(s, a, l);
-    if (r == 0 && a && a->sa_family == AF_INET) {
-        struct sockaddr_in *in = (struct sockaddr_in*)a;
-        if (from_relay(in)) { struct sockaddr_in o; if (map_lookup(s, &o)) *in = o; }
-    }
-    return r;
+    return real_gp(s, a, l);
 }
 int close(int fd) {
     static int (*real_close)(int) = 0;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     if (g_direct) dt_on_close((long long)fd);
-    map_drop(fd);
     return real_close(fd);
 }
 /* poll/select must report tunnel-queued data as readable, or apps with
@@ -1305,7 +1902,8 @@ static int dt_select_scan(int nfds, fd_set *r, fd_set *w, fd_set *x) {
     int n = 0;
     if (r) {
         for (int fd = 0; fd < nfds; fd++) {
-            if (FD_ISSET(fd, r) && dt_fd_readable((long long)fd)) n++;
+            if (!FD_ISSET(fd, r)) continue;
+            if (dt_fd_readable((long long)fd)) n++;
             /* NB: keep FD_ISSET as-is; readable mark = bit already set.
              * We only count here; real select result merged by caller. */
         }
@@ -1393,6 +1991,7 @@ typedef int (WSAAPI *PFN_connect)(SOCKET, const struct sockaddr*, int);
 typedef int (WSAAPI *PFN_WSAConnect)(SOCKET, const struct sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
 typedef int (WSAAPI *PFN_getpeername)(SOCKET, struct sockaddr*, int*);
 typedef int (WSAAPI *PFN_closesocket)(SOCKET);
+typedef int (WSAAPI *PFN_listen)(SOCKET, int);
 typedef int (WSAAPI *PFN_send)(SOCKET, const char*, int, int);
 typedef int (WSAAPI *PFN_recv)(SOCKET, char*, int, int);
 typedef int (WSAAPI *PFN_WSASend)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
@@ -1408,6 +2007,7 @@ static PFN_sendto p_sendto = 0; static PFN_recvfrom p_recvfrom = 0;
 static PFN_WSASendTo p_WSASendTo = 0; static PFN_WSARecvFrom p_WSARecvFrom = 0;
 static PFN_connect p_connect = 0; static PFN_WSAConnect p_WSAConnect = 0;
 static PFN_getpeername p_getpeername = 0; static PFN_closesocket p_closesocket = 0;
+static PFN_listen p_listen = 0;
 static PFN_send p_send = 0; static PFN_recv p_recv = 0;
 static PFN_WSASend p_WSASend = 0; static PFN_WSARecv p_WSARecv = 0;
 static PFN_ioctlsocket p_ioctlsocket = 0;
@@ -1444,13 +2044,6 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
         int rr = select(0, &rf, NULL, NULL, nb ? &ztv : &tv);
         if (rr > 0) {
             int n = p_recvfrom(s, buf, len, flags, from, fromlen);
-            if (n != SOCKET_ERROR && from && from->sa_family == AF_INET) {
-                struct sockaddr_in *in = (struct sockaddr_in *)from;
-                if (!g_direct && from_relay(in)) {
-                    struct sockaddr_in o;
-                    if (map_next_udp((long long)s, &o)) *in = o;
-                }
-            }
             return n;
         }
         if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
@@ -1466,27 +2059,12 @@ int WSAAPI hk_sendto(SOCKET s, const char *buf, int len, int flags, const struct
                          (const struct sockaddr_in *)to))
             return len;
     }
-    struct sockaddr_in cp; const struct sockaddr *tp = to;
-    if (to && to->sa_family == AF_INET && tolen >= (int)sizeof(cp)) {
-        int port = 0;
-        if (sockaddr_is_lan_target(to, &port)) {
-            memcpy(&cp, to, sizeof(cp));
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip;
-            map_save((long long)s, &o); tp = (struct sockaddr*)&cp;
-            dbg("lan_hook: sendto redirected\n");
-        }
-    }
-    return p_sendto(s, buf, len, flags, tp, tolen);
+    return p_sendto(s, buf, len, flags, to, tolen);
 }
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
     if (g_direct && dt_sock_type((long long)s) == SOCK_DGRAM)
         return dt_win_udp_recv(s, buf, len, flags, from, fromlen);
-    int n = p_recvfrom(s, buf, len, flags, from, fromlen);
-    if (n != SOCKET_ERROR && from && from->sa_family == AF_INET) {
-        struct sockaddr_in *in = (struct sockaddr_in*)from;
-        if (from_relay(in)) { struct sockaddr_in o; if (map_next_udp((long long)s, &o)) *in = o; }
-    }
-    return n;
+    return p_recvfrom(s, buf, len, flags, from, fromlen);
 }
 int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
                         const struct sockaddr *to, int tolen,
@@ -1504,16 +2082,7 @@ int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flag
             if (consumed) { if (sent) *sent = (DWORD)total; return 0; }
         }
     }
-    struct sockaddr_in cp; const struct sockaddr *tp = to;
-    if (to && to->sa_family == AF_INET && tolen >= (int)sizeof(cp)) {
-        int port = 0;
-        if (sockaddr_is_lan_target(to, &port)) {
-            memcpy(&cp, to, sizeof(cp));
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip;
-            map_save((long long)s, &o); tp = (struct sockaddr*)&cp;
-        }
-    }
-    return p_WSASendTo(s, b, nb, sent, flags, tp, tolen, ov, cr);
+    return p_WSASendTo(s, b, nb, sent, flags, to, tolen, ov, cr);
 }
 int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD flags,
                           struct sockaddr *from, LPINT fromlen,
@@ -1530,10 +2099,6 @@ int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD
         return 0;
     }
     int n = p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, NULL, NULL);
-    if (n == 0 && from && from->sa_family == AF_INET) {
-        struct sockaddr_in *in = (struct sockaddr_in*)from;
-        if (from_relay(in)) { struct sockaddr_in o; if (map_next_udp((long long)s, &o)) *in = o; }
-    }
     return n;
 }
 int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
@@ -1543,49 +2108,34 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
             return 0;
         }
     }
-    struct sockaddr_in cp; const struct sockaddr *ap = a;
-    if (a && a->sa_family == AF_INET && l >= (int)sizeof(cp)) {
-        int port = 0;
-        if (sockaddr_is_lan_target(a, &port)) {
-            memcpy(&cp, a, sizeof(cp));
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip;
-            map_save((long long)s, &o); ap = (struct sockaddr*)&cp;
-            dbg("lan_hook: connect redirected\n");
-        }
-    }
-    return p_connect(s, ap, l);
+    return p_connect(s, a, l);
 }
 int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1, LPWSABUF b2, LPQOS q1, LPQOS q2) {
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
         if (dt_on_connect((long long)s, (const struct sockaddr_in *)a)) return 0;
     }
-    struct sockaddr_in cp; const struct sockaddr *ap = a;
-    if (a && a->sa_family == AF_INET && l >= (int)sizeof(cp)) {
-        int port = 0;
-        if (sockaddr_is_lan_target(a, &port)) {
-            memcpy(&cp, a, sizeof(cp));
-            struct sockaddr_in o = cp; cp.sin_addr.s_addr = g_relay_ip;
-            map_save((long long)s, &o); ap = (struct sockaddr*)&cp;
-        }
-    }
-    return p_WSAConnect(s, ap, l, b1, b2, q1, q2);
+    return p_WSAConnect(s, a, l, b1, b2, q1, q2);
 }
 int WSAAPI hk_getpeername(SOCKET s, struct sockaddr *a, int *l) {
     if (g_direct && a && l && *l >= (int)sizeof(struct sockaddr_in)) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
     }
-    int r = p_getpeername(s, a, l);
-    if (r == 0 && a && a->sa_family == AF_INET) {
-        struct sockaddr_in *in = (struct sockaddr_in*)a;
-        if (from_relay(in)) { struct sockaddr_in o; if (map_lookup((long long)s, &o)) *in = o; }
-    }
-    return r;
+    return p_getpeername(s, a, l);
 }
 int WSAAPI hk_closesocket(SOCKET s) {
     if (g_direct) dt_on_close((long long)s);
-    map_drop((long long)s);
     return p_closesocket(s);
+}
+int WSAAPI hk_listen(SOCKET s, int backlog) {
+    int r = p_listen(s, backlog);
+    /* game serves a TCP port -> claim designated-host on the relay */
+    if (r == 0 && g_direct && dt_sock_type((long long)s) == SOCK_STREAM) {
+        struct sockaddr_in a; int l = sizeof(a);
+        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET)
+            dt_claim();
+    }
+    return r;
 }
 
 /* Connected-socket byte path for direct-tunnel TCP streams. */
@@ -1776,6 +2326,7 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"WSAConnect")) return (FARPROC)hk_WSAConnect;
             if (!strcmp(n,"getpeername")) return (FARPROC)hk_getpeername;
             if (!strcmp(n,"closesocket")) return (FARPROC)hk_closesocket;
+            if (!strcmp(n,"listen")) return (FARPROC)hk_listen;
             if (!strcmp(n,"send")) return (FARPROC)hk_send;
             if (!strcmp(n,"recv")) return (FARPROC)hk_recv;
             if (!strcmp(n,"WSASend")) return (FARPROC)hk_WSASend;
@@ -1824,6 +2375,7 @@ static void patch_iat(HMODULE mod) {
                     else if (!strcmp(fn,"WSAConnect")) rep = (FARPROC)hk_WSAConnect;
                     else if (!strcmp(fn,"getpeername")) rep = (FARPROC)hk_getpeername;
                     else if (!strcmp(fn,"closesocket")) rep = (FARPROC)hk_closesocket;
+                    else if (!strcmp(fn,"listen")) rep = (FARPROC)hk_listen;
                     else if (!strcmp(fn,"send")) rep = (FARPROC)hk_send;
                     else if (!strcmp(fn,"recv")) rep = (FARPROC)hk_recv;
                     else if (!strcmp(fn,"WSASend")) rep = (FARPROC)hk_WSASend;
@@ -1915,6 +2467,7 @@ static DWORD WINAPI installer(LPVOID unused) {
     p_WSAConnect = (PFN_WSAConnect)GetProcAddress(hWS2, "WSAConnect");
     p_getpeername = (PFN_getpeername)GetProcAddress(hWS2, "getpeername");
     p_closesocket = (PFN_closesocket)GetProcAddress(hWS2, "closesocket");
+    p_listen = (PFN_listen)GetProcAddress(hWS2, "listen");
     p_send = (PFN_send)GetProcAddress(hWS2, "send");
     p_recv = (PFN_recv)GetProcAddress(hWS2, "recv");
     p_WSASend = (PFN_WSASend)GetProcAddress(hWS2, "WSASend");
@@ -1943,7 +2496,6 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID r) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hself = h;
         DisableThreadLibraryCalls(h);
-        if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = 1; }
         if (!g_dcs_init) { InitializeCriticalSection(&g_dcs); g_dcs_init = 1; }
         HANDLE t = CreateThread(NULL, 0, installer, NULL, 0, NULL);
         if (t) CloseHandle(t);

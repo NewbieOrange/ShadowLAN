@@ -1,63 +1,55 @@
-# Universal DLL hook: route all LAN traffic to relay
+# lan_hook — universal game hook (Windows + Linux)
 
-No TUN/TAP, no driver. Per-process Winsock rewrite, only the injected game.
+No TUN/TAP, no driver. Per-process socket-layer rewrite; only the injected
+game is affected. Needs `LAN_HOOK_SERVER` (a ShadowLAN relay), otherwise it
+is a pure passthrough. One source builds both the Windows DLL and the Linux
+`LD_PRELOAD` `.so` (same behavior; tested on Linux, shipped for Windows).
 
-## Two modes
+## Modes (automatic)
 
-**Relay mode** (no `LAN_HOOK_SERVER`): rewrites LAN/broadcast destinations
-to `LAN_HOOK_RELAY` (`127.0.0.1`), where `wclient.py` listens. Needs
-`wclient.py` running next to the game.
+- **Player:** LAN/broadcast destinations tunnel to the relay; beacons come
+  back attributed per sender, so browsers list distinct servers.
+- **Host:** when the game calls `listen()`, the hook claims designated-host
+  on the relay and bridges inbound players to the game over loopback.
+  No flags needed — hosting in-game is enough.
+- **P2P mesh:** the relay assigns every node a virtual LAN IP
+  (`--subnet`, default `10.200.0.0/24`). The hook routes `sendto`/`connect`
+  to virtual IPs to the owning node and spoofs `recvfrom`/`getpeername`
+  sources with the sender's virtual IP, so each peer looks like its own
+  machine on the same LAN.
 
-**Direct mode** (`LAN_HOOK_SERVER` set): the hook itself speaks the
-`server.py` protocol over one public TCP+UDP port. **No `wclient.py`
-needed** - just inject and play:
-```bat
-injector.exe --server HOST_PUBLIC_IP --port 47777 -- lan_hook64.dll game.exe
-```
-Broadcast discovery arrives as `192.168.7.1` (fake LAN server, so the game
-connects back through the hook). TCP game streams and UDP game datagrams
-stay on their optimal transports. Include discovery UDP ports in the
-server's `--udp` list too, so unicast discovery replies get proxied.
+## Covered calls
 
-## What it hooks
-
-Keeps ports, rewrites IP: any `10/8`, `172.16/12`, `192.168/16`,
-`169.254/16`, multicast, `*.255` / `255.255.255.255` destination goes to
-the tunnel. Replies are spoofed back to the original LAN IP (`recvfrom` /
-`WSARecvFrom` / `getpeername`, FIFO per socket).
-
-Covered: `sendto`, `WSASendTo`, `recvfrom`, `WSARecvFrom` (sync),
-`connect`, `WSAConnect`, `send`, `recv`, `WSASend`, `WSARecv` (sync),
-`getpeername`, `closesocket`, `ioctlsocket` (nonblock tracking),
-`select`, `WSAPoll` (+ Linux `poll`/`ppoll`/`pselect`), `GetProcAddress`
-guard, `LoadLibrary` re-patch. Method: IAT patch, no asm blobs.
+`sendto`, `WSASendTo`, `recvfrom`, `WSARecvFrom` (sync), `connect`,
+`WSAConnect`, `send`, `recv`, `WSASend`, `WSARecv` (sync), `listen`,
+`getpeername`, `closesocket`, `ioctlsocket` (nonblock tracking), `select`,
+`WSAPoll` (+ Linux `poll`/`ppoll`/`pselect`), `GetProcAddress` guard,
+`LoadLibrary` re-patch. Method: IAT patch, no asm blobs.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
 ready, so tunnel-queued data must report readable. Slices bound the extra
 latency to ~25ms.
 
-## Windows use (client PC)
+## Use
 
-Direct mode, one step (match DLL to **game** bitness):
+Match DLL to **game** bitness:
+
 ```bat
-injector.exe --server HOST_PUBLIC_IP --port 47777 -- lan_hook64.dll game.exe
+injector.exe --server RELAY_IP --port 47777 --token SECRET -- lan_hook64.dll game.exe
 REM 32-bit game on 64-bit Windows:
-injector.exe --server HOST_PUBLIC_IP --port 47777 -- lan_hook32.dll game.exe
+injector.exe --server RELAY_IP --port 47777 --token SECRET -- lan_hook32.dll game.exe
 ```
-Relay mode (needs `wclient.py` first):
-```bat
-python wclient.py --server HOST_PUBLIC_IP --port 47777 --disc 4444 --tcp 27015 --udp 7777
-injector.exe lan_hook64.dll game.exe
+
+Linux (no launcher needed):
+
+```sh
+LD_PRELOAD=./lan_hook.so LAN_HOOK_SERVER=RELAY_IP LAN_HOOK_PORT=47777 LAN_HOOK_TOKEN=SECRET ./game
 ```
-`injector.exe` options (set hook env for the child, game args go last):
-```
-[--server HOST] [--port PORT] [--relay IP] [--ports LIST] [-e KEY=VAL]... [--debug] [--]
-<hook.dll> <game.exe> [game args...]
-```
-Also directly: `set LAN_HOOK_SERVER=...`, `LAN_HOOK_PORT` (default
-`47777`), `LAN_HOOK_RELAY` (default `127.0.0.1`), `LAN_HOOK_PORTS`
-(`4444,27015` to limit hooked ports), `LAN_HOOK_DEBUG=1`.
+
+Env (or injector flags): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default
+`47777`), `LAN_HOOK_TOKEN`, `LAN_HOOK_PORTS` (`4444,27015` to limit hooked
+ports), `LAN_HOOK_DEBUG=1`.
 
 ## Limits
 
@@ -65,5 +57,5 @@ Also directly: `set LAN_HOOK_SERVER=...`, `LAN_HOOK_PORT` (default
 - Async overlapped `WSARecvFrom`/`WSASend`/`WSARecv` pass through unspoofed
   (most LAN discovery/gameplay uses blocking calls).
 - `ConnectEx` / `WSAConnectByList` / event-based (`WSAEventSelect`)
-  waiting not hooked; `select`/`poll` + blocking sockets are covered.
-- One server per process. No encryption; trusted peers only.
+  waiting not hooked.
+- One game per relay port; `--token` is the room key.

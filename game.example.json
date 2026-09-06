@@ -1,8 +1,10 @@
 {
-  "public_port": 47777,
+  "relay": "python server.py --port 47777 --token SECRET --subnet 10.200.0.0/24",
+  "host": "python wclient.py --server RELAY_IP --port 47777 --disc 4444 --host --token SECRET",
+  "player_hook": "injector.exe --server RELAY_IP --port 47777 --token SECRET -- lan_hook64.dll game.exe",
+  "player_wclient": "python wclient.py --server RELAY_IP --port 47777 --disc 4444 --tcp 27015 --udp 7777 --token SECRET",
   "discovery_udp": [4444],
   "game_tcp": [27015],
   "game_udp": [7777],
-  "host_example": "python server.py --port 47777 --disc 4444 --tcp 27015 --udp 7777",
-  "client_example": "python wclient.py --server 203.0.113.10 --port 47777 --disc 4444 --tcp 27015 --udp 7777"
+  "note": "any peer can host: game host runs wclient --host or the hook (auto-claims on listen); everyone else just joins. One game per relay port."
 }
