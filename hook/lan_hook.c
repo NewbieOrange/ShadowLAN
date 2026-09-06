@@ -571,7 +571,8 @@ static int dt_host_open(unsigned sid, int port) {
     return 0;
 }
 static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
-                                      size_t rl, const struct sockaddr_in *cli) {
+                                      size_t rl, const struct sockaddr_in *cli,
+                                      int create) {
     (void)raw; (void)rl;
     long long now = dt_now_ms();
     for (int i = 0; i < DT_MAXUSESS; i++)
@@ -579,6 +580,7 @@ static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
             g_us[i].cli.sin_addr.s_addr == cli->sin_addr.s_addr &&
             g_us[i].cli.sin_port == cli->sin_port)
             return &g_us[i];
+    if (!create) return NULL;
     for (int i = 0; i < DT_MAXUSESS; i++)
         if (!g_us[i].used || now - g_us[i].last > 45000) {
             if (g_us[i].used) {
@@ -619,7 +621,7 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
 #ifdef LINUX_BUILD
     dt_reals();
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli);
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 0);
     int rs = u ? u->real : -1;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
@@ -628,7 +630,7 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     return 1;
 #else
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli);
+    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 0);
     SOCKET rs = u ? u->real : INVALID_SOCKET;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
