@@ -11,7 +11,7 @@ lan_hook32.dll: lan_hook.c lan_hook.def
 	$(CC32) -shared $(CFLAGS) -o $@ lan_hook.c lan_hook.def -lws2_32 -ldbghelp
 
 injector.exe: injector.c
-	$(CC64) $(CFLAGS) -o $@ $<
+	$(CC64) $(CFLAGS) -o $@ $< -lpsapi
 
 lan_hook.so: lan_hook.c
 	gcc -shared -fPIC -DLINUX_BUILD -O2 -Wall -o $@ $< -ldl -lpthread

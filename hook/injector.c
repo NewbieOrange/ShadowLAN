@@ -17,10 +17,29 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* Remote module base WITHOUT truncation: thread exit codes are DWORD,
+ * so a 64-bit HMODULE never survives GetExitCodeThread. Enumerate the
+ * target's modules instead (same handle we already own). */
+static HMODULE find_remote(HANDLE hProcess, const char *dllfull) {
+    static HMODULE mods[2048];
+    DWORD need = 0;
+    if (!EnumProcessModules(hProcess, mods, sizeof(mods), &need)) return NULL;
+    DWORD n = need / sizeof(HMODULE);
+    if (n > 2048) n = 2048;
+    for (DWORD i = 0; i < n; i++) {
+        char path[MAX_PATH] = {0};
+        if (GetModuleFileNameExA(hProcess, mods[i], path, sizeof(path)) &&
+            _stricmp(path, dllfull) == 0)
+            return mods[i];
+    }
+    return NULL;
+}
 
 static void usage(void) {
     fprintf(stderr,
@@ -111,15 +130,18 @@ int main(int argc, char **argv) {
     CloseHandle(th); VirtualFreeEx(pi.hProcess, mem, 0, MEM_RELEASE);
     if (!code) { fprintf(stderr, "remote LoadLibrary failed\n"); TerminateProcess(pi.hProcess, 1); return 1; }
     /* Stage 2: run LanHookInit on a normal remote thread (outside the
-     * loader lock). Resolve it via RVA so ASLR doesn't matter. */
+     * loader lock). The remote base comes from module enumeration:
+     * thread exit codes are DWORD and would truncate a 64-bit HMODULE.
+     * The RVA is file-layout derived, so ASLR-independent. */
     {
         HMODULE local = LoadLibraryA(dllfull);
         if (local) {
             FARPROC localInit = GetProcAddress(local, "LanHookInit");
-            if (localInit) {
+            HMODULE remote = find_remote(pi.hProcess, dllfull);
+            if (localInit && remote) {
                 uintptr_t rva = (uintptr_t)localInit - (uintptr_t)local;
                 LPTHREAD_START_ROUTINE rInit =
-                    (LPTHREAD_START_ROUTINE)((uintptr_t)code + rva);
+                    (LPTHREAD_START_ROUTINE)((uintptr_t)remote + rva);
                 HANDLE th2 = CreateRemoteThread(pi.hProcess, NULL, 0, rInit,
                                                 NULL, 0, NULL);
                 if (!th2) {
