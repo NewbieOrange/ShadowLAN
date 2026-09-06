@@ -14,10 +14,15 @@
   TCP-C (non-destructive handover): an established stream to host A
   must keep echoing from A after host B claims; only NEW streams go
   to B (old code killed all streams on every HELLO).
+
+  DISC-D (per-source beacons): two hosts beaconing the IDENTICAL
+  payload must both reach a player as distinct BCAST_FROMs (old
+  global dedup forwarded only the first host's).
 """
 import asyncio
 import os
 import socket
+import struct
 import sys
 
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +31,9 @@ sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 from common import (
-    T_NODE, U_GAME_C2S, U_GAME_S2C,
+    T_NODE, T_BCAST, T_BCAST_FROM, U_GAME_C2S, U_GAME_S2C,
     encode_node, encode_pdat, encode_udp_game,
-    decode_udp_game, decode_pdat,
+    decode_udp_game, decode_pdat, decode_bcast_from,
     tcp_send, tcp_read,
 )
 
@@ -169,6 +174,75 @@ async def echo_game(tag, port):
     return await asyncio.start_server(on_conn, "127.0.0.1", port)
 
 
+async def test_disc_distinct_hosts():
+    # two hosts, byte-identical beacon payload, one player: player must
+    # see BOTH servers as distinct attributed beacons
+    loop = asyncio.get_running_loop()
+    DISC = 45678
+    PAYLOAD = b"SAME-GAME-BEACON"
+    hu1, hu2 = udp_sock(), udp_sock()
+    w1, d1 = await register_node(0x55555555, hu1)
+    w2, d2 = await register_node(0x66666666, hu2)
+    pw, pdraw = await register_node(0x77777777, udp_sock())
+    await asyncio.sleep(0.5)
+    got = asyncio.Queue()
+
+    async def collect(reader):
+        try:
+            while True:
+                mtype, payload = await tcp_read(reader)
+                if mtype == T_BCAST_FROM:
+                    await got.put(payload)
+        except Exception:
+            pass
+
+    # need the reader side of the player conn: reopen with our own drain
+    d1.cancel()
+    d2.cancel()
+    pdraw.cancel()
+    for w in (w1, w2, pw):
+        w.close()
+    await asyncio.sleep(0.3)
+    r1, w1 = await asyncio.open_connection("127.0.0.1", PUB)
+    await tcp_send(w1, T_NODE, encode_node(b"", 0x55555555, hu1.getsockname()[1]))
+    r2, w2 = await asyncio.open_connection("127.0.0.1", PUB)
+    await tcp_send(w2, T_NODE, encode_node(b"", 0x66666666, hu2.getsockname()[1]))
+    rp, wp = await asyncio.open_connection("127.0.0.1", PUB)
+    await tcp_send(wp, T_NODE, encode_node(b"", 0x77777777, 0))
+    t1 = asyncio.create_task(collect(r1))
+    t2 = asyncio.create_task(collect(r2))
+    tp = asyncio.create_task(collect(rp))
+    await asyncio.sleep(0.5)
+    await tcp_send(w1, T_BCAST, struct.pack("!H", DISC) + PAYLOAD)
+    await tcp_send(w2, T_BCAST, struct.pack("!H", DISC) + PAYLOAD)
+    seen = {}
+    try:
+        deadline = loop.time() + 8
+        while set(seen) != {0x55555555, 0x66666666}:
+            left = deadline - loop.time()
+            if left <= 0:
+                raise asyncio.TimeoutError()
+            payload = await asyncio.wait_for(got.get(), timeout=left)
+            dec = decode_bcast_from(payload)
+            assert dec, payload
+            node, dport, raw = dec
+            assert dport == DISC and raw == PAYLOAD, (dport, raw)
+            seen[node] = seen.get(node, 0) + 1
+    except asyncio.TimeoutError:
+        print(f"FAIL[disc-per-source]: only saw {sorted(seen)} (want both hosts)",
+              flush=True)
+        sys.exit(1)
+    assert set(seen) == {0x55555555, 0x66666666}, seen
+    print("PASS[disc-per-source] identical beacons from both hosts seen",
+          flush=True)
+    for t in (t1, t2, tp):
+        t.cancel()
+    for w in (w1, w2, wp):
+        w.close()
+    hu1.close()
+    hu2.close()
+
+
 async def test_tcp_survives_claim():
     srv_a = await echo_game(b"A", A_LOCAL)
     srv_b = await echo_game(b"B", B_LOCAL)
@@ -219,6 +293,7 @@ async def main():
     try:
         await test_udp_p2p_perdest()
         await test_udp_persender_learned()
+        await test_disc_distinct_hosts()
         await test_tcp_survives_claim()
     finally:
         relay_task.cancel()

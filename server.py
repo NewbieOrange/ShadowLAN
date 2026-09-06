@@ -288,7 +288,15 @@ class Relay:
                     (dport,) = struct.unpack("!H", payload[:2])
                     if self.disc_ports and dport not in self.disc_ports:
                         continue
-                    if self.dedup.hit(hashlib.sha256(b"B" + payload).digest()):
+                    # Per-source dedup: identical beacon payloads from
+                    # DIFFERENT hosts are distinct servers (multi-host
+                    # same game) and must all fan out; repeats from the
+                    # SAME host are still throttled.
+                    src_node = self.writer_node.get(owner, 0)
+                    uniq = struct.pack("!I", src_node) if src_node else \
+                        struct.pack("!Q", owner & 0xFFFFFFFFFFFFFFFF)
+                    if self.dedup.hit(hashlib.sha256(
+                            b"B" + uniq + payload).digest()):
                         continue
                     self.beaconers[writer] = time.monotonic()
                     src_node = self.writer_node.get(owner, 0)
