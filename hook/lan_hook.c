@@ -3461,6 +3461,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
         if (t) CloseHandle(t);
     }
     dbg("lan_hook: installed\n");
+    flog("LanHookInit: build " __DATE__ " " __TIME__);
     flog("LanHookInit: installed");
     g_init_armed = 0;
     return 0;
