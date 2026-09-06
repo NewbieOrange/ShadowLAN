@@ -85,6 +85,9 @@ python3 test_e2e.py               # relay + wclient host + wclient player (ALL P
 python3 test_relay_topology.py   # host migration incl. demote-keeps-link (MIGRATE_ALL_PASS)
 python3 hook/test_direct.py      # symmetric hook host+join (DIRECT_ALL_PASS)
 python3 hook/test_virtual_p2p.py # 3-node virtual-IP mesh (P2P_ALL_PASS)
+python3 hook/test_childprop.py   # child-process inheritance (CHILDPROP_ALL_PASS)
+python3 hook/test_perdest.py     # per-dest UDP flows, node GC (PERDEST_ALL_PASS)
+SHADOWLAN_WINEPREFIX=~/.wine python3 hook/test_late.py  # late-loaded plugin DLLs (LATE_ALL_PASS; Wine)
 ```
 
 ## Limits

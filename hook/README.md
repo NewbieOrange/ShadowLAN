@@ -24,7 +24,10 @@ is a pure passthrough. One source builds both the Windows DLL and the Linux
 `WSAConnect`, `send`, `recv`, `WSASend`, `WSARecv` (sync), `listen`,
 `getpeername`, `closesocket`, `ioctlsocket` (nonblock tracking), `select`,
 `WSAPoll` (+ Linux `poll`/`ppoll`/`pselect`), `GetProcAddress` guard,
-`LoadLibrary` re-patch. Method: IAT patch, no asm blobs.
+`LoadLibrary` re-patch: every patched module's `LoadLibrary*` imports are
+swapped too, plus a slow differential module sweep as a safety net, so
+plugin DLLs loaded long after install (game engines do this) are hooked.
+Method: IAT patch, no asm blobs.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
@@ -57,7 +60,7 @@ all), `LAN_HOOK_NOCHILD=1` (never inject children).
 ## Sub-processes
 
 Injection follows `CreateProcessA/W`: a hooked launcher that spawns the
-real game (lobby helpers, Steam stubs, …) gets each child suspended,
+real game (launcher tools, plugin loaders, …) gets each child suspended,
 injected, initialized and resumed automatically — env included, so the
 room config carries over. Same-bitness only; failures launch unhooked
 rather than breaking the game. (On Linux this is free: `LD_PRELOAD` is

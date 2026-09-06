@@ -2409,18 +2409,19 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
  * find it and its arrivals are silently dropped. */
 int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     int r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
+    if (g_debug && g_direct && a && a->sa_family == AF_INET) {
+        const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
+        unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
+        char lb[192];
+        snprintf(lb, sizeof(lb), "bind pid=%u sock=%lld %lu.%lu.%lu.%lu:%d r=%d err=%d",
+                 (unsigned)GetCurrentProcessId(), (long long)s,
+                 (addr & 255), ((addr >> 8) & 255), ((addr >> 16) & 255),
+                 ((addr >> 24) & 255), (int)ntohs(ba->sin_port),
+                 r, r ? WSAGetLastError() : 0);
+        dlog(lb);
+    }
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
         DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
-        if (g_debug) {
-            const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
-            unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
-            char lb[160];
-            snprintf(lb, sizeof(lb), "bind pid=%u sock=%lld %lu.%lu.%lu.%lu:%d",
-                     (unsigned)GetCurrentProcessId(), (long long)s,
-                     (addr & 255), ((addr >> 8) & 255), ((addr >> 16) & 255),
-                     ((addr >> 24) & 255), (int)ntohs(ba->sin_port));
-            dlog(lb);
-        }
     }
     return r;
 }
@@ -2829,6 +2830,12 @@ static const char *export_name_for_ordinal(HMODULE mod, DWORD ord) {
 }
 
 /* If game resolves exports dynamically, hand out our hooks. */
+/* LoadLibrary hooks (defined below): patch newcomers too. */
+HMODULE WINAPI hk_LoadLibraryA(LPCSTR);
+HMODULE WINAPI hk_LoadLibraryW(LPCWSTR);
+HMODULE WINAPI hk_LoadLibraryExA(LPCSTR, HANDLE, DWORD);
+HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR, HANDLE, DWORD);
+
 FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
     if (n && !((ULONG_PTR)n >> 16)) {
         /* by ordinal: map through the target's exports, then match by
@@ -2869,6 +2876,10 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
         if (m == hKernel) {
             if (!strcmp(n,"CreateProcessA")) return (FARPROC)hk_CreateProcessA;
             if (!strcmp(n,"CreateProcessW")) return (FARPROC)hk_CreateProcessW;
+            if (!strcmp(n,"LoadLibraryA")) return (FARPROC)hk_LoadLibraryA;
+            if (!strcmp(n,"LoadLibraryW")) return (FARPROC)hk_LoadLibraryW;
+            if (!strcmp(n,"LoadLibraryExA")) return (FARPROC)hk_LoadLibraryExA;
+            if (!strcmp(n,"LoadLibraryExW")) return (FARPROC)hk_LoadLibraryExW;
         }
     }
     return p_GetProcAddress(m, n);
@@ -2977,6 +2988,14 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"WSACloseEvent")) rep = (FARPROC)hk_WSACloseEvent;
                 } else if (isk32 && !strcmp(fn,"GetProcAddress")) {
                     rep = (FARPROC)hk_GetProcAddress;
+                } else if (isk32 && !strcmp(fn,"LoadLibraryA")) {
+                    rep = (FARPROC)hk_LoadLibraryA;
+                } else if (isk32 && !strcmp(fn,"LoadLibraryW")) {
+                    rep = (FARPROC)hk_LoadLibraryW;
+                } else if (isk32 && !strcmp(fn,"LoadLibraryExA")) {
+                    rep = (FARPROC)hk_LoadLibraryExA;
+                } else if (isk32 && !strcmp(fn,"LoadLibraryExW")) {
+                    rep = (FARPROC)hk_LoadLibraryExW;
                 } else if (isk32 && !strcmp(fn,"CreateProcessA")) {
                     rep = (FARPROC)hk_CreateProcessA;
                 } else if (isk32 && !strcmp(fn,"CreateProcessW")) {
@@ -3000,40 +3019,83 @@ static void patch_iat_inner(HMODULE mod) {
 }
 
 /* Guarded entry points: a bad module is skipped, never fatal. */
+/* Patching is re-entrant across threads (init, LoadLibrary hooks on app
+ * threads, the late-module sweep): serialize it. The shared SEH jump
+ * buffer is only sound under this lock. */
+static CRITICAL_SECTION g_pcs;
+static int g_pcs_init = 0;
+#define DT_MAXSEEN 1024
+static HMODULE g_seen[DT_MAXSEEN];
+static int g_nseen = 0;
+
 static void patch_iat(HMODULE mod) {
     if (!mod) return;
+    if (!g_pcs_init) return;
+    EnterCriticalSection(&g_pcs);
     if (mod != g_hself) {
         char path[MAX_PATH] = {0};
         if (GetModuleFileNameA(mod, path, sizeof(path) - 1) &&
             !module_allowed(path)) {
             dbg("lan_hook: module not in allowlist, skipped\n");
+            LeaveCriticalSection(&g_pcs);
             return;
         }
     }
     if (setjmp(g_seh_jb) != 0) {
         dbg("lan_hook: skipped unreadable module\n");
+        LeaveCriticalSection(&g_pcs);
         return;
     }
     g_seh_armed = 1;
     patch_iat_inner(mod);
     g_seh_armed = 0;
+    {   /* remember: the sweep only revisits modules it has never seen */
+        int i, have = 0;
+        for (i = 0; i < g_nseen; i++) if (g_seen[i] == mod) { have = 1; break; }
+        if (!have && g_nseen < DT_MAXSEEN) g_seen[g_nseen++] = mod;
+    }
+    LeaveCriticalSection(&g_pcs);
 }
 
-static void patch_all(void) {
+static void patch_all(int force) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) { patch_iat(GetModuleHandleA(NULL)); return; }
     MODULEENTRY32 me; me.dwSize = sizeof(me);
     int n = 0;
     /* skip our own module: tunnel threads must call the real Winsock */
     if (Module32First(snap, &me)) do {
-        if (me.hModule != g_hself) { patch_iat(me.hModule); n++; }
+        if (me.hModule == g_hself || me.hModule == NULL) continue;
+        if (!force) {
+            int i, have = 0;
+            EnterCriticalSection(&g_pcs);
+            for (i = 0; i < g_nseen; i++) if (g_seen[i] == me.hModule) { have = 1; break; }
+            LeaveCriticalSection(&g_pcs);
+            if (have) continue;
+        }
+        patch_iat(me.hModule);
+        n++;
     } while (Module32Next(snap, &me));
     CloseHandle(snap);
-    {
+    if (force || n > 0) {
         char lb[96];
-        snprintf(lb, sizeof(lb), "lan_hook: patched %d modules\n", n);
+        snprintf(lb, sizeof(lb), force ? "lan_hook: patched %d modules\n"
+                                       : "lan_hook: late-patched %d new modules\n", n);
         dbg(lb);
     }
+}
+
+/* Game engines routinely grab networking plugin DLLs long after our
+ * install pass. LoadLibrary hooks catch the common case, but a direct
+ * ntdll loader call bypasses every user-mode import hook, so keep a
+ * slow differential sweep as a safety net: cheap module-list diff,
+ * patch anything new once. */
+static DWORD WINAPI dt_sweep_thread(LPVOID u) {
+    (void)u;
+    for (;;) {
+        Sleep(2000);
+        patch_all(0);
+    }
+    return 0;
 }
 
 /* LoadLibrary hooks: patch newcomers too. */
@@ -3044,7 +3106,7 @@ HMODULE WINAPI hk_LoadLibraryW(LPCWSTR n) { HMODULE h = p_LoadLibraryW(n); if (h
 HMODULE WINAPI hk_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExA(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
 HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExW(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
 
-/* Sub-process hooking: a launcher (lobby_connect, Steam stub, ...) that
+/* Sub-process hooking: a launcher tool that
  * spawns the real game gets the hook carried into each child automatically.
  * Same bitness only (Windows cannot cross-inject); failures fall back to
  * launching unhooked rather than breaking the game. Filter with
@@ -3341,10 +3403,16 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     if (g_direct) { dbg("lan_hook: starting tunnel\n"); flog("LanHookInit: starting tunnel"); dt_start(); }
     dbg("lan_hook: patching modules\n");
     flog("LanHookInit: patching modules");
-    patch_all();
+    InitializeCriticalSection(&g_pcs);
+    g_pcs_init = 1;
+    patch_all(1);
     patch_loader_iat();
     /* late GetProcAddress IAT swap for already-loaded modules */
-    patch_all();
+    patch_all(1);
+    {
+        HANDLE t = CreateThread(NULL, 0, dt_sweep_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
     dbg("lan_hook: installed\n");
     flog("LanHookInit: installed");
     g_init_armed = 0;
