@@ -702,6 +702,24 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         dlog(lb);
     }
 }
+/* Passive wire observation (indirect/no-relay mode + debug): log real
+ * send/recv frames so a working unhooked session can be compared
+ * byte-for-byte against a tunneled one. Never alters behavior. */
+static void dt_obsv(const char *dir, long long s, const struct sockaddr *a,
+                    const unsigned char *p, int n) {
+    char lb[256]; int hp;
+    if (!g_debug || n <= 0 || !a || a->sa_family != AF_INET) return;
+    {
+        const struct sockaddr_in *sa = (const struct sockaddr_in *)a;
+        unsigned long av = 0; memcpy(&av, &sa->sin_addr.s_addr, 4);
+        hp = snprintf(lb, sizeof(lb), "obsv %s sock=%lld ip=%lu.%lu.%lu.%lu:%d n=%d hex=",
+                      dir, s, (av & 255), ((av >> 8) & 255), ((av >> 16) & 255),
+                      ((av >> 24) & 255), (int)ntohs(sa->sin_port), n);
+    }
+    for (int qi = 0; qi < n && qi < 80 && hp < (int)sizeof(lb) - 3; qi++)
+        hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", p[qi]);
+    dlog(lb);
+}
 static struct dt_stream *dt_stream_by_sock(long long s) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
         if (g_st[i].used && g_st[i].gsock == s) return &g_st[i];
@@ -2443,12 +2461,20 @@ int WSAAPI hk_sendto(SOCKET s, const char *buf, int len, int flags, const struct
                          (const struct sockaddr_in *)to))
             return len;
     }
-    return p_sendto(s, buf, len, flags, to, tolen);
+    {
+        int r = p_sendto(s, buf, len, flags, to, tolen);
+        if (!g_direct && r > 0) dt_obsv("SEND", (long long)s, to, (const unsigned char *)buf, r);
+        return r;
+    }
 }
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
     if (g_direct && dt_sock_type((long long)s) == SOCK_DGRAM)
         return dt_win_udp_recv(s, buf, len, flags, from, fromlen);
-    return p_recvfrom(s, buf, len, flags, from, fromlen);
+    {
+        int r = p_recvfrom(s, buf, len, flags, from, fromlen);
+        if (!g_direct && r > 0) dt_obsv("RECV", (long long)s, from, (const unsigned char *)buf, r);
+        return r;
+    }
 }
 int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
                         const struct sockaddr *to, int tolen,
