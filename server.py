@@ -40,8 +40,8 @@ class Relay:
     HOST_UDP_TTL = 45      # forget uplink UDP endpoint after this silence
     BEACON_TTL = 30        # beaconer fallback freshness
     KNOWN_TTL = 120        # known UDP endpoint freshness
-    LEARN_TTL = 60         # learned game_port -> replier freshness
-    FLOW_TTL = 120         # C2S triple -> player routing freshness
+    LEARN_TTL = 60         # (src, game_port) -> replier freshness (per-sender sticky)
+    FLOW_TTL = 120         # per-dest triple -> player routing freshness
     NODE_GRACE = 5         # token relays: NODE-or-HELLO deadline per conn
 
     def __init__(self, port, token="", allowed_tcp=None, allowed_udp=None,
@@ -74,8 +74,18 @@ class Relay:
         self.host_udp = None
         self.host_udp_seen = 0.0
         self.known_udp = {}  # addr -> last seen (fan-out candidates)
-        self.learned = {}  # game_port -> (replier_addr, seen)
-        self.udp_flows = {}  # (game_port, cli_ip, cli_port) -> [player_addr, seen]
+        # Per-sender sticky: (src_addr, game_port) -> (replier_addr, seen).
+        # A global game_port -> replier flaps when two hosts serve the same
+        # port; per-sender lets each player stick to its own host.
+        self.learned = {}
+        # Per-dest flows: (dest_tag, game_port, cli_ip, cli_port) ->
+        # [player_addr, seen]. dest_tag is ('n', dest_node) for addressed
+        # P2P or ('a', ip, port) for legacy fan-out. Scoping by dest means
+        # identical LAN triples (192.168.x.x, hook 127.0.0.1:5000x) to
+        # different hosts no longer collide; same-dest collisions still
+        # log and last-writer-wins (fix senders to use unique triples -
+        # the hook uses its virtual IP - for full isolation).
+        self.udp_flows = {}
         self._public_udp = None
         self._last_noroute = 0.0
 
@@ -100,15 +110,13 @@ class Relay:
         return True
 
     async def promote_host(self, writer, peer):
-        # fresh slate: close everything routed before, demote (never kick)
-        # the old holder so a shared-link claimant stays playable
-        for sid_h, (cw, sid_c, _tgt) in list(self.h2c.items()):
-            try:
-                await self.r_send(cw, T_TCP_CLOSE, struct.pack("!I", sid_c))
-            except (ConnectionResetError, BrokenPipeError, RuntimeError):
-                pass
-        self.h2c.clear()
-        self.c2h.clear()
+        # Non-destructive handover: existing streams keep flowing to their
+        # original targets (POPEN addressed streams especially must survive
+        # a second host claiming). Only future implicit T_TCP_OPENs go to
+        # the new holder. The old holder is demoted, never kicked, so a
+        # shared-link claimant stays playable. One game per relay port is
+        # still the documented setup; this just stops a claim from killing
+        # live sessions.
         old = self.host_writer
         self.host_writer = writer
         self.roles[id(writer)] = "host"
@@ -421,20 +429,36 @@ class Relay:
             self._last_noroute = now
             print(f"[relay] no route for {what}, dropping", flush=True)
 
-    def udp_targets(self, gport, exclude):
-        """Who should get a UDP C2S for game_port? Learned replier,
-        else fan-out to all known endpoints except the source."""
+    def node_by_udp_addr(self, addr):
+        """Tunnel addr -> dest node id, freshest match (for S2C lookup)."""
+        best, best_seen = None, -1.0
+        for nid, ent in self.nodes.items():
+            if ent.get("udp_addr") == addr:
+                seen = ent.get("seen_udp", 0)
+                if seen > best_seen:
+                    best, best_seen = nid, seen
+        if best is not None:
+            return best
+        for nid, ent in self.nodes.items():
+            if ent.get("udp_port") and ent.get("tcp_ip") and \
+                    (ent["tcp_ip"], ent["udp_port"]) == addr:
+                return nid
+        return None
+
+    def udp_targets(self, gport, src_addr):
+        """Who should get a UDP C2S for game_port? This sender's sticky
+        replier, else fan-out to all known endpoints except the source."""
         now = time.monotonic()
-        ent = self.learned.get(gport)
+        ent = self.learned.get((src_addr, gport))
         if ent is not None:
             addr, seen = ent
-            if now - seen < self.LEARN_TTL and addr != exclude:
+            if now - seen < self.LEARN_TTL and addr != src_addr:
                 return [addr]
-            self.learned.pop(gport, None)
+            self.learned.pop((src_addr, gport), None)
         out = [a for a, seen in self.known_udp.items()
-               if a != exclude and now - seen < self.KNOWN_TTL]
+               if a != src_addr and now - seen < self.KNOWN_TTL]
         if self.host_udp is not None and now - self.host_udp_seen < self.HOST_UDP_TTL \
-                and self.host_udp != exclude and self.host_udp not in out:
+                and self.host_udp != src_addr and self.host_udp not in out:
             out.append(self.host_udp)
         return out
 
@@ -486,7 +510,12 @@ class Relay:
                 if taddr is None or taddr == addr:
                     continue
                 self.known_udp[addr] = time.monotonic()
-                key = (gport, _cip, _cport)
+                key = (("n", dest_node), gport, _cip, _cport)
+                prev = self.udp_flows.get(key)
+                if prev is not None and prev[0] != addr:
+                    print(f"[relay] UDP triple collision for dest node "
+                          f"{dest_node} on {(gport, _cip, _cport)}, "
+                          f"latest sender wins", flush=True)
                 self.udp_flows[key] = [addr, time.monotonic()]
                 if len(self.udp_flows) > 2048:
                     self.udp_flows.clear()
@@ -499,22 +528,48 @@ class Relay:
                 continue
             if mtype == U_GAME_S2C:
                 # bridge reply (wclient --host / hook inbound): route by the
-                # triple recorded when the C2S went out; bytes untouched
+                # per-dest triple recorded when the C2S went out; bytes
+                # untouched. The S2C sender is the host that got the C2S,
+                # so look up (that dest, triple) -> player.
                 dec = decode_udp_game(data)
                 if not dec:
                     continue
                 _m, gport, cip, cport, _raw = dec
-                ent = self.udp_flows.get((gport, cip, cport))
-                if ent is None:
-                    continue
                 now = time.monotonic()
+                ent = self.udp_flows.get((("a", addr[0], addr[1]),
+                                          gport, cip, cport))
+                if ent is None:
+                    nid = self.node_by_udp_addr(addr)
+                    if nid is not None:
+                        ent = self.udp_flows.get((("n", nid), gport,
+                                                  cip, cport))
+                if ent is None:
+                    # fallback: sender addr changed (NAT rebinding) or old
+                    # pre-restart flow - scan same triple across dests,
+                    # freshest wins (ambiguity is logged, not silent)
+                    best_k, best_e, best_seen = None, None, -1.0
+                    for k, e in self.udp_flows.items():
+                        if len(k) != 4 or k[1] != gport or k[2] != cip \
+                                or k[3] != cport:
+                            continue
+                        if e[1] > best_seen and now - e[1] < self.FLOW_TTL:
+                            best_k, best_e, best_seen = k, e, e[1]
+                    if best_e is None:
+                        continue
+                    if sum(1 for k, e in self.udp_flows.items()
+                           if len(k) == 4 and k[1] == gport and k[2] == cip
+                           and k[3] == cport
+                           and now - e[1] < self.FLOW_TTL) > 1:
+                        print(f"[relay] UDP S2C ambiguous on "
+                              f"{(gport, cip, cport)}, freshest wins",
+                              flush=True)
+                    ent = best_e
                 paddr, seen = ent
                 if now - seen > self.FLOW_TTL:
-                    self.udp_flows.pop((gport, cip, cport), None)
                     continue
                 ent[1] = now
-                self.learned[gport] = (addr, now)
-                if len(self.learned) > 512:
+                self.learned[(paddr, gport)] = (addr, now)
+                if len(self.learned) > 2048:
                     self.learned.clear()
                 try:
                     self._public_udp.sendto(data, paddr)
@@ -534,12 +589,14 @@ class Relay:
             if not dests:
                 self.note_noroute("UDP")
                 continue
-            key = (gport, _cip, _cport)
-            prev = self.udp_flows.get(key)
-            if prev is not None and prev[0] != addr:
-                print(f"[relay] UDP triple collision on {key}, "
-                      f"latest sender wins", flush=True)
-            self.udp_flows[key] = [addr, time.monotonic()]
+            for dst in dests:
+                key = (("a", dst[0], dst[1]), gport, _cip, _cport)
+                prev = self.udp_flows.get(key)
+                if prev is not None and prev[0] != addr:
+                    print(f"[relay] UDP triple collision for dest {dst} on "
+                          f"{(gport, _cip, _cport)}, latest sender wins",
+                          flush=True)
+                self.udp_flows[key] = [addr, time.monotonic()]
             if len(self.udp_flows) > 2048:
                 self.udp_flows.clear()
             for dst in dests:

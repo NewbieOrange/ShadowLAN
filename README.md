@@ -12,7 +12,7 @@ Play broadcast-only LAN co-op games online, on Windows **and** Linux. One dedica
 
 1. Each node registers with the relay (`NODE` + token room) and gets a stable virtual IP.
 2. Discovery broadcasts fan out with sender identity; games see distinct servers at distinct IPs.
-3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node; legacy traffic falls back to designated-host → beaconer → learned-replier routing.
+3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node (per-dest flows, so identical LAN triples to different hosts don't collide); legacy traffic falls back to designated-host → beaconer → per-sender sticky-replier routing. A new host claim only steers NEW implicit joins — live streams keep flowing to their original targets.
 4. The hosting node bridges tunnel traffic to its local game at `127.0.0.1` — via `wclient --host`, or the hook, which auto-claims when the game calls `listen()`.
 
 ## Quickstart
@@ -50,7 +50,7 @@ injector.exe --server RELAY_IP --port 47777 --token SECRET -- lan_hook64.dll gam
 python wclient.py --server RELAY_IP --port 47777 --disc 4444 --tcp 27015 --udp 7777 --token SECRET
 ```
 
-Then the host starts the LAN game, everyone else opens the LAN browser and joins. Find the game's ports once with Wireshark (`udp.dstport`, `tcp.dstport`) or `netstat -ano` / `ss -tunap`: discovery UDP, game TCP/UDP. Include discovery UDP ports in `--udp` too if that title uses unicast discovery replies. One game per relay port; run more relays on more ports for more parties.
+Then the host starts the LAN game, everyone else opens the LAN browser and joins. Find the game's ports once with Wireshark (`udp.dstport`, `tcp.dstport`) or `netstat -ano` / `ss -tunap`: discovery UDP, game TCP/UDP. Include discovery UDP ports in `--udp` too if that title uses unicast discovery replies. One game per relay port is still the supported setup (run more relays on more ports for more parties); if two hosts do claim the same port, live sessions now survive and only new implicit joins follow the newest claim, while addressed (hook virtual-IP) sessions stay per-dest isolated.
 
 ## Injector options (Windows)
 
@@ -90,7 +90,8 @@ python3 hook/test_virtual_p2p.py # 3-node virtual-IP mesh (P2P_ALL_PASS)
 ## Limits
 
 - IPv4 only; IPv6 passes through untouched
-- One game per relay port; `--token` is the room key (empty = open relay)
+- One game per relay port is the supported setup; `--token` is the room key (empty = open relay). Accidental double-claims no longer kill live sessions (new implicit joins follow the newest claim; addressed hook sessions are per-dest isolated).
+- Same-dest UDP with byte-identical LAN triples from two sites still last-writer-wins per dest (logged); the hook sends from its virtual IP so hook nodes don't collide, and `wclient` client ports are usually random ephemerals.
 - No encryption — trusted peers only (or wrap in WireGuard)
 - Async overlapped Winsock and `ConnectEx`/`WSAEventSelect` waiting are not hooked; blocking sockets and `select`/`poll` are
 - Full per-peer virtual-IP attribution needs the hook; `wclient` re-emits beacons with its own source

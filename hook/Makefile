@@ -20,6 +20,7 @@ test: lan_hook.so
 	python3 test_direct.py
 	python3 test_virtual_p2p.py
 	python3 test_childprop.py
+	python3 test_perdest.py
 
 clean:
 	rm -f lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so

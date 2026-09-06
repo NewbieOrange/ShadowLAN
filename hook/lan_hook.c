@@ -694,8 +694,14 @@ static int dt_udp_pop(long long gsock, unsigned char *buf, size_t blen,
 }
 static struct dt_slot *dt_slot_get(long long gsock, int game_port,
                                    const struct sockaddr_in *orig) {
+    /* Per-dest slots: same socket to different game servers gets different
+     * marks, so S2C replies demux by mark and relay triples
+     * (virt-IP, mark) stay unique per destination. Same socket + port +
+     * dest reuses its slot. */
     for (int i = 0; i < DT_MAXSLOT; i++)
-        if (g_sl[i].used && g_sl[i].gsock == gsock && g_sl[i].game_port == game_port)
+        if (g_sl[i].used && g_sl[i].gsock == gsock && g_sl[i].game_port == game_port &&
+            g_sl[i].orig.sin_addr.s_addr == orig->sin_addr.s_addr &&
+            g_sl[i].orig.sin_port == orig->sin_port)
             return &g_sl[i];
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (!g_sl[i].used) {
@@ -1373,6 +1379,19 @@ static unsigned dt_next_sid(void) {
     return (unsigned)InterlockedIncrement((volatile LONG *)&g_sid);
 #endif
 }
+/* Outbound UDP source identity: our virtual IP (unique per node) when
+ * assigned, else loopback. Unique triples keep relay per-dest flows and
+ * host session tables from merging two players that share home-LAN
+ * numbering (or two hook sockets that share slot 0 -> 127.0.0.1:50000).
+ * Player-side demux uses the mark/slot, so the IP choice is safe. */
+static int dt_src_ip(char *out, size_t n) {
+    unsigned v;
+    DLOCK(); v = g_myvirt; DUNLOCK();
+    if (!v || n < 16) return 0;
+    snprintf(out, n, "%u.%u.%u.%u",
+             (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255);
+    return 1;
+}
 /* Raw tunnel-UDP transmit to the relay. */
 static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     struct sockaddr_in sa;
@@ -1412,7 +1431,9 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         int slot = sl ? (int)(sl - g_sl) : -1;
         DUNLOCK();
         if (slot < 0) return 1;
-        const char *mip = "127.0.0.1"; int ml = 9, mark = 50000 + slot;
+        char srcip[32]; const char *mip = "127.0.0.1"; int ml = 9;
+        if (dt_src_ip(srcip, sizeof(srcip))) { mip = srcip; ml = (int)strlen(srcip); }
+        int mark = 50000 + slot;
         size_t n = 4 + 4 + 2 + 2 + (size_t)ml + 2 + len;
         unsigned char *d = (unsigned char *)malloc(n);
         if (!d) return 1;
@@ -1444,7 +1465,9 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     DUNLOCK();
     if (slot < 0) { dlog("udp game: slot table full"); return 1; } /* table full: drop, pretend sent */
     /* build U_GAME_C2S: VN 01 01 | H game | H iplen | ip | H mark | raw */
-    const char *mip = "127.0.0.1"; int ml = 9, mark = 50000 + slot;
+    char srcip2[32]; const char *mip = "127.0.0.1"; int ml = 9;
+    if (dt_src_ip(srcip2, sizeof(srcip2))) { mip = srcip2; ml = (int)strlen(srcip2); }
+    int mark = 50000 + slot;
     size_t n = 4 + 2 + 2 + (size_t)ml + 2 + len;
     unsigned char *d = (unsigned char *)malloc(n);
     if (!d) return 1;
