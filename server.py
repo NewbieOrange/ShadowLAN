@@ -42,6 +42,7 @@ class Relay:
     LEARN_TTL = 60         # (src, game_port) -> replier freshness (per-sender sticky)
     FLOW_TTL = 120         # per-dest triple -> player routing freshness
     NODE_GRACE = 5         # token relays: NODE-or-HELLO deadline per conn
+    NODE_TTL = 600         # forget disconnected nodes (writer gone) after this
 
     def __init__(self, port, token="", allowed_tcp=None, allowed_udp=None,
                  disc_ports=None, subnet="10.200.0.0/24"):
@@ -165,6 +166,21 @@ class Relay:
                 continue  # legacy peer: no node table
             await self.send_assign(w)
 
+    def prune_nodes(self, now=None):
+        """Drop disconnected nodes idle past NODE_TTL. Without this,
+        every short-lived peer (helper processes, redial storms) pins
+        a virtual IP forever and the /24 fills up until nobody new can
+        register ("subnet full")."""
+        now = time.monotonic() if now is None else now
+        for nid, ent in list(self.nodes.items()):
+            w = ent.get("writer")
+            if (w is None or w.is_closing()) and \
+                    now - ent.get("seen_tcp", 0) > self.NODE_TTL:
+                self.nodes.pop(nid, None)
+                for o, i in list(self.writer_node.items()):
+                    if i == nid:
+                        self.writer_node.pop(o, None)
+
     async def register_node(self, writer, peer, token, node, udp_port):
         """T_NODE/U_NODE endpoint: returns True if accepted."""
         if not self.token_ok(token):
@@ -176,6 +192,7 @@ class Relay:
             tcp_ip = ""
         ent = self.nodes.get(node)
         if ent is None:
+            self.prune_nodes(now)
             virt = None
             # find free address without mutating yet
             used = {e["virt"] for e in self.nodes.values() if e.get("virt")}
@@ -185,8 +202,26 @@ class Relay:
                     virt = v
                     break
             if virt is None:
-                print(f"[relay] subnet full, rejecting node {node}", flush=True)
-                return False
+                # full even after pruning: evict the stalest
+                # disconnected entry rather than lock out live peers
+                cand, cand_seen = None, None
+                for nid, e in self.nodes.items():
+                    w = e.get("writer")
+                    if w is None or w.is_closing():
+                        s = e.get("seen_tcp", 0)
+                        if cand is None or s < cand_seen:
+                            cand, cand_seen = nid, s
+                if cand is None:
+                    print("[relay] subnet full, rejecting node "
+                          f"{node}", flush=True)
+                    return False
+                old = self.nodes.pop(cand)
+                for o, i in list(self.writer_node.items()):
+                    if i == cand:
+                        self.writer_node.pop(o, None)
+                virt = old.get("virt")
+                print(f"[relay] subnet full: evicted stale node {cand} "
+                      f"for node {node}", flush=True)
             ent = {"writer": None, "tcp_ip": "", "udp_port": 0,
                    "udp_addr": None, "virt": virt,
                    "seen_tcp": 0.0, "seen_udp": 0.0}

@@ -287,10 +287,39 @@ async def test_tcp_survives_claim():
     srv_b.close()
 
 
+async def test_subnet_eviction(relay):
+    # fill the /24 with dead entries, then a live NODE must evict one
+    # and register (old code: "subnet full, rejecting node" forever)
+    import time
+    from common import ip_to_int
+    base = ip_to_int("10.200.0.0") & 0xFFFFFF00
+    now = time.monotonic()
+    for i in range(2, 255):
+        nid = 0x70000000 + i
+        relay.nodes[nid] = {"writer": None, "tcp_ip": "", "udp_port": 0,
+                            "udp_addr": None, "virt": base | i,
+                            "seen_tcp": now, "seen_udp": 0.0}
+    assert len(relay.nodes) >= 253, len(relay.nodes)
+    reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
+    await tcp_send(writer, T_NODE, encode_node(b"", 0x7E11C7, 0))
+    mtype, payload = await asyncio.wait_for(tcp_read(reader), timeout=5)
+    from common import decode_assign
+    assert mtype == 0x23, (mtype, "no ASSIGN = registration rejected")
+    dec = decode_assign(payload)
+    assert dec and dec[0] != 0, ("no virtual IP assigned", payload)
+    assert 0x7E11C7 in relay.nodes, "new node missing"
+    assert len(relay.nodes) <= 253, len(relay.nodes)
+    print("PASS[subnet-evict] full table evicts stale, live node admitted",
+          flush=True)
+    writer.close()
+
+
 async def main():
-    relay_task = asyncio.create_task(Relay(PUB).run())
+    relay = Relay(PUB)
+    relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.3)
     try:
+        await test_subnet_eviction(relay)
         await test_udp_p2p_perdest()
         await test_udp_persender_learned()
         await test_disc_distinct_hosts()
