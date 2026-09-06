@@ -87,6 +87,8 @@ class Relay:
         self.udp_flows = {}
         self._public_udp = None
         self._last_noroute = 0.0
+        self._pdat_warn = {}
+        self._unk_op = {}
 
     async def r_send(self, writer, mtype, payload):
         lock = self.send_locks.setdefault(id(writer), asyncio.Lock())
@@ -462,6 +464,13 @@ class Relay:
             self._last_noroute = now
             print(f"[relay] no route for {what}, dropping", flush=True)
 
+    def note_unknown_udp(self, op):
+        now = time.monotonic()
+        if now - self._unk_op.get(op, 0.0) > 10:
+            self._unk_op[op] = now
+            print(f"[relay] unknown UDP opcode 0x{op:02x}, dropping",
+                  flush=True)
+
     def node_by_udp_addr(self, addr):
         """Tunnel addr -> dest node id, freshest match (for S2C lookup)."""
         best, best_seen = None, -1.0
@@ -541,7 +550,19 @@ class Relay:
                     elif tgt.get("udp_port") and tgt.get("tcp_ip"):
                         taddr = (tgt["tcp_ip"], tgt["udp_port"])
                 if taddr is None or taddr == addr:
+                    why = "same-addr" if taddr == addr else (
+                        "unknown-node" if tgt is None else "no-udp-endpoint")
+                    now = time.monotonic()
+                    if now - self._pdat_warn.get(dest_node, 0.0) > 5.0:
+                        self._pdat_warn[dest_node] = now
+                        print(f"[udp] pdat drop ({why}) dest node "
+                              f"{dest_node} gport {gport}", flush=True)
                     continue
+                print_k = ("ok", dest_node, gport)
+                if now - self._pdat_warn.get(print_k, 0.0) > 5.0:
+                    self._pdat_warn[print_k] = now
+                    print(f"[udp] pdat {addr} -> node {dest_node} @{taddr} "
+                          f"gport {gport} len {len(_raw)}", flush=True)
                 self.known_udp[addr] = time.monotonic()
                 key = (("n", dest_node), gport, _cip, _cport)
                 prev = self.udp_flows.get(key)
@@ -610,6 +631,7 @@ class Relay:
                     pass
                 continue
             if mtype != U_GAME_C2S:
+                self.note_unknown_udp(mtype)
                 continue
             dec = decode_udp_game(data)
             if not dec:

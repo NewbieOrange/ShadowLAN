@@ -1517,8 +1517,15 @@ static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     } else dlog("udp game: no tunnel sock yet");
 #else
     DTSOCK u = g_udptun;
-    if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
-    else dlog("udp game: no tunnel sock yet");
+    if (u != INVALID_SOCKET) {
+        int k = sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
+        if (k < 0 && g_debug) {
+            char lb[96];
+            snprintf(lb, sizeof(lb), "udp tun send fail %d n=%d",
+                     WSAGetLastError(), (int)n);
+            dlog(lb);
+        }
+    } else dlog("udp game: no tunnel sock yet");
 #endif
 }
 /* Outbound sendto routing. Returns 1 when consumed: virtual peer IP ->
