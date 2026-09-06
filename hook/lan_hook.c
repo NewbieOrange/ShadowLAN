@@ -190,6 +190,8 @@ static struct dt_frame *g_sqh = NULL, *g_sqt = NULL;
 static unsigned g_sid = 0;
 static volatile int g_tun_run = 0, g_tun_started = 0, g_tcp_up = 0;
 static DTSOCK g_tcp = DTSOCK_BAD, g_udptun = DTSOCK_BAD;
+static int g_tun_conn = 0;
+static void dt_tun_setup(DTSOCK s);
 static unsigned long g_fakeip = 0; /* 192.168.7.1 net order, set at start */
 #ifdef LINUX_BUILD
 static pthread_mutex_t g_dmu = PTHREAD_MUTEX_INITIALIZER;
@@ -1307,13 +1309,17 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         s = socket(AF_INET, SOCK_DGRAM, 0);
         if (s < 0) return NULL;
         g_udptun = s;
+        g_tun_conn = 0;
+        dt_tun_setup(s);
+        dt_send_node();      /* punch the reply pinhole right away */
+        dt_send_udp_node();
     }
     for (;;) {
         if (!g_tun_run) break;
         {
             static long long last_nd = 0;
             long long nown = dt_now_ms();
-            if (nown - last_nd > 30000) {
+            if (nown - last_nd > 12000) {
                 last_nd = nown;
                 dt_send_node();      /* TCP: membership + UDP endpoint */
                 dt_send_udp_node();  /* UDP: refresh NAT mapping */
@@ -1368,13 +1374,17 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (s == INVALID_SOCKET) return 0;
         g_udptun = s;
+        g_tun_conn = 0;
+        dt_tun_setup(s);
+        dt_send_node();      /* punch the reply pinhole right away */
+        dt_send_udp_node();
     }
     for (;;) {
         if (!g_tun_run) break;
         {
             static long long last_nd = 0;
             long long nown = dt_now_ms();
-            if (nown - last_nd > 30000) {
+            if (nown - last_nd > 12000) {
                 last_nd = nown;
                 dt_send_node();      /* TCP: membership + UDP endpoint */
                 dt_send_udp_node();  /* UDP: refresh NAT mapping */
@@ -1438,7 +1448,7 @@ static void dt_start(void) {
 #endif
         g_node = dt_rand() | 1;
     }
-    dt_send_udp_node(); /* early NAT mapping; 30s tick + T_NODE refresh it */
+    dt_send_udp_node(); /* refresh even if the socket below already exists */
     /* Create the UDP tunnel socket synchronously: game threads may send
      * within microseconds of the first intercepted call, before a
      * background thread would get scheduled. */
@@ -1449,7 +1459,13 @@ static void dt_start(void) {
             struct sockaddr_in b; memset(&b, 0, sizeof(b));
             b.sin_family = AF_INET; b.sin_addr.s_addr = htonl(INADDR_ANY); b.sin_port = 0;
             if (bind(s, (struct sockaddr *)&b, sizeof(b)) != 0) { close(s); }
-            else g_udptun = s;
+            else {
+                g_udptun = s;
+                g_tun_conn = 0;
+                dt_tun_setup(s);
+                dt_send_node();      /* punch the reply pinhole now */
+                dt_send_udp_node();
+            }
         }
     }
 #else
@@ -1459,7 +1475,13 @@ static void dt_start(void) {
             struct sockaddr_in b; memset(&b, 0, sizeof(b));
             b.sin_family = AF_INET; b.sin_addr.s_addr = htonl(INADDR_ANY); b.sin_port = 0;
             if (bind(s, (struct sockaddr *)&b, sizeof(b)) != 0) { closesocket(s); }
-            else g_udptun = s;
+            else {
+                g_udptun = s;
+                g_tun_conn = 0;
+                dt_tun_setup(s);
+                dt_send_node();      /* punch the reply pinhole now */
+                dt_send_udp_node();
+            }
         }
     }
 #endif
@@ -1507,6 +1529,46 @@ static int dt_src_ip(char *out, size_t n) {
     return 1;
 }
 /* Raw tunnel-UDP transmit to the relay. */
+/* Firewall ride (LAN_HOOK_TUNNEL_PORT=<port>): bind the tunnel socket to
+ * the game's own UDP port. Windows program rules key on the executable,
+ * so replies pass under rules the game legitimately earned; connect()
+ * then pins exact 4-tuple demux so tunnel traffic lands on this socket
+ * even when the app's own socket shares the port, and REUSEADDR lets
+ * both bind. Use on at most ONE hooked process per machine. Unset
+ * (default): ephemeral port, relying on the stateful unicast-reply
+ * pinhole opened by our outbound keepalives. */
+static void dt_tun_setup(DTSOCK s) {
+    struct sockaddr_in sa;
+    const char *tp = getenv("LAN_HOOK_TUNNEL_PORT");
+    if (tp && tp[0]) {
+        int p = atoi(tp);
+        if (p > 0 && p < 65536) {
+            struct sockaddr_in tb;
+            int on = 1;
+            memset(&tb, 0, sizeof(tb));
+            tb.sin_family = AF_INET;
+            tb.sin_addr.s_addr = htonl(INADDR_ANY);
+            tb.sin_port = htons((unsigned short)p);
+#ifdef LINUX_BUILD
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#else
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
+#endif
+            if (bind(s, (struct sockaddr *)&tb, sizeof(tb)) != 0)
+                dlog("udp tun: ride-port bind failed, ephemeral");
+            else {
+                char lb[64];
+                snprintf(lb, sizeof(lb), "udp tun: bound ride-port %d", p);
+                dlog(lb);
+            }
+        }
+    }
+    if (dt_resolve(&sa) == 0 &&
+        connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        g_tun_conn = 1;
+        dlog("udp tun: connected to relay");
+    }
+}
 static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     struct sockaddr_in sa;
     if (dt_resolve(&sa) != 0) { dlog("udp game: resolve failed"); return; }
@@ -1514,13 +1576,15 @@ static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     dt_reals();
     int u = g_udptun;
     if (u >= 0) {
-        ssize_t k = r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+        ssize_t k = g_tun_conn ? r_send(u, d, n, 0)
+                               : r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
         if (k < 0) dlog("udp game: tunnel send failed");
     } else dlog("udp game: no tunnel sock yet");
 #else
     DTSOCK u = g_udptun;
     if (u != INVALID_SOCKET) {
-        int k = sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
+        int k = g_tun_conn ? send(u, (const char *)d, (int)n, 0)
+                           : sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
         if (k < 0 && g_debug) {
             char lb[96];
             snprintf(lb, sizeof(lb), "udp tun send fail %d n=%d",

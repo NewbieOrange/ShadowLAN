@@ -577,8 +577,10 @@ class Relay:
                 inner = encode_udp_game(U_GAME_C2S, gport, _cip, _cport, _raw)
                 try:
                     self._public_udp.sendto(inner, taddr)
-                except (OSError, AttributeError):
-                    pass
+                except OSError as e:
+                    print(f"[udp] pdat sendto {taddr} failed: {e}", flush=True)
+                except AttributeError:
+                    print("[udp] pdat: no public UDP socket yet", flush=True)
                 continue
             if mtype == U_GAME_S2C:
                 # bridge reply (wclient --host / hook inbound): route by the
