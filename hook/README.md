@@ -64,8 +64,8 @@ injector.exe --server RELAY_IP --port 47777 --token SECRET --debug -- lan_hook64
 
 The tail shows how far init got (`enter` → `resolving imports` →
 `policy ready` → `starting tunnel` → `patching modules` →
-`patched N modules` → `installed`). The file opens first thing in init and
-falls back to `%TEMP%\lan_hook.log` when unset. A guarded fault also drops
+`patched N modules` → `installed`). The file opens first thing in init;
+unset or empty means no file logging at all. A guarded fault still drops
 `%TEMP%\lan_hook_<pid>.dmp` (minidump with the exact crash address).
 Common causes:
 

@@ -2077,14 +2077,9 @@ static void flog_open(void) {
     char path[MAX_PATH];
     DWORD n;
     if (g_logf) return;
-    path[0] = 0;
+    /* Unset or empty: file logging stays off entirely. */
     n = GetEnvironmentVariableA("LAN_HOOK_LOGFILE", path, sizeof(path));
-    if (n == 0 || n >= sizeof(path)) {
-        char tmp[MAX_PATH];
-        if (GetTempPathA(sizeof(tmp), tmp) == 0) return;
-        snprintf(path, sizeof(path), "%slan_hook.log", tmp);
-        path[sizeof(path) - 1] = 0;
-    }
+    if (n == 0 || n >= sizeof(path)) return;
     g_logf = fopen(path, "a");
 }
 static void flog(const char *m) {
