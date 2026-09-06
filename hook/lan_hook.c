@@ -1644,46 +1644,71 @@ static void dt_udp_tun_send(const unsigned char *d, size_t n) {
  * LAN such packets already loop locally, and several games' discovery
  * relies on that self-loop (peer-list announcements sent to the local
  * LAN IP, overlay IPC on 127.0.0.1). Interface list cached ~30s. */
-static int ipv4_is_local(unsigned long net_order) {
-    static unsigned long ips[16];
-    static int n = -1;
-    static long long next = 0;
-    unsigned long h = ntohl(net_order);
+static unsigned long g_lips[16];
+static int g_nlips = -1;
+static long long g_lips_next = 0;
+/* (Re)build the cached list of this machine's interface addresses. */
+static void lips_refresh(void) {
     long long now = dt_now_ms();
     char host[256];
     struct addrinfo hints, *res = 0, *rp;
-    int i, hit = 0;
-    if ((h >> 24) == 127) return 1;
     DLOCK();
-    if (n >= 0 && now < next) {
-        for (i = 0; i < n; i++) if (ips[i] == net_order) { hit = 1; break; }
-        DUNLOCK();
-        return hit;
-    }
+    if (g_nlips >= 0 && now < g_lips_next) { DUNLOCK(); return; }
     DUNLOCK();
     if (gethostname(host, sizeof(host)) != 0) host[0] = 0;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     if (host[0] && getaddrinfo(host, 0, &hints, &res) == 0) {
         DLOCK();
-        n = 0;
-        for (rp = res; rp && n < (int)(sizeof(ips) / sizeof(ips[0])); rp = rp->ai_next)
+        g_nlips = 0;
+        for (rp = res; rp && g_nlips < (int)(sizeof(g_lips) / sizeof(g_lips[0]));
+             rp = rp->ai_next)
             if (rp->ai_family == AF_INET && rp->ai_addrlen >= sizeof(struct sockaddr_in))
-                ips[n++] = ((struct sockaddr_in *)rp->ai_addr)->sin_addr.s_addr;
-        next = dt_now_ms() + 30000;
-        for (i = 0; i < n; i++) if (ips[i] == net_order) hit = 1;
+                g_lips[g_nlips++] = ((struct sockaddr_in *)rp->ai_addr)->sin_addr.s_addr;
+        g_lips_next = dt_now_ms() + 30000;
         DUNLOCK();
         freeaddrinfo(res);
-        return hit;
     }
-    return 0;
 }
-
+static int ipv4_is_local(unsigned long net_order) {
+    unsigned long h = ntohl(net_order);
+    int i, hit = 0;
+    if ((h >> 24) == 127) return 1;
+    lips_refresh();
+    DLOCK();
+    for (i = 0; i < g_nlips; i++) if (g_lips[i] == net_order) { hit = 1; break; }
+    DUNLOCK();
+    return hit;
+}
+/* Primary interface address as dotted string (the source a NIC would put
+ * on locally delivered traffic). 0 on failure. */
+static int dt_machine_ip(char *out, int n) {
+    unsigned long a = 0;
+    int ok = 0;
+    lips_refresh();
+    DLOCK();
+    if (g_nlips > 0) { a = g_lips[0]; ok = 1; }
+    DUNLOCK();
+    if (!ok) return 0;
+    snprintf(out, n, "%lu.%lu.%lu.%lu", a & 255, (a >> 8) & 255,
+             (a >> 16) & 255, (a >> 24) & 255);
+    return 1;
+}
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     int game_port = ntohs(dst->sin_port);
-    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host loop stays real */
+    if (ipv4_is_local(dst->sin_addr.s_addr)) {
+        if (g_debug) {
+            unsigned long a = 0; char lb[112];
+            memcpy(&a, &dst->sin_addr.s_addr, 4);
+            snprintf(lb, sizeof(lb), "sendto local pass %lu.%lu.%lu.%lu:%d n=%d",
+                     a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255,
+                     game_port, (int)len);
+            dlog(lb);
+        }
+        return 0;   /* same-host loop stays on the real stack */
+    }
     {
         char lb[160];
         unsigned long a = 0; memcpy(&a, &dst->sin_addr.s_addr, 4);
@@ -1734,6 +1759,15 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         dt_tcp_queue(DT_BCAST, p, 2 + len);
         free(p);
         DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        /* NIC-style local echo: many LAN discovery schemes seed their
+         * peer table from the echo of their own broadcast, which the
+         * real stack always delivers to local sockets. Replicate. */
+        {
+            char mip[64];
+            if (dt_machine_ip(mip, (int)sizeof(mip)))
+                dt_direct_udp_in(game_port, (const unsigned char *)mip,
+                                 (int)strlen(mip), buf, len);
+        }
         return 1;
     }
     DLOCK();
