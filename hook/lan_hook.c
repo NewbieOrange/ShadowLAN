@@ -36,6 +36,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <iphlpapi.h>
 #include <ctype.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -2688,7 +2689,22 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
  * first (pure blocking reader): register it here or fanout can never
  * find it and its arrivals are silently dropped. */
 int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
-    int r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
+    int r;
+    unsigned myv = 0;
+    if (g_direct && a && a->sa_family == AF_INET) {
+        DLOCK(); myv = g_myvirt; DUNLOCK();
+        if (myv && ((const struct sockaddr_in *)a)->sin_addr.s_addr == htonl(myv)) {
+            /* binding to our advertised virtual interface: give the real
+             * stack a wildcard bind; the shim made the app believe in it */
+            struct sockaddr_in mod = *(const struct sockaddr_in *)a;
+            mod.sin_addr.s_addr = htonl(INADDR_ANY);
+            dlog("bind vnode->ANY");
+            r = p_bind ? p_bind(s, (struct sockaddr *)&mod, l) : SOCKET_ERROR;
+            if (r == 0) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+            return r;
+        }
+    }
+    r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
     /* Shared discovery ports: several game processes bind one UDP port
      * (SO_REUSEADDR). If the real stack refuses it - another socket on
      * this machine owns the port - bind ephemerally instead but register
@@ -3206,6 +3222,112 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
     return p_GetProcAddress(m, n);
 }
 
+/* ---- interface-identity shim --------------------------------------
+ * A virtual-NIC product would expose the tunnel address as a real local
+ * interface; without a driver we fake that view per-process: the vnode
+ * is appended to the adapter address lists returned by the IP Helper
+ * APIs (consumers that enumerate "my IPs" / compute per-interface
+ * broadcasts / sanity-check peer addresses against local subnets then
+ * see 10.200.0.x as legitimately ours), and binds to it are rewritten
+ * to INADDR_ANY. Pure data surgery on caller-owned buffers; failures
+ * degrade to the unshimmed answer. ---- */
+typedef ULONG (WINAPI *PFN_GetAdaptersAddresses)(ULONG, ULONG, PVOID,
+                                                 PIP_ADAPTER_ADDRESSES, PULONG);
+typedef ULONG (WINAPI *PFN_GetAdaptersInfo)(PIP_ADAPTER_INFO, PULONG);
+static PFN_GetAdaptersAddresses p_GetAdaptersAddresses = 0;
+static PFN_GetAdaptersInfo p_GetAdaptersInfo = 0;
+static int g_gaa_logged = 0;
+
+static int dt_vnode_str(char *out, int n) { return dt_src_ip(out, (size_t)n); }
+
+typedef struct { IP_ADAPTER_UNICAST_ADDRESS u; SOCKADDR_IN sa; } dt_uni_node;
+
+ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
+                                     PIP_ADAPTER_ADDRESSES AdapterAddresses,
+                                     PULONG SizePointer) {
+    ULONG r, used, room, at;
+    dt_uni_node *nd;
+    IP_ADAPTER_ADDRESSES *a, *tgt = 0;
+    char ip[48];
+    if (!p_GetAdaptersAddresses) return ERROR_FUNCTION_FAILED;
+    if (g_debug && !g_gaa_logged) { g_gaa_logged = 1;
+        dlog("GAA shim active"); }
+    if (!g_direct || !dt_vnode_str(ip, sizeof(ip)))
+        return p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
+    room = SizePointer ? *SizePointer : 0;
+    r = p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
+    if (r == ERROR_BUFFER_OVERFLOW) {
+        ULONG need = SizePointer ? *SizePointer : 0;
+        if (need < 0xFFFFFFFFu - 128 && SizePointer) *SizePointer = need + 128;
+        return r;
+    }
+
+    if (r != NO_ERROR || !AdapterAddresses || !SizePointer) return r;
+    used = *SizePointer;
+    {   /* some implementations report the whole buffer as "used"; trust a
+         * fresh size probe when it's smaller */
+        ULONG probe = 0;
+        p_GetAdaptersAddresses(Family, Flags, Reserved, NULL, &probe);
+        if (probe && probe < used) used = probe;
+    }
+    at = (used + 15u) & ~15u;
+    if (at + sizeof(dt_uni_node) > room) return r;   /* no slack: unshimmed */
+    /* target: first up, non-loop adapter; else head */
+    for (a = AdapterAddresses; a; a = a->Next)
+        if (a->OperStatus == IfOperStatusUp && a->IfType != IF_TYPE_SOFTWARE_LOOPBACK) { tgt = a; break; }
+    if (!tgt) tgt = AdapterAddresses;
+    nd = (dt_uni_node *)((BYTE *)AdapterAddresses + at);
+    memset(nd, 0, sizeof(*nd));
+    nd->u.Length = sizeof(IP_ADAPTER_UNICAST_ADDRESS);
+    nd->u.Address.lpSockaddr = (LPSOCKADDR)&nd->sa;
+    nd->u.Address.iSockaddrLength = sizeof(SOCKADDR_IN);
+    nd->sa.sin_family = AF_INET;
+    nd->sa.sin_addr.s_addr = inet_addr(ip);
+    nd->u.OnLinkPrefixLength = 24;
+    {
+        PIP_ADAPTER_UNICAST_ADDRESS u = &tgt->FirstUnicastAddress ? tgt->FirstUnicastAddress : 0;
+        if (!u) { tgt->FirstUnicastAddress = &nd->u; }
+        else { while (u->Next) u = u->Next; u->Next = &nd->u; }
+    }
+    *SizePointer = at + (ULONG)sizeof(dt_uni_node);
+
+    return r;
+}
+
+ULONG WINAPI hk_GetAdaptersInfo(PIP_ADAPTER_INFO InfoBuffer, PULONG SizePointer) {
+    ULONG r, used, at, room;
+    IP_ADDR_STRING *nd;
+    PIP_ADAPTER_INFO a, tgt = 0;
+    char ip[48];
+    if (!p_GetAdaptersInfo) return ERROR_FUNCTION_FAILED;
+    if (!g_direct || !dt_vnode_str(ip, sizeof(ip)))
+        return p_GetAdaptersInfo(InfoBuffer, SizePointer);
+    room = SizePointer ? *SizePointer : 0;
+    r = p_GetAdaptersInfo(InfoBuffer, SizePointer);
+    if (r == ERROR_BUFFER_OVERFLOW) {
+        ULONG need = SizePointer ? *SizePointer : 0;
+        if (need < 0xFFFFFFFFu - 128 && SizePointer) *SizePointer = need + 128;
+        return r;
+    }
+    if (r != NO_ERROR || !InfoBuffer || !SizePointer) return r;
+    used = *SizePointer;
+    at = (used + 15u) & ~15u;
+    if (at + sizeof(IP_ADDR_STRING) > room) return r;
+    for (a = InfoBuffer; a; a = a->Next) { if (a->AddressLength == 6 && a->Index) { tgt = a; break; } }
+    if (!tgt) tgt = InfoBuffer;
+    nd = (IP_ADDR_STRING *)((BYTE *)InfoBuffer + at);
+    memset(nd, 0, sizeof(*nd));
+    strncpy(nd->IpAddress.String, ip, 15);
+    strncpy(nd->IpMask.String, "255.255.255.0", 15);
+    {
+        PIP_ADDR_STRING s = &tgt->IpAddressList;
+        while (s->Next) s = s->Next;
+        s->Next = nd;
+    }
+    *SizePointer = at + (ULONG)sizeof(IP_ADDR_STRING);
+    return r;
+}
+
 /* Optional module allowlist (LAN_HOOK_MODULES=a.dll,b.dll): only patch
  * modules whose file name contains one of these (case-insensitive).
  * Escape hatch when a specific DLL (overlay, anti-tamper, ...) misbehaves.
@@ -3258,7 +3380,8 @@ static void patch_iat_inner(HMODULE mod) {
             char *dll = (char*)(base + desc->Name);
             int isws2 = (_stricmp(dll, "ws2_32.dll") == 0);
             int isk32 = (_stricmp(dll, "kernel32.dll") == 0);
-            if (!isws2 && !isk32) continue;
+            int isiph = (_stricmp(dll, "iphlpapi.dll") == 0);
+            if (!isws2 && !isk32 && !isiph) continue;
             IMAGE_THUNK_DATA *orig = desc->OriginalFirstThunk ?
                 (IMAGE_THUNK_DATA*)(base + desc->OriginalFirstThunk) : 0;
             IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
@@ -3308,6 +3431,10 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"WSAWaitForMultipleEvents")) rep = (FARPROC)hk_WSAWaitForMultipleEvents;
                     else if (!strcmp(fn,"WSACreateEvent")) rep = (FARPROC)hk_WSACreateEvent;
                     else if (!strcmp(fn,"WSACloseEvent")) rep = (FARPROC)hk_WSACloseEvent;
+                } else if (isiph && !strcmp(fn,"GetAdaptersAddresses")) {
+                    rep = (FARPROC)hk_GetAdaptersAddresses;
+                } else if (isiph && !strcmp(fn,"GetAdaptersInfo")) {
+                    rep = (FARPROC)hk_GetAdaptersInfo;
                 } else if (isk32 && !strcmp(fn,"GetProcAddress")) {
                     rep = (FARPROC)hk_GetProcAddress;
                 } else if (isk32 && !strcmp(fn,"LoadLibraryA")) {
@@ -3698,6 +3825,14 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_WSAConnect = (PFN_WSAConnect)GetProcAddress(hWS2, "WSAConnect");
     p_getpeername = (PFN_getpeername)GetProcAddress(hWS2, "getpeername");
     p_getsockname = (PFN_getsockname)GetProcAddress(hWS2, "getsockname");
+    {
+        HMODULE hIPH = LoadLibraryA("iphlpapi.dll");
+        if (hIPH) {
+            p_GetAdaptersAddresses = (PFN_GetAdaptersAddresses)GetProcAddress(hIPH, "GetAdaptersAddresses");
+            p_GetAdaptersInfo = (PFN_GetAdaptersInfo)GetProcAddress(hIPH, "GetAdaptersInfo");
+            dbg("lan_hook: iphlpapi pointers resolved\n");
+        }
+    }
     p_closesocket = (PFN_closesocket)GetProcAddress(hWS2, "closesocket");
     p_listen = (PFN_listen)GetProcAddress(hWS2, "listen");
     p_send = (PFN_send)GetProcAddress(hWS2, "send");

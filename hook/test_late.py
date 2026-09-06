@@ -141,15 +141,19 @@ def main():
     served = wait_for(hlog, r"bind pid=\d+ sock=\d+ 0\.0\.0\.0:%d" % (PUB + 1), 90)
     okB = False
     cli = None
+    hout = os.path.join(tmp, "host.out")
     if not served:
         print("host never bound the query port")
     else:
         print("host serving:", served)
-        cli = launch("client", winpath(clog), cout)
-        done = wait_for(cout, r"LATE_", 120)
-        okB = done is not None and "LATE_OK" in open(
-            os.path.join(tmp, "cli.out"), errors="replace").read()
-        print("client:", done)
+        ifv = wait_for(hout, r"IF(OK|MISS)", 15)
+        print("interface shim:", ifv)
+        if ifv and "IFOK" in ifv:
+            cli = launch("client", winpath(clog), cout)
+            done = wait_for(cout, r"LATE_", 120)
+            okB = done is not None and "LATE_OK" in open(
+                os.path.join(tmp, "cli.out"), errors="replace").read()
+            print("client:", done)
     ok = okA and okB
     if cli:
         cli.kill()

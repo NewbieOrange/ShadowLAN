@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -62,6 +63,31 @@ int main(int argc, char **argv) {
         if (!h) { printf("load failed %lu\n", GetLastError()); return 1; }
         run_fn r = (run_fn)(void *)GetProcAddress(h, "run");
         if (!r) { printf("no run export\n"); return 1; }
+        /* shim check: our virtual address must appear as a local one */
+        {
+            ULONG len = 0;
+            IP_ADAPTER_ADDRESSES *ad = 0;
+            int found = 0;
+            GetAdaptersAddresses(AF_INET, 0, 0, 0, &len);
+            if (len) {
+                ad = (IP_ADAPTER_ADDRESSES *)malloc(len + 512);
+                if (ad && GetAdaptersAddresses(AF_INET, 0, 0, ad, &len) == 0) {
+                    IP_ADAPTER_ADDRESSES *p;
+                    for (p = ad; p && !found; p = p->Next)
+                        for (PIP_ADAPTER_UNICAST_ADDRESS u = p->FirstUnicastAddress;
+                             u; u = u->Next) {
+                            char *s;
+                            if (!u->Address.lpSockaddr ||
+                                u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                            s = inet_ntoa(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr);
+                            if (s && !strncmp(s, "10.200.", 7)) { found = 1; printf("iface %s\n", s); }
+                        }
+                }
+            }
+            printf(found ? "IFOK\n" : "IFMISS\n");
+            free(ad);
+        }
+        fflush(stdout);
         printf("plugin loaded late, serving\n"); fflush(stdout);
         r(qport, aport); /* blocks ~10s answering queries */
         return 0;
