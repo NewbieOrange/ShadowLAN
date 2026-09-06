@@ -20,7 +20,7 @@ a node id for virtual-IP P2P mesh play.
 Notes:
 - Stdlib only, no admin. Allow Python through the firewall once.
 - If bind fails with 10013 on Windows (game uses exclusive bind), use
-  the hook instead; most Unity/Unreal/legacy LAN titles use reusable binds.
+  the hook instead; most Unity/Unreal/classic LAN titles use reusable binds.
 """
 import argparse
 import asyncio
