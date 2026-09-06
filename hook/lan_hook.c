@@ -1333,6 +1333,7 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         ssize_t n = r_recv(s, buf, sizeof(buf), 0);
         if (n <= 0) continue;
         if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
+        { char lb[64]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d", buf[3], (int)n); dlog(lb); }
         if (buf[3] == DU_C2S) {
             /* inbound: another player targets OUR hosted game */
             int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
@@ -1393,6 +1394,7 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         int n = recv(s, (char *)buf, (int)sizeof(buf), 0);
         if (n <= 0) continue;
         if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
+        { char lb[64]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d", buf[3], n); dlog(lb); }
         if (buf[3] == DU_C2S) {
             /* inbound: another player targets OUR hosted game */
             int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);

@@ -90,6 +90,12 @@ Common causes:
 
 - Wrong bitness: 32-bit game needs `lan_hook32.dll` (check Task Manager →
   Details → Platform column).
+- Host machine must not drop inbound UDP: the relay forwards addressed
+  game datagrams back to each player's ephemeral tunnel port. If one-way
+  traffic appears (broadcasts arrive, unicast answers do not), allow the
+  game and tool executables through the firewall for UDP, e.g.
+  `netsh advfirewall firewall add rule dir=in action=allow protocol=UDP
+  program="C:\path\to\game.exe" name="ShadowLAN"`.
 - A specific DLL misbehaving: restrict patching with
   `set LAN_HOOK_MODULES=game.exe,unityplayer.dll` (substring list).
 - Anti-tamper: some titles fault when imports change; the hook skips
