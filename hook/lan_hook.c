@@ -2088,6 +2088,7 @@ typedef int (WSAAPI *PFN_recvfrom)(SOCKET, char*, int, int, struct sockaddr*, in
 typedef int (WSAAPI *PFN_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_WSARecvFrom)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, struct sockaddr*, LPINT, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_connect)(SOCKET, const struct sockaddr*, int);
+typedef int (WSAAPI *PFN_bind)(SOCKET, const struct sockaddr*, int);
 typedef int (WSAAPI *PFN_WSAConnect)(SOCKET, const struct sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
 typedef int (WSAAPI *PFN_getpeername)(SOCKET, struct sockaddr*, int*);
 typedef int (WSAAPI *PFN_closesocket)(SOCKET);
@@ -2111,6 +2112,7 @@ typedef HMODULE (WINAPI *PFN_LoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
 static PFN_sendto p_sendto = 0; static PFN_recvfrom p_recvfrom = 0;
 static PFN_WSASendTo p_WSASendTo = 0; static PFN_WSARecvFrom p_WSARecvFrom = 0;
 static PFN_connect p_connect = 0; static PFN_WSAConnect p_WSAConnect = 0;
+static PFN_bind p_bind = 0;
 static PFN_getpeername p_getpeername = 0; static PFN_closesocket p_closesocket = 0;
 static PFN_listen p_listen = 0;
 static PFN_send p_send = 0; static PFN_recv p_recv = 0;
@@ -2378,6 +2380,16 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
         }
     }
     return p_connect(s, a, l);
+}
+/* A bound socket can receive without ever calling a tracked function
+ * first (pure blocking reader): register it here or fanout can never
+ * find it and its arrivals are silently dropped. */
+int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
+    int r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
+    if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
+        DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
+    }
+    return r;
 }
 int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1, LPWSABUF b2, LPQOS q1, LPQOS q2) {
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
@@ -2796,6 +2808,7 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"WSASendTo")) return (FARPROC)hk_WSASendTo;
             if (!strcmp(n,"WSARecvFrom")) return (FARPROC)hk_WSARecvFrom;
             if (!strcmp(n,"connect")) return (FARPROC)hk_connect;
+            if (!strcmp(n,"bind")) return (FARPROC)hk_bind;
             if (!strcmp(n,"WSAConnect")) return (FARPROC)hk_WSAConnect;
             if (!strcmp(n,"getpeername")) return (FARPROC)hk_getpeername;
             if (!strcmp(n,"closesocket")) return (FARPROC)hk_closesocket;
@@ -2897,6 +2910,7 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"WSASendTo")) rep = (FARPROC)hk_WSASendTo;
                     else if (!strcmp(fn,"WSARecvFrom")) rep = (FARPROC)hk_WSARecvFrom;
                     else if (!strcmp(fn,"connect")) rep = (FARPROC)hk_connect;
+                    else if (!strcmp(fn,"bind")) rep = (FARPROC)hk_bind;
                     else if (!strcmp(fn,"WSAConnect")) rep = (FARPROC)hk_WSAConnect;
                     else if (!strcmp(fn,"getpeername")) rep = (FARPROC)hk_getpeername;
                     else if (!strcmp(fn,"closesocket")) rep = (FARPROC)hk_closesocket;
@@ -3243,6 +3257,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_WSASendTo = (PFN_WSASendTo)GetProcAddress(hWS2, "WSASendTo");
     p_WSARecvFrom = (PFN_WSARecvFrom)GetProcAddress(hWS2, "WSARecvFrom");
     p_connect = (PFN_connect)GetProcAddress(hWS2, "connect");
+    p_bind = (PFN_bind)GetProcAddress(hWS2, "bind");
     p_WSAConnect = (PFN_WSAConnect)GetProcAddress(hWS2, "WSAConnect");
     p_getpeername = (PFN_getpeername)GetProcAddress(hWS2, "getpeername");
     p_closesocket = (PFN_closesocket)GetProcAddress(hWS2, "closesocket");
