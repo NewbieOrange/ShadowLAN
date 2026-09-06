@@ -655,6 +655,9 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
     from.sin_addr.s_addr = inet_addr(ipstr);
     from.sin_port = htons((unsigned short)game_port);
     if (from.sin_addr.s_addr == INADDR_NONE) return;
+    int matched = 0, shown = 0;
+    char lb[256]; int hp = 0;
+    hp = snprintf(lb, sizeof(lb), "udp direct gport=%d:", game_port);
     DLOCK();
     for (int i = 0; i < DT_MAXUDP; i++) {
         if (!g_uq[i].used || g_uq[i].closed) continue;
@@ -665,8 +668,15 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         int dg = dt_sock_type(gs) == SOCK_DGRAM;
         DLOCK();
         struct dt_udp *e = &g_uq[i];
-        if (!e->used || e->closed || !dg || bp != game_port) continue;
+        if (!e->used || e->closed) continue;
+        if (shown < 6 && hp < (int)sizeof(lb) - 32) {
+            hp += snprintf(lb + hp, sizeof(lb) - hp, " s%lld=%d%s",
+                           gs, bp, dg ? "" : "!dgram");
+            shown++;
+        }
+        if (!dg || bp != game_port) continue;
         if (e->nq >= DT_MAXQ) continue;
+        matched = 1;
         struct dt_dgram *d = (struct dt_dgram *)malloc(sizeof(*d));
         if (!d) continue;
         d->p = (unsigned char *)malloc(rl ? rl : 1);
@@ -676,9 +686,21 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         if (e->t) e->t->next = d; else e->h = d;
         e->t = d; e->nq++;
         dt_sig_locked(gs);
-        { char lb[96]; snprintf(lb, sizeof(lb), "udp direct sock=%lld n=%d", gs, (int)rl); dlog(lb); }
+        if (g_debug) {
+            char lb[320]; int hp = 0;
+            size_t hn = rl < 96 ? rl : 96;
+            hp = snprintf(lb, sizeof(lb), "udp direct sock=%lld n=%d hex=", gs, (int)rl);
+            for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
+                hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", raw[qi]);
+            dlog(lb);
+        }
     }
     DUNLOCK();
+    if (g_debug && !matched) {
+        if (hp < (int)sizeof(lb) - 12)
+            snprintf(lb + hp, sizeof(lb) - hp, " NOMATCH");
+        dlog(lb);
+    }
 }
 static struct dt_stream *dt_stream_by_sock(long long s) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
@@ -1089,8 +1111,8 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
             } else if (t == DT_BCAST_FROM && ml >= 7) {
                 unsigned node = dt_get32(pl + 1);
                 {
-                    char lb[192]; int hp = 0;
-                    size_t hn = ml - 7 < 16 ? ml - 7 : 16;
+                    char lb[320]; int hp = 0;
+                    size_t hn = ml - 7 < 80 ? ml - 7 : 80;
                     hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d n=%u hex=",
                                   node, (int)dt_get16(pl + 5), ml - 7);
                     for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
