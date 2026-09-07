@@ -20,10 +20,11 @@ from common import (
     T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
     T_TCP_CLOSE, T_HELLO, T_NODE, T_ASSIGN, T_POPEN,
     U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_HELLO_HOST, U_NODE, UMAGIC, UVER,
+    U_ICMP_REQ, U_ICMP_REP,
     QueueProto,
     decode_udp_game, encode_udp_game, decode_udp_hello,
     decode_hello, decode_node, decode_udp_node, decode_popen, decode_pdat,
-    encode_assign, encode_bcast_from,
+    encode_assign, encode_bcast_from, encode_icmp, decode_icmp,
     ip_to_int, int_to_ip, parse_ports, tcp_read, tcp_send,
 )
 
@@ -506,6 +507,28 @@ class Relay:
             out.append(self.host_udp)
         return out
 
+    def relay_virt(self):
+        """The relay's own virtual address (.1): answers ICMP echo."""
+        return self.subnet_net | 1
+
+    def icmp_target(self, dest_node):
+        """UDP tunnel address for an ICMP dest node, or None.
+
+        dest_node 0 addresses the relay itself (handled by the caller).
+        Never returns the sender: self-addressed frames are dropped and
+        looped back client-side, never echoed by the relay."""
+        if not dest_node:
+            return None
+        tgt = self.nodes.get(dest_node)
+        if not tgt:
+            return None
+        now = time.monotonic()
+        if tgt.get("udp_addr") and now - tgt.get("seen_udp", 0) < self.KNOWN_TTL:
+            return tgt["udp_addr"]
+        if tgt.get("udp_port") and tgt.get("tcp_ip"):
+            return (tgt["tcp_ip"], tgt["udp_port"])
+        return None
+
     async def udp_consume(self, pproto):
         while True:
             data, addr = await pproto.q.get()
@@ -584,6 +607,46 @@ class Relay:
                 except AttributeError:
                     print("[udp] pdat: no public UDP socket yet", flush=True)
                 continue
+            if mtype in (U_ICMP_REQ, U_ICMP_REP):
+                dec = decode_icmp(data)
+                if not dec:
+                    continue
+                _m, src, dest, iid, seq, idata = dec
+                # Authoritative source: the sender's registered node when
+                # known (frames are trivially spoofable otherwise).
+                sender = self.node_by_udp_addr(addr)
+                if sender is not None:
+                    src = sender
+                elif not src:
+                    continue  # anonymous: no return path, drop
+                if not dest:
+                    # ping to the relay itself (.1): echo back to sender
+                    if mtype != U_ICMP_REQ:
+                        continue
+                    self.known_udp[addr] = time.monotonic()
+                    try:
+                        self._public_udp.sendto(
+                            encode_icmp(U_ICMP_REP, 0, src, iid, seq, idata),
+                            addr)
+                    except (OSError, AttributeError):
+                        pass
+                    continue
+                if dest == src:
+                    continue  # self-ping: client loops back, relay drops
+                taddr = self.icmp_target(dest)
+                if taddr is None or taddr == addr:
+                    now = time.monotonic()
+                    if now - self._pdat_warn.get(("icmp", dest), 0.0) > 5.0:
+                        self._pdat_warn[("icmp", dest)] = now
+                        print(f"[udp] icmp drop dest node {dest}", flush=True)
+                    continue
+                self.known_udp[addr] = time.monotonic()
+                try:
+                    self._public_udp.sendto(
+                        encode_icmp(mtype, src, dest, iid, seq, idata), taddr)
+                except (OSError, AttributeError):
+                    pass
+                continue
             if mtype == U_GAME_S2C:
                 # bridge reply (wclient --host / hook inbound): route by the
                 # per-dest triple recorded when the C2S went out; bytes
@@ -625,6 +688,8 @@ class Relay:
                 paddr, seen = ent
                 if now - seen > self.FLOW_TTL:
                     continue
+                if paddr == addr:
+                    continue  # reply to self: client loops back, relay drops
                 ent[1] = now
                 self.learned[(paddr, gport)] = (addr, now)
                 if len(self.learned) > 2048:

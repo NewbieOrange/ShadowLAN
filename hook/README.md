@@ -33,6 +33,13 @@ socket to the requested port, matching `SO_REUSEADDR` broadcast semantics.
 Addressed datagrams with no prior session (a unicast reply to a broadcast
 query, a first join packet) are delivered to every socket listening on
 that game port, as a real NIC would. Method: IAT patch, no asm blobs.
+ICMP ping rides the UDP tunnel as addressed echo request/reply frames:
+raw/ICMP sockets on both OSes plus `IcmpSendEcho`/`IcmpSendEcho2` on
+Windows (its event is signaled; the APC routine is not queued). The relay
+answers at `.1` of the subnet and routes peer pings by node; self-pings
+and subnet-broadcast pings are answered locally, and the relay never
+echoes a packet back to its sender — loopback is always client-side,
+exactly like a NIC.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
@@ -63,9 +70,12 @@ ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
 all), `LAN_HOOK_NOCHILD=1` (never inject children),
 `LAN_HOOK_TUNNEL_PORT=47584` (bind the tunnel UDP socket to that port too,
 so host-firewall program rules earned by the game also cover the tunnel;
-one hooked process per machine), `LAN_HOOK_LEASE_WAIT=-1` (game startup
-waits until the relay grants our address lease — installing means
-playing *on* ShadowLAN; `0` skips the wait, `N>0` caps at N ms).
+one hooked process per machine), `LAN_HOOK_LEASE_WAIT=3000` (game startup
+waits up to N ms until the relay grants our address lease — installing means
+playing *on* ShadowLAN; `0` skips the wait, `-1` waits indefinitely.
+A missing lease is fatal: messagebox (Windows) or stderr (Linux) and the
+game exits with code 200 (relay unreachable) or 201 (no lease).
+`LAN_HOOK_INIT_TIMEOUT=30000` bounds the watchdog the same way (`0` disables).
 
 ## Sub-processes
 

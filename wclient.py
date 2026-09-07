@@ -40,9 +40,10 @@ if os.name == "nt":
 from common import (
     T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
     T_TCP_CLOSE, T_HELLO, T_NODE, U_GAME_C2S, U_GAME_S2C, U_NODE,
+    U_ICMP_REQ, U_ICMP_REP,
     QueueProto,
     decode_udp_game, encode_udp_game, encode_hello, encode_udp_hello,
-    encode_node, encode_udp_node, decode_bcast_from,
+    encode_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
     make_reuse_udp, parse_ports, tcp_read, tcp_send,
 )
 
@@ -365,6 +366,10 @@ class WinClient:
         loop = asyncio.get_running_loop()
         while True:
             data, addr = await self.udp_tun_proto.q.get()
+            if len(data) >= 4 and data[:2] == b"VN" and data[2] == 0x01 \
+                    and data[3] in (U_ICMP_REQ, U_ICMP_REP):
+                await self.icmp_tun_recv(data, addr)
+                continue
             dec = decode_udp_game(data)
             if not dec:
                 continue
@@ -382,6 +387,25 @@ class WinClient:
             elif mtype == U_GAME_C2S:
                 # inbound: another player's datagram for our local game
                 await self.udp_host_recv(gport, cip, cport, raw, addr, loop)
+
+    async def icmp_tun_recv(self, data, addr):
+        """Answer pings to our own node; drop anything else.
+
+        wclient never initiates ICMP (local ping capture needs raw
+        privileges the bridge deliberately avoids); it only answers so
+        the mesh stays consistent when a hooked peer pings this node."""
+        dec = decode_icmp(data)
+        if not dec:
+            return
+        mtype, _src, dest, iid, seq, idata = dec
+        if mtype != U_ICMP_REQ or dest != self.node_id:
+            return
+        try:
+            self.udp_tun.sendto(
+                encode_icmp(U_ICMP_REP, self.node_id, _src, iid, seq, idata),
+                (self.server_ip, self.port))
+        except (OSError, AttributeError):
+            pass
 
     async def udp_host_recv(self, gport, cip, cport, raw, tunnel_addr, loop):
         rev_udp = {v: k for k, v in self.udp_remote.items()}

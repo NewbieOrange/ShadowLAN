@@ -152,7 +152,16 @@ int main(int argc, char **argv) {
                     DWORD st = 1;
                     GetExitCodeThread(th2, &st);
                     CloseHandle(th2);
-                    if (st == 2)
+                    if (st == 200 || st == 201) {
+                        /* hook already showed the fatal messagebox and is
+                         * terminating the game; make sure it never resumes */
+                        fprintf(stderr, "ShadowLAN fatal (%lu): %s\n", st,
+                                st == 200 ? "cannot reach relay"
+                                          : "no virtual-IP lease from relay");
+                        TerminateProcess(pi.hProcess, st);
+                        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+                        return (int)st;
+                    } else if (st == 2)
                         fprintf(stderr, "warning: LanHookInit hit a guarded fault; "
                                 "see lan_hook_<pid>.dmp next to the game and the hook log\n");
                     else if (st != 0)
