@@ -5,7 +5,7 @@ import struct
 
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 T_BCAST = 0x01        # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
@@ -24,6 +24,8 @@ UVER = 0x01
 U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
 U_GAME_P2P = 0x12  # payload: !I dest_node + std triple+raw
+U_ICMP_REQ = 0x20  # payload: !I src_node + !I dest_node + !H id + !H seq + data (0 = relay)
+U_ICMP_REP = 0x21  # payload: !I src_node + !I dest_node + !H id + !H seq + data
 U_HELLO_HOST = 0x10  # payload: !H token_len + token (host UDP heartbeat)
 U_NODE = 0x11        # payload: !H tlen + token + !I node_id + !H udp_port
 # game payload both dirs: !H game_port + !H iplen + ip + !H port + raw
@@ -229,6 +231,27 @@ def decode_pdat(data):
     except (struct.error, UnicodeDecodeError, IndexError):
         return None
     return dest, game_port, ip, cport, raw
+
+
+def encode_icmp(mtype: int, src_node: int, dest_node: int,
+                icmp_id: int, icmp_seq: int, data: bytes) -> bytes:
+    return (UMAGIC + bytes([UVER, mtype])
+            + struct.pack("!IIHH", src_node & 0xFFFFFFFF,
+                          dest_node & 0xFFFFFFFF,
+                          icmp_id & 0xFFFF, icmp_seq & 0xFFFF) + data)
+
+
+def decode_icmp(data):
+    """U_ICMP_REQ/REP datagram -> (mtype, src, dest, id, seq, data)."""
+    if len(data) < 16 or data[:2] != UMAGIC or data[2] != UVER:
+        return None
+    if data[3] not in (U_ICMP_REQ, U_ICMP_REP):
+        return None
+    try:
+        src, dest, iid, seq = struct.unpack("!IIHH", data[4:16])
+    except struct.error:
+        return None
+    return data[3], src, dest, iid, seq, data[16:]
 
 
 def encode_bcast_from(node: int, disc_port: int, src_port: int,

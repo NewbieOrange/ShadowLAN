@@ -7,6 +7,11 @@ Play broadcast-only LAN co-op games online, on Windows **and** Linux. One dedica
 - One public port on the relay (TCP+UDP); players need no port forwarding
 - Discovery broadcast, game TCP and game UDP all tunneled; UDP stays UDP
 - P2P mesh: each node appears at its own virtual IP (default `10.200.0.0/24`)
+- ICMP ping across the mesh: the relay answers at `10.200.0.1`, peers answer
+  at their virtual IPs (raw sockets everywhere, plus `IcmpSendEcho` on Windows)
+- Fail-fast startup: no relay link or no address lease aborts the game with a
+  visible error (exit `200`/`201`) instead of running broken; the relay never
+  echoes a packet back to its sender (loopback is always client-side)
 
 ## How it works
 
@@ -59,7 +64,8 @@ injector.exe [--server HOST] [--port PORT] [--token SECRET] [--ports LIST] [-e K
 <hook.dll> <game.exe> [game args...]
 ```
 
-Without `--server` the hook is a passthrough. Also honored as env (both OSes): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default `47777`), `LAN_HOOK_TOKEN`, `LAN_HOOK_PORTS` (`4444,27015` to limit hooked ports), `LAN_HOOK_DEBUG=1`. Match the DLL to the **game** bitness (`lan_hook32.dll` for 32-bit games).
+Without `--server` the hook is a passthrough. Also honored as env (both OSes): `LAN_HOOK_SERVER`, `LAN_HOOK_PORT` (default `47777`), `LAN_HOOK_TOKEN`, `LAN_HOOK_PORTS` (`4444,27015` to limit hooked ports), `LAN_HOOK_DEBUG=1`. Match the DLL to the **game** bitness (`lan_hook32.dll` for 32-bit games). Game command-line arguments after the exe pass through untouched (quote args containing spaces).
+Startup waits up to `LAN_HOOK_LEASE_WAIT` ms (default `3000`) for the relay's address lease; without it the game exits with code `200` (relay unreachable) or `201` (no lease) after a messagebox (Windows) or stderr message (Linux). `LAN_HOOK_INIT_TIMEOUT` (default `30000`, `0` disables) is the backstop watchdog; neither ever fires after startup — mid-game drops just redial silently.
 
 ## Layout
 
@@ -88,6 +94,9 @@ python3 hook/test_virtual_p2p.py # 3-node virtual-IP mesh (P2P_ALL_PASS)
 python3 hook/test_childprop.py   # child-process inheritance (CHILDPROP_ALL_PASS)
 python3 hook/test_perdest.py     # per-dest UDP flows, node GC (PERDEST_ALL_PASS)
 SHADOWLAN_WINEPREFIX=~/.wine python3 hook/test_late.py  # late-loaded plugin DLLs (LATE_ALL_PASS; Wine)
+python3 hook/test_noloop.py      # relay never echoes to source + ICMP mesh (NOLOOP_ALL_PASS)
+python3 hook/test_fatal.py       # fatal startup errors kill game with 200/201 (FATAL_ALL_PASS; Linux)
+python3 hook/test_icmp.py        # hook-level ping mesh via raw sockets (ICMP_ALL_PASS; Linux root)
 ```
 
 ## Limits

@@ -37,6 +37,7 @@
 #include <psapi.h>
 #include <dbghelp.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 #include <ctype.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -47,7 +48,7 @@
 /* ---------- shared policy ---------- */
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
-#define SHADOWLAN_VERSION "1.0.0"
+#define SHADOWLAN_VERSION "1.1.0"
 static int g_debug = 0;
 /* direct-tunnel mode: hook dials server itself (no wclient.py needed) */
 static char g_server[256] = {0};
@@ -153,6 +154,8 @@ typedef SOCKET DTSOCK;
 #define DU_HELLO 0x10
 #define DU_NODE 0x11
 #define DU_PDAT 0x12
+#define DU_ICMP_REQ 0x20  /* VN 01 20 | !I src + !I dest + !H id + !H seq + data (0 = relay) */
+#define DU_ICMP_REP 0x21  /* same layout, reply */
 /* virtual-IP membership (assigned by relay per token room) */
 static volatile unsigned g_node = 0;
 static unsigned g_myvirt = 0;      /* numeric, e.g. 0x0AC80002 */
@@ -192,8 +195,26 @@ static struct dt_frame *g_sqh = NULL, *g_sqt = NULL;
 static unsigned g_sid = 0;
 static volatile int g_tun_run = 0, g_tun_started = 0, g_tcp_up = 0;
 static volatile int g_have_assign = 0;   /* first ASSIGN (our vnode) seen */
+/* Fatal startup errors: without a relay link AND an address lease the
+ * tunnel is unusable, so running on would only produce a broken game.
+ * Report visibly and terminate the process with a distinct exit code.
+ * LAN_HOOK_INIT_TIMEOUT (ms, default 30000, 0 = never fail) bounds how
+ * long init waits for the first lease; LAN_HOOK_LEASE_WAIT=0 skips the
+ * wait (and the watchdog) entirely for legacy unassigned starts. */
+#define SL_FATAL_NORELAY 200  /* relay unreachable (resolve/connect) */
+#define SL_FATAL_NOLEASE 201  /* link up but no virtual-IP lease */
+static volatile int g_init_done = 0;      /* LanHookInit/ensure_init finished */
+static volatile int g_tcp_ever_up = 0;    /* any TCP link since process start */
+static long long g_init_t0 = 0;
+static long long g_fatal_after_ms = 30000;
+static long long dt_now_ms(void);
+static void dt_fatal(int code, const char *msg);
 #ifndef LINUX_BUILD
 static void flog(const char *m);         /* defined below; lease logs use it */
+DWORD WINAPI hk_IcmpSendEcho(HANDLE, IPAddr, LPVOID, WORD,
+                             PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+DWORD WINAPI hk_IcmpSendEcho2(HANDLE, HANDLE, FARPROC, PVOID, IPAddr, LPVOID,
+                              WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
 #endif
 static DTSOCK g_tcp = DTSOCK_BAD, g_udptun = DTSOCK_BAD;
 static int g_tun_conn = 0;
@@ -236,6 +257,61 @@ static void dlog(const char *m) {
     }
 #endif
 }
+/* Fatal startup failure: the tunnel cannot work, so running on would
+ * only produce a broken game. Log unconditionally, tell the user, and
+ * terminate the process with a distinct exit code (200/201). Never
+ * returns. Safe to call from any thread, including the init thread. */
+static void dt_fatal(int code, const char *msg) {
+    /* Fatal is init-only by construction: every call site checks
+     * !g_init_done, and this re-checks so no future path can ever kill
+     * a running game mid-play (post-init drops just redial silently). */
+    if (g_init_done) {
+        dlog("dt_fatal after init: ignored (never kill gameplay)");
+        return;
+    }
+    char full[512];
+    snprintf(full, sizeof(full), "ShadowLAN fatal (%d): %s [relay %s:%d]",
+             code, msg,
+             g_server[0] ? g_server : "(unset)", g_srvport);
+    full[sizeof(full) - 1] = 0;
+    dlog(full);
+#ifdef LINUX_BUILD
+    fprintf(stderr, "%s\n", full);
+    fflush(stderr);
+    _exit(code);
+#else
+    {
+        static FILE *lf = NULL;
+        const char *p = getenv("LAN_HOOK_LOGFILE");
+        if (p && p[0]) lf = fopen(p, "a");
+        if (lf) { fputs("lan_hook: ", lf); fputs(full, lf); fputc('\n', lf); fflush(lf); fclose(lf); }
+    }
+    OutputDebugStringA("lan_hook: ");
+    OutputDebugStringA(full);
+    OutputDebugStringA("\n");
+    MessageBoxA(NULL, full, "ShadowLAN",
+                MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND);
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code); /* unreachable, paranoia if Terminate fails */
+#endif
+}
+static int dt_fatal_code(void) {
+    /* 200 = never reached the relay, 201 = link up but no address lease */
+    return g_tcp_ever_up ? SL_FATAL_NOLEASE : SL_FATAL_NORELAY;
+}
+/* Init watchdog: still unleashed (no lease) past the fatal timeout means
+ * the tunnel can never work (dead relay, wrong port, token rejected so
+ * no ASSIGN). Fail loudly instead of running a broken game. Post-init
+ * redials keep retrying silently: mid-game drops recover on their own. */
+static void dt_init_watchdog(void) {
+    if (!g_init_done && !g_have_assign && g_fatal_after_ms > 0 &&
+        g_tun_run && dt_now_ms() - g_init_t0 > g_fatal_after_ms) {
+        int code = dt_fatal_code();
+        dt_fatal(code, code == SL_FATAL_NORELAY
+                 ? "cannot reach relay (check server/port, relay running, firewall)"
+                 : "relay connected but no virtual-IP lease (check token, relay log)");
+    }
+}
 static void dt_put32(unsigned char *b, unsigned v) {
     b[0] = (v >> 24) & 255; b[1] = (v >> 16) & 255; b[2] = (v >> 8) & 255; b[3] = v & 255;
 }
@@ -247,6 +323,14 @@ static unsigned dt_get16(const unsigned char *b) { return ((unsigned)b[0] << 8) 
 
 /* live socket introspection (no extra hooks needed except Win nonblock) */
 static void dt_sig_locked(long long gsock);
+static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
+                       unsigned id, unsigned seq,
+                       const unsigned char *data, size_t dlen);
+#ifndef LINUX_BUILD
+static int dt_icmp_pend_complete(unsigned id, unsigned seq,
+                                 const unsigned char *data, size_t dlen,
+                                 unsigned from_virt);
+#endif
 static int dt_bound_port(long long gsock) {
     struct sockaddr_in a;
 #ifdef LINUX_BUILD
@@ -1001,6 +1085,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
     unsigned char hdr[4], *pl = NULL;
     for (;;) {
         if (!g_tun_run) break;
+        dt_init_watchdog();
 #ifdef LINUX_BUILD
         dt_reals();
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -1032,6 +1117,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
         g_tcp = s;
 #endif
         g_tcp_up = 1;
+        g_tcp_ever_up = 1;
         dlog("tunnel TCP up");
         DLOCK();
         int need_hello = g_claimed && !g_hello_conn;
@@ -1080,6 +1166,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
         DUNLOCK();
         for (;;) {
             if (!g_tun_run) break;
+            dt_init_watchdog();
             /* flush send queue */
             for (;;) {
                 DLOCK();
@@ -1391,6 +1478,16 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
                                  buf + 10 + il2, (size_t)(n - 10 - il2));
             continue;
         }
+        if (buf[3] == DU_ICMP_REQ || buf[3] == DU_ICMP_REP) {
+            /* ping request/reply: addressed, never looped back by relay */
+            if (n >= 16) {
+                unsigned src = dt_get32(buf + 4), dest = dt_get32(buf + 8);
+                unsigned iid = dt_get16(buf + 12), seq = dt_get16(buf + 14);
+                dt_icmp_in(buf[3] == DU_ICMP_REP, src, dest, iid, seq,
+                           buf + 16, (size_t)(n - 16));
+            }
+            continue;
+        }
         if (buf[3] != DU_S2C) continue;
         dlog("udp tun: S2C in");
         int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
@@ -1456,6 +1553,16 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
                                  buf + 10 + il2, (size_t)(n - 10 - il2));
             continue;
         }
+        if (buf[3] == DU_ICMP_REQ || buf[3] == DU_ICMP_REP) {
+            /* ping request/reply: addressed, never looped back by relay */
+            if (n >= 16) {
+                unsigned src = dt_get32(buf + 4), dest = dt_get32(buf + 8);
+                unsigned iid = dt_get16(buf + 12), seq = dt_get16(buf + 14);
+                dt_icmp_in(buf[3] == DU_ICMP_REP, src, dest, iid, seq,
+                           buf + 16, (size_t)(n - 16));
+            }
+            continue;
+        }
         if (buf[3] != DU_S2C) continue;
         int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
         if (8 + il + 2 > n) continue;
@@ -1478,6 +1585,7 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
 static void dt_start(void) {
     if (g_tun_started || !g_direct) return;
     g_tun_started = 1; g_tun_run = 1;
+    g_init_t0 = dt_now_ms(); /* watchdog baseline: threads start below */
     g_fakeip = inet_addr("192.168.7.1");
     if (!g_node) {
         /* stable-ish random node id (loopback tests fork rarely collide) */
@@ -1552,26 +1660,40 @@ static void dt_start(void) {
      * kernel (its interface predates the game); we get it by not
      * finishing initialization until the relay's ASSIGN (our vnode) is
      * in hand. The injector holds the game suspended through init, so
-     * the title simply starts a few hundred ms later. Bounded: a dead
-     * or overloaded relay must never brick the game. 0 disables. */
+     * the title simply starts a few hundred ms later.
+     *
+     * A missing lease is fatal (see dt_fatal): without it the tunnel
+     * cannot work. LAN_HOOK_LEASE_WAIT=0 skips the wait AND the
+     * watchdog for legacy unassigned starts. */
     {
-        /* -1 (default): wait as long as it takes. Launching a game
-         * through ShadowLAN means launching it ON ShadowLAN: install is
-         * not complete until the relay has handed us our address, so
-         * the title's very first interface enumeration already sees it.
-         * LAN_HOOK_LEASE_WAIT=0 skips the wait; N>0 caps at N ms. */
-        long long budget = -1;
+        /* Default 3000ms: fail fast on a dead relay instead of hanging
+         * the game startup. N>=0 caps the wait here; LAN_HOOK_LEASE_WAIT
+         * overrides (0 skips, larger values wait longer). */
+        long long budget = 3000;
         long long t0, last_warn = 0;
+        int no_wait = 0;
         const char *wb = getenv("LAN_HOOK_LEASE_WAIT");
         if (wb && wb[0]) {
             long long v = atoll(wb);
-            if (v >= 0 && v <= 600000) budget = v;
+            if (v == 0) no_wait = 1;
+            else if (v < 0) budget = -1; /* infinite: watchdog decides */
+            else if (v <= 600000) budget = v;
         }
-        t0 = dt_now_ms();
-        while (!g_have_assign && g_tun_run) {
+        {
+            const char *fb = getenv("LAN_HOOK_INIT_TIMEOUT");
+            g_fatal_after_ms = 30000;
+            if (fb && fb[0]) {
+                long long v = atoll(fb);
+                if (v >= 0 && v <= 600000) g_fatal_after_ms = v;
+            }
+            if (no_wait) g_fatal_after_ms = 0;
+        }
+        g_init_t0 = dt_now_ms();
+        t0 = g_init_t0;
+        while (!g_have_assign && g_tun_run && !no_wait) {
             long long e = dt_now_ms() - t0;
             if (budget >= 0 && e >= budget) break;
-            if (budget < 0 && e - last_warn >= 5000) {
+            if (e - last_warn >= 5000) {
                 last_warn = e;
 #ifndef LINUX_BUILD
                 flog("LanHookInit: waiting for relay lease...");
@@ -1585,8 +1707,15 @@ static void dt_start(void) {
             Sleep(20);
 #endif
         }
-        dlog(g_have_assign ? "lease acquired before install"
-                           : "lease not yet held; continuing unassigned");
+        if (!g_have_assign && g_tun_run && !no_wait) {
+            /* Barrier cap hit (or watchdog already past due): the game
+             * would start broken. Fail loudly instead. */
+            int code = dt_fatal_code();
+            dt_fatal(code, code == SL_FATAL_NORELAY
+                     ? "cannot reach relay (check server/port, relay running, firewall)"
+                     : "relay connected but no virtual-IP lease (check token, relay log)");
+        }
+        dlog("lease acquired before install");
     }
 }
 
@@ -1735,8 +1864,290 @@ static int dt_machine_ip(char *out, int n) {
              (a >> 16) & 255, (a >> 24) & 255);
     return 1;
 }
+/* ---- ICMP (ping) over the UDP tunnel --------------------------------
+ * Raw/ICMP sockets and (Windows) IcmpSendEcho are tunneled like game
+ * UDP: echo requests become addressed REQ frames, replies come back as
+ * REP frames and are re-materialized as echo replies for the app.
+ * Same loopback rules as everything else: self-pings are answered
+ * locally, the relay never echoes to source (it drops), broadcast
+ * pings fan out per-member. Non-echo ICMP and real-LAN destinations
+ * stay on the real stack untouched. ---- */
+static int dt_is_icmp_sock(long long gsock) {
+    int t = dt_sock_type(gsock);
+    if (t == SOCK_RAW) {
+#ifdef LINUX_BUILD
+        int p = 0; socklen_t l = sizeof(p);
+        if (getsockopt((int)gsock, SOL_SOCKET, SO_PROTOCOL, &p, &l) == 0)
+            return p == IPPROTO_ICMP;
+#endif
+        return 1; /* raw: the payload parse decides (ICMPv4 echo only) */
+    }
+#ifdef LINUX_BUILD
+    if (t == SOCK_DGRAM) { /* unprivileged "ping" sockets */
+        int p = 0; socklen_t l = sizeof(p);
+        if (getsockopt((int)gsock, SOL_SOCKET, SO_PROTOCOL, &p, &l) == 0)
+            return p == IPPROTO_ICMP;
+    }
+#endif
+    return 0;
+}
+/* UDP-like for queue purposes: normal datagram sockets + ICMP sockets
+ * (both consume tunnel queues via the same recv paths). */
+static int dt_is_udp_like(long long gsock) {
+    if (dt_sock_type(gsock) == SOCK_DGRAM) return 1;
+    return dt_is_icmp_sock(gsock);
+}
+/* our own relay's virtual address (.1 of the assigned subnet), 0 if none */
+static unsigned dt_relay_virt(void) {
+    unsigned v = 0;
+    DLOCK();
+    if (g_nmembers > 0) v = dt_ipnum(g_vnetb) | 1;
+    DUNLOCK();
+    return v;
+}
+/* in our virtual subnet at all (any host address)? */
+static int dt_in_vnet(unsigned long inaddr) {
+    unsigned char ab[4];
+    int full, rem, ok = 1;
+    memcpy(ab, &inaddr, 4);
+    DLOCK();
+    if (g_nmembers <= 0 || g_vbits <= 0 || g_vbits > 32) ok = 0;
+    else {
+        full = g_vbits / 8; rem = g_vbits % 8;
+        if (memcmp(g_vnetb, ab, (size_t)full) != 0) ok = 0;
+        else if (rem) {
+            unsigned m = (0xFFu << (8 - rem)) & 0xFFu;
+            if (((unsigned)g_vnetb[full] & m) != ((unsigned)ab[full] & m)) ok = 0;
+        }
+    }
+    DUNLOCK();
+    return ok;
+}
+/* all host bits set = subnet broadcast (.255 on a /24) */
+static int dt_is_vnet_bcast(unsigned long inaddr) {
+    unsigned char ab[4];
+    int i, full, rem;
+    if (!dt_in_vnet(inaddr)) return 0;
+    memcpy(ab, &inaddr, 4);
+    full = g_vbits / 8; rem = g_vbits % 8;
+    for (i = full + (rem ? 1 : 0); i < 4; i++)
+        if (ab[i] != 0xFF) return 0;
+    if (rem) {
+        unsigned m = 0xFFu >> rem;
+        if ((ab[full] & m) != m) return 0;
+    }
+    return 1;
+}
+/* ICMPv4 echo request? fills id/seq/payload view. */
+static int dt_icmp_parse_req(const unsigned char *buf, size_t len,
+                             unsigned *id, unsigned *seq,
+                             const unsigned char **data, size_t *dlen) {
+    if (len < 8 || buf[0] != 8 || buf[1] != 0) return 0;
+    *id = ((unsigned)buf[4] << 8) | buf[5];
+    *seq = ((unsigned)buf[6] << 8) | buf[7];
+    *data = buf + 8; *dlen = len - 8;
+    return 1;
+}
+static unsigned short dt_icmp_cksum(const unsigned char *b, size_t n) {
+    unsigned sum = 0;
+    while (n > 1) { sum += ((unsigned)b[0] << 8) | b[1]; b += 2; n -= 2; }
+    if (n) sum += (unsigned)b[0] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (unsigned short)~sum;
+}
+/* echo reply bytes into out (needs 8+dlen); returns total length */
+static size_t dt_icmp_build_rep(unsigned char *out, unsigned id, unsigned seq,
+                                const unsigned char *data, size_t dlen) {
+    unsigned c;
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+    out[4] = (id >> 8) & 255; out[5] = id & 255;
+    out[6] = (seq >> 8) & 255; out[7] = seq & 255;
+    if (dlen) memcpy(out + 8, data, dlen);
+    c = dt_icmp_cksum(out, 8 + dlen);
+    out[2] = (c >> 8) & 255; out[3] = c & 255;
+    return 8 + dlen;
+}
+/* outstanding echo ids per raw socket, for reply matching (id is
+ * app-chosen and shared across its seq series; entries expire). */
+#define DT_MAXICMP 128
+struct dt_icmp_out { int used; long long gsock; unsigned id; long long last; };
+static struct dt_icmp_out g_io[DT_MAXICMP];
+static void dt_icmp_note(long long gsock, unsigned id) {
+    int i, freei = -1, oldi = -1;
+    long long now = dt_now_ms(), oldest = now;
+    DLOCK();
+    for (i = 0; i < DT_MAXICMP; i++) {
+        if (g_io[i].used && g_io[i].gsock == gsock && g_io[i].id == id) {
+            g_io[i].last = now; DUNLOCK(); return;
+        }
+        if (!g_io[i].used && freei < 0) freei = i;
+        if (g_io[i].used && g_io[i].last < oldest) { oldest = g_io[i].last; oldi = i; }
+    }
+    i = (freei >= 0) ? freei : oldi;
+    if (i >= 0) { g_io[i].used = 1; g_io[i].gsock = gsock; g_io[i].id = id; g_io[i].last = now; }
+    DUNLOCK();
+}
+static int dt_icmp_match(long long gsock, unsigned id) {
+    int i, hit = 0;
+    long long now = dt_now_ms();
+    DLOCK();
+    for (i = 0; i < DT_MAXICMP; i++)
+        if (g_io[i].used && g_io[i].gsock == gsock && g_io[i].id == id &&
+            now - g_io[i].last < 30000) { hit = 1; break; }
+    DUNLOCK();
+    return hit;
+}
+/* queue an echo reply (from a virtual address, numeric octet0-MSB) to
+ * every local ICMP socket waiting on this id */
+static void dt_icmp_deliver(unsigned from_virt, unsigned id, unsigned seq,
+                            const unsigned char *data, size_t dlen) {
+    unsigned char rep[1500];
+    size_t rn;
+    long long gs[DT_MAXICMP];
+    int i, n = 0;
+    struct sockaddr_in from;
+    if (8 + dlen > sizeof(rep)) return;
+    rn = dt_icmp_build_rep(rep, id, seq, data, dlen);
+    memset(&from, 0, sizeof(from));
+    from.sin_family = AF_INET;
+    from.sin_addr.s_addr = htonl(from_virt);
+    from.sin_port = 0;
+    DLOCK();
+    for (i = 0; i < DT_MAXUDP && n < DT_MAXICMP; i++)
+        if (g_uq[i].used && !g_uq[i].closed) gs[n++] = g_uq[i].gsock;
+    DUNLOCK();
+    for (i = 0; i < n; i++) {
+        if (!dt_is_icmp_sock(gs[i])) continue;
+        if (!dt_icmp_match(gs[i], id)) continue;
+        dt_udp_push(gs[i], rep, rn, &from);
+    }
+}
+/* reply to our own socket immediately (self-ping / broadcast self-part):
+ * what a NIC delivers when we are our own destination */
+static void dt_icmp_self(long long gsock, unsigned id, unsigned seq,
+                         const unsigned char *data, size_t dlen) {
+    unsigned char rep[1500];
+    size_t rn;
+    struct sockaddr_in from;
+    unsigned myv;
+    if (8 + dlen > sizeof(rep)) return;
+    DLOCK(); myv = g_myvirt; DUNLOCK();
+    if (!myv) return;
+    rn = dt_icmp_build_rep(rep, id, seq, data, dlen);
+    memset(&from, 0, sizeof(from));
+    from.sin_family = AF_INET;
+    from.sin_addr.s_addr = htonl(myv);
+    from.sin_port = 0;
+    dt_udp_push(gsock, rep, rn, &from);
+}
+/* send one REQ frame toward dest_node (0 = the relay itself) */
+static void dt_icmp_send_req(unsigned dest, unsigned id, unsigned seq,
+                             const unsigned char *data, size_t dlen) {
+    size_t n = 4 + 4 + 4 + 2 + 2 + dlen;
+    unsigned char *d = (unsigned char *)malloc(n ? n : 1);
+    if (!d) return;
+    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_ICMP_REQ;
+    dt_put32(d + 4, g_node);
+    dt_put32(d + 8, dest);
+    dt_put16(d + 12, id); dt_put16(d + 14, seq);
+    if (dlen) memcpy(d + 16, data, dlen);
+    dt_udp_tun_send(d, n);
+    free(d);
+}
+/* Outbound ICMP sendto routing. Returns 1 when consumed. */
+static int dt_on_icmp_send(long long gsock, const unsigned char *buf, size_t len,
+                           const struct sockaddr_in *dst) {
+    unsigned id, seq, vnode, relay1;
+    const unsigned char *data;
+    size_t dlen;
+    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real */
+    if (!dt_icmp_parse_req(buf, len, &id, &seq, &data, &dlen)) return 0;
+    if (g_debug) {
+        unsigned long a = 0; char lb[128];
+        memcpy(&a, &dst->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "icmp send id=%u seq=%u n=%d to %lu.%lu.%lu.%lu",
+                 id, seq, (int)dlen,
+                 a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255);
+        dlog(lb);
+    }
+    if (ntohl(dst->sin_addr.s_addr) == g_myvirt) {
+        dt_icmp_self(gsock, id, seq, data, dlen);   /* self-ping: local */
+        DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        return 1;
+    }
+    relay1 = dt_relay_virt();
+    if (relay1 && ntohl(dst->sin_addr.s_addr) == relay1) {
+        dt_icmp_note(gsock, id);
+        dt_icmp_send_req(0, id, seq, data, dlen);    /* ping the relay */
+        DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        return 1;
+    }
+    vnode = dt_virt_node(dst->sin_addr.s_addr);
+    if (vnode) {
+        dt_icmp_note(gsock, id);
+        dt_icmp_send_req(vnode, id, seq, data, dlen);
+        DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        return 1;
+    }
+    if (dt_is_vnet_bcast(dst->sin_addr.s_addr)) {
+        /* broadcast ping: one addressed request per member (the relay
+         * fans out nothing for ICMP; we address explicitly), plus our
+         * own reply for the self part, like a NIC broadcast ping */
+        int i, nm = 0;
+        unsigned nodes[DT_MAXMEMB];
+        DLOCK();
+        for (i = 0; i < g_nmembers && nm < DT_MAXMEMB; i++)
+            nodes[nm++] = g_members[i].node;
+        DUNLOCK();
+        dt_icmp_note(gsock, id);
+        for (i = 0; i < nm; i++) {
+            unsigned virt = dt_node_virt(nodes[i]);
+            if (!virt || virt == g_myvirt) continue;
+            dt_icmp_send_req(nodes[i], id, seq, data, dlen);
+        }
+        dt_icmp_self(gsock, id, seq, data, dlen);
+        DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+        return 1;
+    }
+    return 0;   /* real-LAN destination: real wire */
+}
+/* Inbound REQ/REP from the UDP tunnel. */
+static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
+                       unsigned id, unsigned seq,
+                       const unsigned char *data, size_t dlen) {
+    unsigned from_virt;
+    if (!is_rep) {
+        /* echo request addressed to us (the relay never forwards
+         * self/other): answer back through the tunnel with our node as
+         * source. The request itself is never shown locally, mirroring
+         * IcmpSendEcho semantics for raw sockets too. */
+        size_t n;
+        unsigned char *d;
+        if (g_node == 0 || dest != g_node) return;
+        n = 4 + 4 + 4 + 2 + 2 + dlen;
+        d = (unsigned char *)malloc(n ? n : 1);
+        if (!d) return;
+        d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_ICMP_REP;
+        dt_put32(d + 4, g_node);
+        dt_put32(d + 8, src);
+        dt_put16(d + 12, id); dt_put16(d + 14, seq);
+        if (dlen) memcpy(d + 16, data, dlen);
+        dt_udp_tun_send(d, n);
+        free(d);
+        return;
+    }
+    from_virt = (src == 0) ? dt_relay_virt() : dt_node_virt(src);
+    if (!from_virt) return;
+#ifndef LINUX_BUILD
+    /* IcmpSendEcho waiters first (they own no socket) */
+    if (dt_icmp_pend_complete(id, seq, data, dlen, from_virt)) return;
+#endif
+    dt_icmp_deliver(from_virt, id, seq, data, dlen);
+}
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
+    if (dt_is_icmp_sock(gsock))
+        return dt_on_icmp_send(gsock, buf, len, dst);
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     int game_port = ntohs(dst->sin_port);
     if (ipv4_is_local(dst->sin_addr.s_addr)) {
@@ -1973,7 +2384,7 @@ static int dt_stream_has(long long gsock) {
  * so the wait hooks must register DGRAM interest too — otherwise fan-out
  * finds no entry and tunnel broadcasts are dropped. */
 static void dt_udp_ensure(long long gsock) {
-    if (dt_sock_type(gsock) != SOCK_DGRAM) return;
+    if (!dt_is_udp_like(gsock)) return;
     DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
 }
 static int dt_fd_readable(long long gsock) {
@@ -2050,7 +2461,7 @@ static void ensure_init(void) {
     static int done = 0;
     if (!done) { done = 1;
         dlog("ShadowLAN hook v" SHADOWLAN_VERSION " init");
-        policy_init(); if (g_direct) dt_start(); }
+        policy_init(); if (g_direct) dt_start(); g_init_done = 1; }
 }
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest, socklen_t addrlen) {
@@ -2072,7 +2483,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
     if (g_direct) {
         int st = dt_sock_type((long long)sockfd);
         { char lb[128]; snprintf(lb, sizeof(lb), "recvfrom fd=%d type=%d", sockfd, st); dlog(lb); }
-        if (st == SOCK_DGRAM) {
+        if (st == SOCK_DGRAM || dt_is_icmp_sock((long long)sockfd)) {
         DLOCK(); dt_udp_entry((long long)sockfd, 1); DUNLOCK();
         int nb = dt_is_nonblock((long long)sockfd) || (flags & MSG_DONTWAIT);
         int tmo = dt_rcvtimeo_ms((long long)sockfd);
@@ -2638,7 +3049,7 @@ int WSAAPI hk_sendto(SOCKET s, const char *buf, int len, int flags, const struct
     }
 }
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
-    if (g_direct && dt_sock_type((long long)s) == SOCK_DGRAM)
+    if (g_direct && dt_is_udp_like((long long)s))
         return dt_win_udp_recv(s, buf, len, flags, from, fromlen);
     {
         int r = p_recvfrom(s, buf, len, flags, from, fromlen);
@@ -2689,7 +3100,7 @@ int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flag
 int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD flags,
                           struct sockaddr *from, LPINT fromlen,
                           LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
-    if (ov && g_direct && !cr && dt_sock_type((long long)s) == SOCK_DGRAM) {
+    if (ov && g_direct && !cr && dt_is_udp_like((long long)s)) {
         /* overlapped poll: complete synchronously from our queue when
          * data waits, else hand to the real provider for true async */
         size_t total = 0;
@@ -2727,7 +3138,7 @@ int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD
         return p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, ov, cr);
     }
     if (ov) return p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, ov, cr);
-    if (g_direct && dt_sock_type((long long)s) == SOCK_DGRAM && nb == 1) {
+    if (g_direct && dt_is_udp_like((long long)s) && nb == 1) {
         int fl = fromlen ? *fromlen : 0;
         int dwflags = flags ? (int)*flags : 0;
         int n = dt_win_udp_recv(s, b[0].buf, (int)b[0].len, dwflags, from, &fl);
@@ -3274,6 +3685,18 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"WSACreateEvent")) return (FARPROC)hk_WSACreateEvent;
             if (!strcmp(n,"WSACloseEvent")) return (FARPROC)hk_WSACloseEvent;
         }
+        {
+            char imod[MAX_PATH] = {0};
+            GetModuleFileNameA(m, imod, sizeof(imod)-1);
+            {
+                char *bs = strrchr(imod, '\\');
+                const char *base = bs ? bs + 1 : imod;
+                if (!_stricmp(base, "iphlpapi.dll")) {
+                    if (!strcmp(n,"IcmpSendEcho")) return (FARPROC)hk_IcmpSendEcho;
+                    if (!strcmp(n,"IcmpSendEcho2")) return (FARPROC)hk_IcmpSendEcho2;
+                }
+            }
+        }
         if (m == hKernel) {
             if (!strcmp(n,"CreateProcessA")) return (FARPROC)hk_CreateProcessA;
             if (!strcmp(n,"CreateProcessW")) return (FARPROC)hk_CreateProcessW;
@@ -3286,6 +3709,256 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
     return p_GetProcAddress(m, n);
 }
 
+/* ---- ICMP echo API (Windows IcmpSendEcho family) -----------------------
+ * Synchronous ping APIs own no socket, so echo requests are tracked in
+ * a pending table keyed by synthetic (id, seq) and completed by
+ * inbound REPs (see dt_icmp_in). Unicast returns on the first reply;
+ * subnet-broadcast collects until timeout/buffer-full, like the real
+ * stack. IcmpSendEcho2's event is signaled; its APC routine is NOT
+ * queued (documented limitation: wait on the event instead). ---- */
+typedef DWORD (WINAPI *PFN_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD,
+    PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI *PFN_IcmpSendEcho2)(HANDLE, HANDLE, FARPROC, PVOID,
+    IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+static PFN_IcmpSendEcho p_IcmpSendEcho = 0;
+static PFN_IcmpSendEcho2 p_IcmpSendEcho2 = 0;
+#define DT_MAXPEND 32
+#define DT_MAXREPS 8
+struct dt_icmp_pend { int used; unsigned id, seq; HANDLE ev;
+                      unsigned from[DT_MAXREPS]; int nrep;
+                      unsigned char data[1400]; size_t dlen;
+                      long long t0, last; };
+static struct dt_icmp_pend g_pend[DT_MAXPEND];
+static unsigned dt_icmp_synth_id(void) {
+    static volatile LONG ctr = 0;
+    long c = InterlockedIncrement(&ctr);
+    return (unsigned)(0xC000 | ((GetCurrentThreadId() ^ (c * 0x9E37)) & 0x3FFF));
+}
+/* allocate a waiter slot; -1 when full (caller fails the API call) */
+static int dt_icmp_pend_alloc(unsigned id, unsigned seq, HANDLE ev) {
+    int i, idx = -1;
+    long long now = dt_now_ms(), oldest = now;
+    int oldi = -1;
+    DLOCK();
+    for (i = 0; i < DT_MAXPEND; i++) {
+        if (!g_pend[i].used && idx < 0) idx = i;
+        if (g_pend[i].used && g_pend[i].last < oldest) { oldest = g_pend[i].last; oldi = i; }
+    }
+    if (idx < 0 && oldi >= 0 && now - oldest > 60000) {
+        if (g_pend[oldi].ev) CloseHandle(g_pend[oldi].ev);
+        memset(&g_pend[oldi], 0, sizeof(g_pend[oldi]));
+        idx = oldi;
+    }
+    if (idx >= 0) {
+        memset(&g_pend[idx], 0, sizeof(g_pend[idx]));
+        g_pend[idx].used = 1; g_pend[idx].id = id; g_pend[idx].seq = seq;
+        g_pend[idx].ev = ev; g_pend[idx].t0 = now; g_pend[idx].last = now;
+    }
+    DUNLOCK();
+    return idx;
+}
+static void dt_icmp_pend_free(int idx) {
+    if (idx < 0 || idx >= DT_MAXPEND) return;
+    DLOCK();
+    if (g_pend[idx].used) {
+        if (g_pend[idx].ev) CloseHandle(g_pend[idx].ev);
+        memset(&g_pend[idx], 0, sizeof(g_pend[idx]));
+    }
+    DUNLOCK();
+}
+/* inbound REP completion: record responder, wake waiter. Returns hits. */
+static int dt_icmp_pend_complete(unsigned id, unsigned seq,
+                                 const unsigned char *data, size_t dlen,
+                                 unsigned from_virt) {
+    int i, hit = 0;
+    HANDLE evs[DT_MAXPEND];
+    int nev = 0;
+    DLOCK();
+    for (i = 0; i < DT_MAXPEND; i++) {
+        int k, dup = 0;
+        if (!g_pend[i].used || g_pend[i].id != id || g_pend[i].seq != seq) continue;
+        for (k = 0; k < g_pend[i].nrep; k++)
+            if (g_pend[i].from[k] == from_virt) { dup = 1; break; }
+        if (!dup && g_pend[i].nrep < DT_MAXREPS) {
+            size_t cn = dlen < sizeof(g_pend[i].data) ? dlen : sizeof(g_pend[i].data);
+            if (g_pend[i].nrep == 0 && cn) memcpy(g_pend[i].data, data, cn);
+            if (g_pend[i].nrep == 0) g_pend[i].dlen = cn;
+            g_pend[i].from[g_pend[i].nrep++] = from_virt;
+            g_pend[i].last = dt_now_ms();
+        }
+        if (nev < DT_MAXPEND && g_pend[i].ev) evs[nev++] = g_pend[i].ev;
+        hit = 1;
+    }
+    DUNLOCK();
+    for (i = 0; i < nev; i++) SetEvent(evs[i]);
+    return hit;
+}
+/* lay out nrep ICMP_ECHO_REPLY structs + data into the caller's buffer */
+static DWORD dt_icmp_emit(int idx, PVOID repbuf, DWORD repsize, long long rtt_ms) {
+    BYTE *p = (BYTE *)repbuf;
+    DWORD left = repsize;
+    int i, n = 0, nrep = 0;
+    size_t dlen = 0;
+    unsigned char data[1400];
+    unsigned from[DT_MAXREPS];
+    DLOCK();
+    if (idx >= 0 && idx < DT_MAXPEND && g_pend[idx].used) {
+        nrep = g_pend[idx].nrep;
+        dlen = g_pend[idx].dlen;
+        if (dlen) memcpy(data, g_pend[idx].data, dlen);
+        for (i = 0; i < nrep && i < DT_MAXREPS; i++) from[i] = g_pend[idx].from[i];
+    }
+    DUNLOCK();
+    for (i = 0; i < nrep; i++) {
+        PICMP_ECHO_REPLY r;
+        if (left < sizeof(ICMP_ECHO_REPLY) + (DWORD)dlen) break;
+        r = (PICMP_ECHO_REPLY)p;
+        r->Address = from[i];
+        r->Status = 0;
+        r->RoundTripTime = (ULONG)(rtt_ms < 1 ? 1 : (rtt_ms > 0x7FFFFFFF ? 0x7FFFFFFF : rtt_ms));
+        r->DataSize = (USHORT)dlen;
+        r->Reserved = 0;
+        r->Data = p + sizeof(ICMP_ECHO_REPLY);
+        if (dlen) memcpy(r->Data, data, dlen);
+        r->Options.Ttl = 64;
+        r->Options.Tos = 0;
+        r->Options.Flags = 0;
+        r->Options.OptionsSize = 0;
+        r->Options.OptionsData = NULL;
+        p += sizeof(ICMP_ECHO_REPLY) + dlen;
+        left -= (DWORD)(sizeof(ICMP_ECHO_REPLY) + dlen);
+        n++;
+    }
+    return (DWORD)n;
+}
+/* shared IcmpSendEcho(2) body */
+static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
+                          PVOID repbuf, DWORD repsize, DWORD timeout) {
+    unsigned long da = (unsigned long)dst; /* IPAddr is network order */
+    unsigned relay1 = 0, node = 0;
+    unsigned id, seq;
+    int idx = -1, is_bcast = 0, is_self = 0;
+    HANDLE ev = NULL, wev = NULL;
+    long long t0;
+    DWORD n = 0;
+    static volatile LONG seqctr = 0;
+    if (!g_direct || !p_IcmpSendEcho)
+        goto passthrough;
+    if (ipv4_is_local(da)) goto passthrough;
+    if (ntohl(da) == g_myvirt) is_self = 1;
+    else if (dt_is_vnet_bcast(da)) is_bcast = 1;
+    else {
+        relay1 = dt_relay_virt();
+        if (relay1 && ntohl(da) == relay1) node = 0;
+        else {
+            node = dt_virt_node(da);
+            if (!node) goto passthrough; /* real-LAN destination */
+        }
+    }
+    if (repsize < sizeof(ICMP_ECHO_REPLY)) { SetLastError(IP_BUF_TOO_SMALL); return 0; }
+    id = dt_icmp_synth_id();
+    seq = (unsigned)(InterlockedIncrement(&seqctr) & 0xFFFF);
+    ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!ev) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    t0 = dt_now_ms();
+    if (is_self && !is_bcast) {
+        /* pinging ourselves: answer inline, no tunnel, no wait */
+        unsigned char rep[1500];
+        size_t rn, rl = reqsize;
+        unsigned myv;
+        DLOCK(); myv = g_myvirt; DUNLOCK();
+        if (rl > sizeof(rep) - 8) rl = sizeof(rep) - 8;
+        rn = dt_icmp_build_rep(rep, id, seq, (const unsigned char *)req, rl);
+        idx = dt_icmp_pend_alloc(id, seq, NULL);
+        if (idx >= 0) {
+            dt_icmp_pend_complete(id, seq, rep + 8, rn - 8, myv);
+            n = dt_icmp_emit(idx, repbuf, repsize, 0);
+            dt_icmp_pend_free(idx);
+        } else {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        }
+        CloseHandle(ev);
+        return n;
+    }
+    idx = dt_icmp_pend_alloc(id, seq, ev);
+    if (idx < 0) { CloseHandle(ev); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    wev = ev; ev = NULL; /* owned by the slot now */
+    if (is_bcast) {
+        int i, nm = 0;
+        unsigned nodes[DT_MAXMEMB];
+        unsigned myv;
+        DLOCK();
+        myv = g_myvirt;
+        for (i = 0; i < g_nmembers && nm < DT_MAXMEMB; i++)
+            nodes[nm++] = g_members[i].node;
+        DUNLOCK();
+        for (i = 0; i < nm; i++) {
+            unsigned virt = dt_node_virt(nodes[i]);
+            if (!virt || virt == myv) continue;
+            dt_icmp_send_req(nodes[i], id, seq, (const unsigned char *)req, reqsize);
+        }
+        /* self part of a broadcast ping answers immediately */
+        if (myv) dt_icmp_pend_complete(id, seq, (const unsigned char *)req, reqsize, myv);
+        /* collect until the timeout (or buffer full), like the stack */
+        {
+            long long deadline = t0 + (timeout ? timeout : 4000);
+            for (;;) {
+                long long left = deadline - dt_now_ms();
+                DWORD w;
+                int fits;
+                if (left <= 0) break;
+                w = WaitForSingleObject(wev, left > 250 ? 250 : (DWORD)left);
+                (void)w;
+                DLOCK();
+                fits = ((size_t)(g_pend[idx].nrep + 1) *
+                        (sizeof(ICMP_ECHO_REPLY) + reqsize) <= repsize);
+                DUNLOCK();
+                if (!fits) break;
+            }
+        }
+        n = dt_icmp_emit(idx, repbuf, repsize, dt_now_ms() - t0);
+        dt_icmp_pend_free(idx);
+        if (n == 0) SetLastError(IP_REQ_TIMED_OUT);
+        return n;
+    }
+    dt_icmp_send_req(node, id, seq, (const unsigned char *)req, reqsize);
+    {
+        DWORD w = WaitForSingleObject(wev, timeout ? timeout : 4000);
+        if (w == WAIT_OBJECT_0) {
+            n = dt_icmp_emit(idx, repbuf, repsize, dt_now_ms() - t0);
+            dt_icmp_pend_free(idx);
+            if (n == 0) SetLastError(IP_REQ_TIMED_OUT);
+            return n;
+        }
+        dt_icmp_pend_free(idx);
+        SetLastError(IP_REQ_TIMED_OUT);
+        return 0;
+    }
+passthrough:
+    if (p_IcmpSendEcho)
+        return p_IcmpSendEcho(h, dst, (LPVOID)req, reqsize, NULL,
+                              repbuf, repsize, timeout);
+    SetLastError(ERROR_INVALID_FUNCTION);
+    return 0;
+}
+DWORD WINAPI hk_IcmpSendEcho(HANDLE h, IPAddr dst, LPVOID req, WORD reqsize,
+                             PIP_OPTION_INFORMATION opts, LPVOID repbuf,
+                             DWORD repsize, DWORD timeout) {
+    (void)opts;
+    return dt_icmp_echo(h, dst, req, reqsize, repbuf, repsize, timeout);
+}
+DWORD WINAPI hk_IcmpSendEcho2(HANDLE h, HANDLE hev, FARPROC apc, PVOID ctx,
+                              IPAddr dst, LPVOID req, WORD reqsize,
+                              PIP_OPTION_INFORMATION opts, LPVOID repbuf,
+                              DWORD repsize, DWORD timeout) {
+    DWORD n;
+    (void)apc; (void)ctx; (void)opts;
+    /* APC routines are not queued (documented): the event is the
+     * completion signal; callers waiting on it work unchanged. */
+    n = dt_icmp_echo(h, dst, req, reqsize, repbuf, repsize, timeout);
+    if (hev) SetEvent(hev);
+    return n;
+}
 /* ---- interface-identity shim --------------------------------------
  * A virtual-NIC product would expose the tunnel address as a real local
  * interface; without a driver we fake that view per-process: the vnode
@@ -3497,6 +4170,10 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"WSACloseEvent")) rep = (FARPROC)hk_WSACloseEvent;
                 } else if (isiph && !strcmp(fn,"GetAdaptersAddresses")) {
                     rep = (FARPROC)hk_GetAdaptersAddresses;
+                } else if (isiph && !strcmp(fn,"IcmpSendEcho")) {
+                    rep = (FARPROC)hk_IcmpSendEcho;
+                } else if (isiph && !strcmp(fn,"IcmpSendEcho2")) {
+                    rep = (FARPROC)hk_IcmpSendEcho2;
                 } else if (isiph && !strcmp(fn,"GetAdaptersInfo")) {
                     rep = (FARPROC)hk_GetAdaptersInfo;
                 } else if (isk32 && !strcmp(fn,"GetProcAddress")) {
@@ -3894,6 +4571,8 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
         if (hIPH) {
             p_GetAdaptersAddresses = (PFN_GetAdaptersAddresses)GetProcAddress(hIPH, "GetAdaptersAddresses");
             p_GetAdaptersInfo = (PFN_GetAdaptersInfo)GetProcAddress(hIPH, "GetAdaptersInfo");
+            p_IcmpSendEcho = (PFN_IcmpSendEcho)GetProcAddress(hIPH, "IcmpSendEcho");
+            p_IcmpSendEcho2 = (PFN_IcmpSendEcho2)GetProcAddress(hIPH, "IcmpSendEcho2");
             dbg("lan_hook: iphlpapi pointers resolved\n");
         }
     }
@@ -3940,6 +4619,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     flog("LanHookInit: build " __DATE__ " " __TIME__);
     flog("LanHookInit: installed");
     g_init_armed = 0;
+    g_init_done = 1;
     return 0;
 }
 
