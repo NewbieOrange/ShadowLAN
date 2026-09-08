@@ -63,7 +63,7 @@ async def fake_game_server():
 
 
 async def run_stack(pub, token, checks):
-    relay = Relay(pub, token=token)
+    relay = Relay(pub, token=token, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.3)
     host = WinClient("127.0.0.1", pub, [DISC], [], [],
@@ -157,5 +157,12 @@ async def main():
     tcp_srv.close()
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())

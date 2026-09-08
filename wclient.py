@@ -2,8 +2,13 @@
 """ShadowLAN symmetric client (Windows + Linux). Runs next to the game. No TUN/TAP, no driver.
 
 Connects to ONE specific IP:port on the relay:
-  TCP server_ip:port -> discovery + game-TCP + membership
+  TCP server_ip:port -> control (membership, beacons) + one conn per stream
   UDP server_ip:port -> game-UDP
+
+Protocol v2 (1.2.0): each game TCP stream is its own TCP connection to the
+relay (both ends dial out, NAT-safe); the relay pipes raw bytes once the
+destination has bridged to its local game (T_STOPEN -> T_STREQ -> T_STJOIN
+-> T_STJOINED -> T_STOK). connect() only completes after that handshake.
 
 Player mode (default) per game (ports from CLI):
 - Snoops local discovery broadcasts with SO_REUSEADDR (gets a copy
@@ -38,13 +43,17 @@ if os.name == "nt":
         pass
 
 from common import (
-    T_BCAST, T_BCAST_FROM, T_TCP_OPEN, T_TCP_DATA_C2S, T_TCP_DATA_S2C,
-    T_TCP_CLOSE, T_HELLO, T_NODE, U_GAME_C2S, U_GAME_S2C, U_NODE,
+    HDR,
+    T_BCAST, T_BCAST_FROM, T_HELLO, T_NODE,
+    T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL, T_STOPEN,
+    STF_HOST_FAILED,
+    U_GAME_C2S, U_GAME_S2C, U_NODE,
     U_ICMP_REQ, U_ICMP_REP,
     QueueProto,
     decode_udp_game, encode_udp_game, encode_hello, encode_udp_hello,
     encode_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
-    make_reuse_udp, parse_ports, tcp_read, tcp_send,
+    encode_stjoin, encode_stsid, encode_stfail, encode_stopen,
+    make_reuse_udp, parse_ports, tcp_read, tcp_send, ST_TIMEOUT_S,
 )
 
 
@@ -79,12 +88,6 @@ class WinClient:
         self.bcast_sock = None
         self.bcast_port = 0
         self._route_ip = None
-        # stream_id -> StreamWriter to local game (client side)
-        self.local_tcp = {}
-        self.next_stream = 1
-        # hosted streams: relay sid -> StreamWriter to local game server
-        self.host_game = {}
-        self.host_pending = {}  # sid -> bytearray (OPEN/DATA race)
         # game UDP port -> (transport, proto) local listener
         self.udp_local = {}
         # tunnel UDP transport/proto (ephemeral -> server:port)
@@ -209,86 +212,100 @@ class WinClient:
                         continue
                     _node, dport, _sport, raw = dec
                     self.rebroadcast(dport, raw)
-                elif mtype == T_TCP_DATA_S2C:
-                    sid = struct.unpack("!I", payload[:4])[0]
-                    w = self.local_tcp.get(sid)
-                    if w and not w.is_closing():
-                        w.write(payload[4:])
-                        try:
-                            await w.drain()
-                        except (ConnectionResetError, BrokenPipeError):
-                            pass
-                elif mtype == T_TCP_CLOSE:
-                    sid = struct.unpack("!I", payload[:4])[0]
-                    w = self.local_tcp.pop(sid, None)
-                    if w and not w.is_closing():
-                        w.close()
-                    w = self.host_game.pop(sid, None)
-                    self.host_pending.pop(sid, None)
-                    if w and not w.is_closing():
-                        w.close()
-                elif mtype == T_TCP_OPEN:
-                    # inbound: relay routes another player's stream to our
-                    # local game server (--host bridge)
+                elif mtype == T_STREQ:
+                    # v2: another player is joining a port we serve
                     if len(payload) < 6:
                         continue
                     sid, gport = struct.unpack("!IH", payload[:6])
-                    rev_tcp = {v: k for k, v in self.tcp_remote.items()}
-                    asyncio.create_task(
-                        self.host_dial(sid, rev_tcp.get(gport, gport)))
-                elif mtype == T_TCP_DATA_C2S:
-                    # inbound game data for a hosted stream
-                    if len(payload) < 4:
-                        continue
-                    (sid,) = struct.unpack("!I", payload[:4])
-                    w = self.host_game.get(sid)
-                    if w and not w.is_closing():
-                        w.write(payload[4:])
-                        try:
-                            await w.drain()
-                        except (ConnectionResetError, BrokenPipeError):
-                            pass
-                    else:
-                        self.host_pending.setdefault(sid, bytearray()).extend(payload[4:])
+                    asyncio.create_task(self.stream_join(sid, gport))
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
 
-    async def host_dial(self, sid, gport):
-        """Bridge one inbound relay stream to the local game server."""
-        try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", gport)
-        except OSError as e:
-            print(f"[tcp] host dial 127.0.0.1:{gport} failed: {e}", flush=True)
-            self.host_pending.pop(sid, None)
+    async def pipe_stream(self, ra, wa, rb, wb, tag):
+        """Raw bidirectional pipe between two (reader, writer) pairs."""
+        async def pump(src, dst):
             try:
-                await self.tcp_send(T_TCP_CLOSE, struct.pack("!I", sid))
-            except Exception:
+                while True:
+                    d = await src.read(65536)
+                    if not d:
+                        break
+                    dst.write(d)
+                    await dst.drain()
+            except (ConnectionResetError, BrokenPipeError, RuntimeError):
                 pass
+        t1 = asyncio.create_task(pump(ra, wb))
+        t2 = asyncio.create_task(pump(rb, wa))
+        try:
+            await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (t1, t2):
+                t.cancel()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+            for w in (wa, wb):
+                try:
+                    if not w.is_closing():
+                        w.close()
+                except Exception:
+                    pass
+            print(f"[stream] {tag} closed", flush=True)
+
+    async def stream_join(self, sid, gport):
+        """Joinee side: per-stream TCP to the relay, join, bridge to the
+        local game, T_STJOINED, then raw pipe (handshake guarantees the
+        bridge exists before the opener's connect() can succeed)."""
+        rev_tcp = {v: k for k, v in self.tcp_remote.items()}
+        lport = rev_tcp.get(gport, gport)
+        try:
+            sreader, swriter = await asyncio.wait_for(
+                asyncio.open_connection(self.server_ip, self.port),
+                timeout=ST_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError) as e:
+            print(f"[stream] join {sid}: relay dial failed: {e}", flush=True)
             return
-        early = self.host_pending.pop(sid, None)
-        if early:
-            writer.write(bytes(early))
-            try:
-                await writer.drain()
-            except (ConnectionResetError, BrokenPipeError):
-                pass
-        self.host_game[sid] = writer
-        print(f"[tcp] hosted stream {sid} -> 127.0.0.1:{gport}", flush=True)
         try:
-            while True:
-                chunk = await reader.read(65536)
-                if not chunk:
+            swriter.write(HDR.pack(1 + 8) + bytes([T_STJOIN])
+                          + encode_stjoin(self.node_id, sid))
+            await swriter.drain()
+            # claim verdict first: a sibling process sharing this node id
+            # may win; stand down BEFORE bridging so the game port is
+            # touched by exactly one process.
+            _hdr = await asyncio.wait_for(sreader.readexactly(4),
+                                          timeout=ST_TIMEOUT_S)
+            (mlen,) = HDR.unpack(_hdr)
+            _body = await asyncio.wait_for(sreader.readexactly(mlen),
+                                           timeout=ST_TIMEOUT_S)
+            if _body[0] != T_STOK:
+                print(f"[stream] join {sid}: claim refused "
+                      f"(op {_body[0]:#x}) - sibling serves it", flush=True)
+                swriter.close()
+                return
+            local = None
+            for _ in range(4):
+                try:
+                    local = await asyncio.open_connection("127.0.0.1", lport)
                     break
-                await self.tcp_send(T_TCP_DATA_S2C, struct.pack("!I", sid) + chunk)
-        except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                except OSError:
+                    await asyncio.sleep(0.25)
+            if local is None:
+                swriter.write(HDR.pack(1 + 5) + bytes([T_STFAIL])
+                              + encode_stfail(sid, STF_HOST_FAILED))
+                await swriter.drain()
+                print(f"[stream] join {sid}: local dial 127.0.0.1:{lport} failed",
+                      flush=True)
+                swriter.close()
+                return
+            lr, lw = local
+            swriter.write(HDR.pack(1 + 4) + bytes([T_STJOINED])
+                          + encode_stsid(sid))
+            await swriter.drain()
+            print(f"[stream] hosted {sid} -> 127.0.0.1:{lport}", flush=True)
+            await self.pipe_stream(sreader, swriter, lr, lw, f"join {sid}")
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, RuntimeError):
             pass
         finally:
-            self.host_game.pop(sid, None)
-            self.host_pending.pop(sid, None)
-            if not writer.is_closing():
-                writer.close()
             try:
-                await self.tcp_send(T_TCP_CLOSE, struct.pack("!I", sid))
+                swriter.close()
             except Exception:
                 pass
 
@@ -296,32 +313,38 @@ class WinClient:
         rport = self.tcp_remote.get(gport, gport)
 
         async def on_accept(reader, writer):
-            sid = self.next_stream
-            self.next_stream += 1
-            self.local_tcp[sid] = writer
-            print(f"[tcp] local game -> stream {sid} (:{gport}=>{rport})", flush=True)
+            sid = random.getrandbits(32) or 1
+            print(f"[stream] local game -> open {sid} (:{gport}=>{rport})", flush=True)
             try:
-                await self.tcp_send(T_TCP_OPEN, struct.pack("!IH", sid, rport))
-            except Exception:
-                self.local_tcp.pop(sid, None)
-                writer.close()
-                return
-            try:
-                while True:
-                    chunk = await reader.read(65536)
-                    if not chunk:
-                        break
-                    await self.tcp_send(T_TCP_DATA_C2S, struct.pack("!I", sid) + chunk)
-            except (ConnectionResetError, BrokenPipeError, RuntimeError):
-                pass
-            finally:
-                self.local_tcp.pop(sid, None)
+                sreader, swriter = await asyncio.wait_for(
+                    asyncio.open_connection(self.server_ip, self.port),
+                    timeout=ST_TIMEOUT_S)
+                swriter.write(HDR.pack(1 + 14) + bytes([T_STOPEN])
+                              + encode_stopen(self.node_id, 0, sid, rport))
+                await swriter.drain()
+                # handshake: relay confirms the destination bridged its
+                # local game before the connect() may complete
+                _hdr = await asyncio.wait_for(sreader.readexactly(4),
+                                              timeout=ST_TIMEOUT_S)
+                (mlen,) = HDR.unpack(_hdr)
+                body = await asyncio.wait_for(sreader.readexactly(mlen),
+                                              timeout=ST_TIMEOUT_S)
+                if body[0] != T_STOK:
+                    print(f"[stream] open {sid}: refused (op {body[0]:#x})",
+                          flush=True)
+                    swriter.close()
+                    writer.close()
+                    return
+                print(f"[stream] open {sid} -> :{rport}", flush=True)
+                await self.pipe_stream(sreader, swriter, reader, writer,
+                                       f"open {sid}")
+            except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    ConnectionResetError, BrokenPipeError, RuntimeError) as e:
+                print(f"[stream] open {sid}: failed: {e}", flush=True)
                 try:
-                    await self.tcp_send(T_TCP_CLOSE, struct.pack("!I", sid))
+                    writer.close()
                 except Exception:
                     pass
-                if not writer.is_closing():
-                    writer.close()
         srv = await asyncio.start_server(on_accept, "0.0.0.0", gport)
         print(f"[tcp] proxy listening 0.0.0.0:{gport} (point game at this PC)", flush=True)
         async with srv:
@@ -515,7 +538,6 @@ class WinClient:
                 print("[peer] TCP connected", flush=True)
                 backoff = 1
                 self.tcp_writer = writer
-                self.local_tcp.clear()
                 if self.host_mode:
                     try:
                         await self.tcp_send(T_HELLO, encode_hello(self.token))
@@ -615,6 +637,11 @@ def main():
     c = WinClient(a.server, a.port, parse_ports(a.disc), parse_ports(a.tcp),
                   parse_ports(a.udp), a.rebroadcast_ip,
                   host_mode=a.host, token=a.token)
+    print(f"[cfg] wclient server={a.server}:{a.port} "
+          f"token={'set' if a.token else 'open'} "
+          f"mode={'host' if a.host else 'player'} disc={a.disc or '-'} "
+          f"tcp={a.tcp or '-'} udp={a.udp or '-'} "
+          f"rebroadcast={a.rebroadcast_ip}", flush=True)
     try:
         asyncio.run(c.run())
     except KeyboardInterrupt:

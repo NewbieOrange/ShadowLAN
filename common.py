@@ -1,4 +1,12 @@
-"""Shared framing + socket helpers. Stdlib only, Windows + Linux."""
+"""Shared framing + socket helpers. Stdlib only, Windows + Linux.
+
+Protocol v2 (1.2.0): game TCP streams no longer multiplex over the control
+TCP. Each fake game TCP connection is ONE real TCP connection to the relay,
+opened by the hook/client itself (NAT-safe: both ends dial out). The relay
+pipes raw bytes between the two per-stream connections. The control TCP
+carries only membership, host claim, discovery beacons and (UDP-over-TCP)
+game datagrams.
+"""
 import asyncio
 import socket
 import struct
@@ -7,16 +15,35 @@ import struct
 HDR = struct.Struct("!I")
 VERSION = "1.1.0"
 
+# ---- control-connection ops ---------------------------------------------
 T_BCAST = 0x01        # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
-T_TCP_OPEN = 0x10     # payload: !I stream_id + !H game_port (implicit route)
-T_TCP_DATA_C2S = 0x11 # payload: !I stream_id + raw
-T_TCP_DATA_S2C = 0x12 # payload: !I stream_id + raw
-T_TCP_CLOSE = 0x13    # payload: !I stream_id
 T_HELLO = 0x20        # payload: !H token_len + token (designated-host claim)
 T_NODE = 0x22         # payload: !H tlen + token + !I node_id + !H udp_port
 T_ASSIGN = 0x23       # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
-T_POPEN = 0x24        # payload: !I sid + !I dest_node + !H port (P2P open)
+T_UDP_TUN = 0x30      # TCP frame carrying one UDP-tunnel datagram (UDP-over-TCP mode)
+T_UDP_MODE = 0x31     # declare UDP-over-TCP mode for this link (empty payload)
+
+# ---- per-stream TCP ops (first frame(s) of a stream connection) ----------
+# opener dials the relay, sends T_STOPEN; the relay asks the destination
+# (T_STREQ on its CONTROL connection, to EVERY live link of the dest node
+# -- process-tree identity means siblings race to serve); a destination
+# process dials the relay and sends T_STJOIN, and the relay answers the
+# claim ON THAT connection: T_STOK = first joiner, serve it; T_STFAIL
+# (STF_BUSY) = a sibling already claimed, stand down WITHOUT bridging.
+# The winner bridges to its local game and sends T_STJOINED; the relay
+# then replies T_STOK to the opener and pipes raw bytes both ways.
+T_STOPEN = 0x40   # opener->relay (per-stream TCP): !I node + !I dest_node + !I sid + !H gport
+T_STREQ = 0x41    # relay->dest (control TCP): !I sid + !H gport
+T_STJOIN = 0x42   # dest->relay (per-stream TCP): !I node + !I sid
+T_STJOINED = 0x43 # dest->relay (per-stream TCP, local bridge up): !I sid
+T_STOK = 0x44     # relay->opener / relay->joinee (claim): !I sid
+T_STFAIL = 0x45   # relay->opener/joinee or dest->relay: !I sid + !B reason
+STF_NO_ROUTE = 1  # destination node unknown / not connected / no host for port
+STF_JOIN_TIMEOUT = 2  # destination never joined in time
+STF_HOST_FAILED = 3  # destination could not reach its local game
+STF_BAD_ID = 4    # joining node is not the stream's destination
+STF_BUSY = 5      # stream id already in use
 
 # UDP tunnel datagrams: MAGIC + VER + TYPE + payload
 UMAGIC = b"VN"
@@ -25,10 +52,13 @@ U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
 U_GAME_P2P = 0x12  # payload: !I dest_node + std triple+raw
 U_ICMP_REQ = 0x20  # payload: !I src_node + !I dest_node + !H id + !H seq + data (0 = relay)
-U_ICMP_REP = 0x21  # payload: !I src_node + !I dest_node + !H id + !H seq + data
+U_ICMP_REP = 0x21  # same layout, reply
 U_HELLO_HOST = 0x10  # payload: !H token_len + token (host UDP heartbeat)
 U_NODE = 0x11        # payload: !H tlen + token + !I node_id + !H udp_port
 # game payload both dirs: !H game_port + !H iplen + ip + !H port + raw
+
+# stream handshake budget (both sides + relay)
+ST_TIMEOUT_S = 10.0
 
 
 def parse_ports(s):
@@ -193,16 +223,71 @@ def decode_assign(payload: bytes):
         return None
 
 
-def encode_popen(sid: int, dest_node: int, port: int) -> bytes:
-    return struct.pack("!IIH", sid & 0xFFFFFFFF, dest_node & 0xFFFFFFFF,
-                       port & 0xFFFF)
+# ---- per-stream ops -------------------------------------------------------
+def encode_stopen(node: int, dest_node: int, sid: int, gport: int) -> bytes:
+    return struct.pack("!IIIH", node & 0xFFFFFFFF, dest_node & 0xFFFFFFFF,
+                       sid & 0xFFFFFFFF, gport & 0xFFFF)
 
 
-def decode_popen(payload: bytes):
+def decode_stopen(payload: bytes):
+    """T_STOPEN -> (node, dest_node, sid, gport) or None."""
     try:
-        if len(payload) != 10:
+        if len(payload) != 14:
             return None
-        return struct.unpack("!IIH", payload)
+        return struct.unpack("!IIIH", payload)
+    except struct.error:
+        return None
+
+
+def encode_streq(sid: int, gport: int) -> bytes:
+    return struct.pack("!IH", sid & 0xFFFFFFFF, gport & 0xFFFF)
+
+
+def decode_streq(payload: bytes):
+    try:
+        if len(payload) != 6:
+            return None
+        return struct.unpack("!IH", payload)
+    except struct.error:
+        return None
+
+
+def encode_stjoin(node: int, sid: int) -> bytes:
+    return struct.pack("!II", node & 0xFFFFFFFF, sid & 0xFFFFFFFF)
+
+
+def decode_stjoin(payload: bytes):
+    try:
+        if len(payload) != 8:
+            return None
+        return struct.unpack("!II", payload)
+    except struct.error:
+        return None
+
+
+def encode_stsid(sid: int) -> bytes:
+    """T_STJOINED / T_STOK payload: !I sid."""
+    return struct.pack("!I", sid & 0xFFFFFFFF)
+
+
+def decode_stsid(payload: bytes):
+    try:
+        if len(payload) != 4:
+            return None
+        return struct.unpack("!I", payload)[0]
+    except struct.error:
+        return None
+
+
+def encode_stfail(sid: int, reason: int) -> bytes:
+    return struct.pack("!IB", sid & 0xFFFFFFFF, reason & 0xFF)
+
+
+def decode_stfail(payload: bytes):
+    try:
+        if len(payload) != 5:
+            return None
+        return struct.unpack("!IB", payload)
     except struct.error:
         return None
 

@@ -78,7 +78,7 @@ async def tcp_check(expect, tag):
 
 
 async def main():
-    relay_task = asyncio.create_task(Relay(PUB).run())
+    relay_task = asyncio.create_task(Relay(PUB, bind="127.0.0.1").run())
     await asyncio.sleep(0.3)
 
     srv_a, udp_a = await start_game(b"A", A_TCP, A_UDP)
@@ -135,5 +135,12 @@ async def main():
     srv_b.close()
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())
