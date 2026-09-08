@@ -18,7 +18,7 @@ is a pure passthrough. One source builds both the Windows DLL and the Linux
   sources with the sender's virtual IP, so each peer looks like its own
   machine on the same LAN.
 
-## TCP streams (v1.2.0 protocol)
+## TCP streams
 
 Every fake game TCP connection is ONE real TCP connection to the relay
 opened by the process itself (both peers dial out, so NATs never block a
