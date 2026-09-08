@@ -35,7 +35,7 @@ from server import Relay
 from wclient import WinClient
 from common import (
     T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, U_GAME_C2S, U_GAME_S2C,
-    encode_node, encode_pdat, encode_udp_game,
+    encode_ctl_node, encode_pdat, encode_udp_game,
     decode_udp_game, decode_pdat, decode_bcast_from,
     tcp_send, tcp_read,
 )
@@ -67,7 +67,7 @@ async def register_node(node_id, udp_sock):
     this node never race the node table."""
     port = udp_sock.getsockname()[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(writer, T_NODE, encode_node(b"", node_id, port))
+    await tcp_send(writer, T_NODE, encode_ctl_node(b"", node_id, port))
     from common import encode_udp_node
     loop = asyncio.get_running_loop()
     await loop.sock_sendto(
@@ -213,12 +213,12 @@ async def test_disc_distinct_hosts():
             w.close()
         r1, w1 = await asyncio.open_connection("127.0.0.1", PUB)
         await tcp_send(w1, T_NODE,
-                       encode_node(b"", 0x55555555, hu1.getsockname()[1]))
+                       encode_ctl_node(b"", 0x55555555, hu1.getsockname()[1]))
         r2, w2 = await asyncio.open_connection("127.0.0.1", PUB)
         await tcp_send(w2, T_NODE,
-                       encode_node(b"", 0x66666666, hu2.getsockname()[1]))
+                       encode_ctl_node(b"", 0x66666666, hu2.getsockname()[1]))
         rp, wp = await asyncio.open_connection("127.0.0.1", PUB)
-        await tcp_send(wp, T_NODE, encode_node(b"", 0x77777777, 0))
+        await tcp_send(wp, T_NODE, encode_ctl_node(b"", 0x77777777, 0))
         for r in (r1, r2, rp):
             tasks.append(asyncio.create_task(collect(r)))
         # registration barrier: send a beacon and drain until BOTH node
@@ -326,7 +326,7 @@ async def test_subnet_eviction(relay):
     try:
         assert len(relay.nodes) >= 253, len(relay.nodes)
         reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
-        await tcp_send(writer, T_NODE, encode_node(b"", 0x7E11C7, 0))
+        await tcp_send(writer, T_NODE, encode_ctl_node(b"", 0x7E11C7, 0))
         mtype, payload = await asyncio.wait_for(tcp_read(reader), timeout=5)
         from common import decode_assign
         assert mtype == T_ASSIGN, (mtype, "no ASSIGN = registration rejected")

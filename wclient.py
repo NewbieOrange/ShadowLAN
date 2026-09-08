@@ -5,7 +5,7 @@ Connects to ONE specific IP:port on the relay:
   TCP server_ip:port -> control (membership, beacons) + one conn per stream
   UDP server_ip:port -> game-UDP
 
-Protocol v2 (1.2.0): each game TCP stream is its own TCP connection to the
+Each game TCP stream is its own TCP connection to the
 relay (both ends dial out, NAT-safe); the relay pipes raw bytes once the
 destination has bridged to its local game (T_STOPEN -> T_STREQ -> T_STJOIN
 -> T_STJOINED -> T_STOK). connect() only completes after that handshake.
@@ -44,14 +44,14 @@ if os.name == "nt":
 
 from common import (
     HDR,
-    T_BCAST, T_BCAST_FROM, T_HELLO, T_NODE,
+    T_BCAST, T_BCAST_FROM, T_NODE, NODE_F_HOST,
     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL, T_STOPEN,
     STF_HOST_FAILED,
     U_GAME_C2S, U_GAME_S2C, U_NODE,
-    U_ICMP_REQ, U_ICMP_REP,
+    U_ICMP_REQ, U_ICMP_REP, UMAGIC, UVER,
     QueueProto,
-    decode_udp_game, encode_udp_game, encode_hello, encode_udp_hello,
-    encode_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
+    decode_udp_game, encode_udp_game,
+    encode_ctl_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
     encode_stjoin, encode_stsid, encode_stfail, encode_stopen,
     make_reuse_udp, parse_ports, tcp_read, tcp_send, ST_TIMEOUT_S,
 )
@@ -213,7 +213,7 @@ class WinClient:
                     _node, dport, _sport, raw = dec
                     self.rebroadcast(dport, raw)
                 elif mtype == T_STREQ:
-                    # v2: another player is joining a port we serve
+                    # another player is joining a port we serve
                     if len(payload) < 6:
                         continue
                     sid, gport = struct.unpack("!IH", payload[:6])
@@ -389,7 +389,7 @@ class WinClient:
         loop = asyncio.get_running_loop()
         while True:
             data, addr = await self.udp_tun_proto.q.get()
-            if len(data) >= 4 and data[:2] == b"VN" and data[2] == 0x01 \
+            if len(data) >= 4 and data[:2] == UMAGIC and data[2] == UVER \
                     and data[3] in (U_ICMP_REQ, U_ICMP_REP):
                 await self.icmp_tun_recv(data, addr)
                 continue
@@ -471,15 +471,6 @@ class WinClient:
         self.udp_host_socks.pop(key, None)
         s.close()
 
-    def send_udp_hello(self):
-        if not self.udp_tun:
-            return
-        try:
-            self.udp_tun.sendto(encode_udp_hello(self.token),
-                                (self.server_ip, self.port))
-        except OSError:
-            pass
-
     def udp_port(self):
         try:
             t = self.udp_tun
@@ -497,7 +488,8 @@ class WinClient:
             return
         try:
             self.udp_tun.sendto(
-                encode_udp_node(self.token, self.node_id, self.udp_port()),
+                encode_udp_node(self.token, self.node_id, self.udp_port(),
+                                NODE_F_HOST if self.host_mode else 0),
                 (self.server_ip, self.port))
         except OSError:
             pass
@@ -505,7 +497,9 @@ class WinClient:
     async def send_tcp_node(self):
         try:
             await self.tcp_send(
-                T_NODE, encode_node(self.token, self.node_id, self.udp_port()))
+                T_NODE, encode_ctl_node(self.token, self.node_id,
+                                        self.udp_port(),
+                                        NODE_F_HOST if self.host_mode else 0))
         except (ConnectionResetError, BrokenPipeError, RuntimeError,
                 AttributeError):
             pass
@@ -514,8 +508,6 @@ class WinClient:
         n = 0
         while True:
             self.send_udp_node()
-            if self.host_mode:
-                self.send_udp_hello()
             if n % 2 == 0:
                 await self.send_tcp_node()  # refresh mapping ~60s
             n += 1
@@ -538,17 +530,8 @@ class WinClient:
                 print("[peer] TCP connected", flush=True)
                 backoff = 1
                 self.tcp_writer = writer
-                if self.host_mode:
-                    try:
-                        await self.tcp_send(T_HELLO, encode_hello(self.token))
-                    except (ConnectionResetError, BrokenPipeError, RuntimeError):
-                        try:
-                            writer.close()
-                        except Exception:
-                            pass
-                        self.tcp_writer = None
-                        continue
-                await self.send_tcp_node()  # register node (+real UDP port later)
+                # one frame does it all: identity + endpoint (+ host flag)
+                await self.send_tcp_node()
                 tasks = [asyncio.create_task(self.tcp_reader_loop(reader))]
                 for d in self.disc_ports:
                     tasks.append(asyncio.create_task(self.bcast_snoop(d)))

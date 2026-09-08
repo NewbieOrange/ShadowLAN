@@ -24,7 +24,7 @@ sys.path.insert(0, ROOT)
 from server import Relay
 from common import (HDR, T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, T_STOPEN,
                     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
-                    STF_BUSY, encode_node, decode_bcast_from, tcp_read)
+                    STF_BUSY, encode_ctl_node, decode_bcast_from, tcp_read)
 
 PUB = 47795
 N1, N2, N3 = 0x11111111, 0x22222222, 0x33333333
@@ -65,7 +65,7 @@ class Link:
                 return False, (t, p)
 
     async def register(self, node, uport):
-        await self.send(T_NODE, encode_node(b"", node, uport))
+        await self.send(T_NODE, encode_ctl_node(b"", node, uport))
         return await self.expect(T_ASSIGN)
 
     def close(self):
@@ -111,12 +111,12 @@ async def main():
     # ---- phase 1: same node id from two links -> one vnode ----
     a1 = await l1.register(N1, 6001)
     a2 = await l2.register(N1, 6002)
-    v1, v2 = my_virt(a1), my_virt(a2)
-    assert v1 == v2 and v1 != 0, (v1, v2)
+    v_1, v_2 = my_virt(a1), my_virt(a2)
+    assert v_1 == v_2 and v_1 != 0, (v_1, v_2)
     assert len(relay.nodes[N1]["links"]) == 2
     await l3.register(N2, 6003)
     await l4.register(N3, 6004)
-    print(f"PASS[1] one vnode 0x{v1:08x} for both links", flush=True)
+    print(f"PASS[1] one vnode 0x{v_1:08x} for both links", flush=True)
 
     # ---- phase 2: beacon from N2 fans to every link of N1 ----
     await l3.send(T_BCAST, struct.pack("!HH", 47584, 47584) + b"BIGBEACON")

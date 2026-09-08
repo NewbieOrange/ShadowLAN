@@ -6,7 +6,7 @@ Listens on ONE public port number for both protocols:
                     UDP-over-TCP) + one connection per game TCP stream
   UDP 0.0.0.0:P  -> game-UDP datagrams (low latency, stays UDP)
 
-Protocol v2 (1.2.0): every fake game TCP connection is its own real TCP
+Every fake game TCP connection is its own real TCP
 connection to the relay (both peers dial OUT, NAT-safe). The relay pipes
 raw bytes between the two per-stream connections, so a stalled stream
 never head-of-line-blocks beacons or other streams. connect() only
@@ -25,15 +25,16 @@ import time
 
 from common import (
     VERSION, HDR,
-    T_BCAST, T_BCAST_FROM, T_HELLO, T_NODE, T_ASSIGN,
+    T_BCAST, T_BCAST_FROM, T_NODE, T_ASSIGN,
     T_UDP_TUN, T_UDP_MODE,
     T_STOPEN, T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
     STF_NO_ROUTE, STF_JOIN_TIMEOUT, STF_BAD_ID, STF_BUSY,
-    U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_HELLO_HOST, U_NODE, UMAGIC, UVER,
+    U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_NODE, UMAGIC, UVER,
     U_ICMP_REQ, U_ICMP_REP,
     QueueProto,
-    decode_udp_game, encode_udp_game, decode_udp_hello,
-    decode_hello, decode_node, decode_udp_node, decode_pdat,
+    decode_udp_game, encode_udp_game,
+    decode_udp_node, decode_pdat,
+    PVER, ctl_ver, decode_ctl_node, NODE_F_HOST,
     encode_assign, encode_bcast_from, encode_icmp, decode_icmp,
     encode_stopen, decode_stopen, encode_streq, decode_streq,
     encode_stjoin, decode_stjoin, encode_stsid, decode_stsid,
@@ -90,7 +91,6 @@ class Relay:
         # every live link.
         self.nodes = {}
         self.writer_node = {}  # id(writer) -> node_id
-        self.next_virt = 2  # .1 reserved
         self.host_udp = None
         self.host_udp_seen = 0.0
         self.known_udp = {}  # addr -> last seen (fan-out candidates)
@@ -120,7 +120,7 @@ class Relay:
         self.wq = {}        # id(writer) -> asyncio.Queue
         self.wq_size = {}   # id(writer) -> [frames, bytes]
         self.wq_task = {}   # id(writer) -> drain task
-        # v2 streams: sid -> dict(opener_node, opener_r/w, dest_node, gport,
+        # stream table: sid -> dict(opener_node, opener_r/w, dest_node, gport,
         # state open|ready, joiner_r/w, created, task)
         self.streams = {}
         self.node_streams = {}  # node -> set(sid)
@@ -189,25 +189,31 @@ class Relay:
             return False
         return True
 
-    async def promote_host(self, writer, peer):
-        # Non-destructive handover: existing streams keep flowing to their
-        # original targets; only future implicit opens go to the new holder.
-        # The old holder is demoted, never kicked, so a shared-link claimant
-        # stays playable. A claim from another link of the SAME node (e.g.
-        # tool + game sharing one identity) never demotes anything: it only
-        # refreshes the uplink stamp.
+    def claim_host(self, writer, peer):
+        # Designated-host claim (T_NODE flags bit). Non-destructive
+        # handover: existing streams keep flowing to their original
+        # targets; only future implicit opens go to the new holder. The
+        # old holder is demoted, never kicked. A re-claim from the same
+        # node (process-tree sibling link or a keepalive refresh) never
+        # demotes anything: it only refreshes the uplink stamp.
         old = self.host_writer
-        new_node = self.writer_node.get(id(writer))
+        if old is writer:
+            return
+        node = self.writer_node.get(id(writer))
         old_node = self.writer_node.get(id(old)) if old is not None else None
         self.host_writer = writer
         self.roles[id(writer)] = "host"
         self.players.discard(writer)
-        if old is not None and old is not writer and old_node != new_node:
+        if old is not None and old_node != node:
             self.players.add(old)
             self.roles[id(old)] = "player"
             print(f"[relay] host demoted to player: "
                   f"{old.get_extra_info('peername')}", flush=True)
-        print(f"[relay] host uplink up from {peer}", flush=True)
+            print(f"[relay] host uplink up from {peer}", flush=True)
+        elif old is not None:
+            print(f"[relay] host uplink refreshed from {peer}", flush=True)
+        else:
+            print(f"[relay] host uplink up from {peer}", flush=True)
 
     def live_links(self, nid, exclude_writer=None, exclude_node=None):
         """All live control writers registered for node nid."""
@@ -372,11 +378,11 @@ class Relay:
         await asyncio.sleep(self.NODE_GRACE)
         if writer.is_closing():
             return
-        if id(writer) not in self.writer_node and self.host_writer is not writer:
-            print(f"[relay] no NODE/HELLO from {peer}, dropping", flush=True)
+        if id(writer) not in self.writer_node:
+            print(f"[relay] no NODE from {peer}, dropping", flush=True)
             writer.close()
 
-    # ---- v2 per-stream connections ----------------------------------------
+    # ---- per-stream connections ----------------------------------------
     def _stream_pop(self, sid):
         st = self.streams.pop(sid, None)
         if st is None:
@@ -650,24 +656,24 @@ class Relay:
         try:
             mtype, payload = first if first else await tcp_read(reader)
             while True:
-                if mtype == T_HELLO:
-                    tok = decode_hello(payload)
-                    if not self.token_ok(tok):
-                        print(f"[relay] bad/missing host token from {peer}, dropping", flush=True)
+                if mtype == T_NODE:
+                    if ctl_ver(payload) != PVER:
+                        print(f"[relay] proto mismatch from {peer}: NODE "
+                              f"ver {ctl_ver(payload)} != {PVER}", flush=True)
                         return
-                    await self.promote_host(writer, peer)
-                elif mtype == T_NODE:
-                    dec = decode_node(payload)
+                    dec = decode_ctl_node(payload)
                     if not dec:
                         pass
                     else:
-                        tok, node, uport = dec
+                        tok, node, uport, flags = dec
                         if not node:
                             pass
                         else:
                             ok = await self.register_node(writer, peer, tok, node, uport)
                             if not ok:
                                 return
+                            if flags & NODE_F_HOST:
+                                self.claim_host(writer, peer)
                 elif mtype == T_UDP_MODE:
                     # UDP-over-TCP mode for this LINK: game datagrams
                     # arrive as T_UDP_TUN and replies go back the same way
@@ -752,7 +758,7 @@ class Relay:
                               f"{node}", flush=True)
                     if not survivors and not was_host:
                         asyncio.create_task(self.broadcast_assign())
-                    # v2: only when the whole node goes dark close its
+                    # only when the whole node goes dark close its
                     # per-stream TCPs; the other end sees EOF and cleans
                     # up on its side. Streams of a node that still has a
                     # live sibling link stay up.
@@ -908,21 +914,18 @@ class Relay:
         if len(data) < 4 or data[:2] != UMAGIC or data[2] != UVER:
             return
         mtype = data[3]
-        if mtype == U_HELLO_HOST:
-            tok = decode_udp_hello(data)
-            if not self.token_ok(tok):
-                return
-            if self.host_udp != addr:
-                print(f"[relay] host UDP endpoint {addr}", flush=True)
-            self.host_udp = addr
-            self.host_udp_seen = time.monotonic()
-            self.known_udp[addr] = time.monotonic()
-            return
         if mtype == U_NODE:
             dec = decode_udp_node(data)
             if not dec:
                 return
-            tok, node, _uport = dec
+            tok, node, _uport, flags = dec
+            # host-flagged U_NODE refreshes the host UDP endpoint
+            # (the old dedicated UDP hello heartbeat, folded in)
+            if flags & NODE_F_HOST and self.token_ok(tok):
+                if self.host_udp != addr:
+                    print(f"[relay] host UDP endpoint {addr}", flush=True)
+                self.host_udp = addr
+                self.host_udp_seen = time.monotonic()
             if not self.token_ok(tok):
                 return
             ent = self.nodes.get(node)
@@ -1128,7 +1131,7 @@ class Relay:
         print(f"[tcp] relay {self.bind}:{self.port}", flush=True)
         print(f"[up] relay v{VERSION} port={self.port} "
               f"token={'set' if self.token else 'open'} "
-              f"streams=v2(per-conn)", flush=True)
+              f"streams=per-conn", flush=True)
         try:
             await srv.serve_forever()
         finally:

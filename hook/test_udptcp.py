@@ -19,7 +19,7 @@ from server import Relay
 from common import (
     T_NODE, T_ASSIGN, T_UDP_TUN, T_UDP_MODE,
     U_GAME_C2S, U_GAME_S2C, U_ICMP_REQ, U_ICMP_REP,
-    encode_node, encode_pdat, encode_udp_game,
+    encode_ctl_node, encode_pdat, encode_udp_game,
     decode_udp_game, decode_icmp, encode_icmp,
     tcp_send, tcp_read,
 )
@@ -53,7 +53,7 @@ async def register_udp(node_id, udp_sock):
     """Plain UDP-mode node (TCP NODE + UDP U_NODE)."""
     port = udp_sock.getsockname()[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(writer, T_NODE, encode_node(b"", node_id, port))
+    await tcp_send(writer, T_NODE, encode_ctl_node(b"", node_id, port))
     from common import encode_udp_node
     loop = asyncio.get_running_loop()
     await loop.sock_sendto(
@@ -84,7 +84,7 @@ class TcpModePeer:
             "127.0.0.1", PUB)
         uport = self.udp.getsockname()[1] if self.udp else 0
         await tcp_send(self.writer, T_NODE,
-                       encode_node(b"", self.node_id, uport))
+                       encode_ctl_node(b"", self.node_id, uport))
         await tcp_send(self.writer, T_UDP_MODE, b"")
         # wait for our ASSIGN (registration committed)
         while True:

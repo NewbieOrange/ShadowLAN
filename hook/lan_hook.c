@@ -65,7 +65,6 @@ static int g_direct = 0;
 static int g_udp_tcp = 0;   /* UDP-over-TCP mode (policy_init, used everywhere) */
 /* hosting claim: set when the local game serves (listen() hook) */
 static volatile int g_claimed = 0;
-static volatile int g_hello_conn = 0; /* hello already sent on this link */
 static unsigned char g_token[256];
 static int g_token_len = 0;
 
@@ -207,16 +206,21 @@ typedef SOCKET DTSOCK;
 /* Control-connection frames (one per hook instance): membership, host
  * claim, discovery beacons, UDP-over-TCP. Game TCP streams are NOT
  * multiplexed here: every fake game TCP connection is its own real TCP
- * connection to the relay (v2, see "per-stream TCP" section below), so a
- * stalled stream can never head-of-line-block beacons or other streams. */
-#define DT_BCAST 0x01
-#define DT_BCAST_FROM 0x02
-#define DT_HELLO 0x20
-#define DT_NODE 0x22
-#define DT_ASSIGN 0x23
-#define DT_UDP_TUN 0x30   /* one UDP-tunnel datagram (UDP-over-TCP mode) */
-#define DT_UDP_MODE 0x31  /* declare UDP-over-TCP mode (empty) */
-/* v2 per-stream ops. Opener dials the relay on a NEW tcp conn, sends
+ * connection to the relay (see "per-stream TCP" section below), so a
+ * stalled stream can never head-of-line-block beacons or other streams.
+ * One contiguous op block; keep in sync with common.py. */
+#define DT_NODE  0x01     /* !H tlen + token + !I node + !H uport + !B flags */
+#define DT_ASSIGN 0x02
+#define DT_BCAST 0x03
+#define DT_BCAST_FROM 0x04
+#define DT_UDP_MODE 0x05  /* declare UDP-over-TCP mode (empty) */
+#define DT_UDP_TUN 0x06   /* one UDP-tunnel datagram (UDP-over-TCP mode) */
+#define DT_NODE_F_HOST 0x01  /* T_NODE flags bit: claim designated-host */
+/* wire protocol version: one leading byte on the TCP registration frames
+ * (DT_NODE). The relay gates there, which transitively gates
+ * every stream routed by the resulting node id. Keep == common.PVER. */
+#define DT_PVER 2
+/* per-stream ops. Opener dials the relay on a NEW tcp conn, sends
  * DT_STOPEN; the relay asks the destination (DT_STREQ on EVERY control
  * link of the dest node -- process-tree identity means sibling processes
  * race to serve); a destination dials the relay on its OWN new tcp conn,
@@ -225,12 +229,12 @@ typedef SOCKET DTSOCK;
  * down before bridging); the winner bridges to its local game and sends
  * DT_STJOINED; the relay confirms DT_STOK to the opener and pipes raw
  * bytes both ways. */
-#define DT_STOPEN 0x40    /* opener->relay: !I node + !I dest_node + !I sid + !H gport */
-#define DT_STREQ  0x41    /* relay->dest (control): !I sid + !H gport */
-#define DT_STJOIN 0x42    /* dest->relay: !I node + !I sid */
-#define DT_STJOINED 0x43  /* dest->relay: !I sid (local bridge up) */
-#define DT_STOK   0x44    /* relay->opener (confirmed) / relay->dest (claim): !I sid */
-#define DT_STFAIL 0x45    /* relay->opener/dest, dest->relay: !I sid + !B reason */
+#define DT_STOPEN 0x07    /* opener->relay: !I node + !I dest_node + !I sid + !H gport */
+#define DT_STREQ  0x08    /* relay->dest (control): !I sid + !H gport */
+#define DT_STJOIN 0x09    /* dest->relay: !I node + !I sid */
+#define DT_STJOINED 0x0A  /* dest->relay: !I sid (local bridge up) */
+#define DT_STOK   0x0B    /* relay->opener (confirmed) / relay->dest (claim): !I sid */
+#define DT_STFAIL 0x0C    /* relay->opener/dest, dest->relay: !I sid + !B reason */
 #define STF_NO_ROUTE 1
 #define STF_JOIN_TIMEOUT 2
 #define STF_HOST_FAILED 3
@@ -241,15 +245,15 @@ typedef SOCKET DTSOCK;
 #define ST_CONNECTING 1
 #define ST_OPEN 2
 #define ST_DEAD 3
+/* UDP tunnel datagram ops: 'V' 'N' DU_VER op payload... (keep in sync
+ * with common.py U_* table) */
+#define DU_VER 2
 #define DU_C2S 0x01
 #define DU_S2C 0x02
-#define DU_HELLO 0x10
-#define DU_NODE 0x11
-#define DU_PDAT 0x12
-#define DU_ICMP_REQ 0x20  /* VN 01 20 | !I src + !I dest + !H id + !H seq + data (0 = relay) */
-#define DU_ICMP_REP 0x21  /* same layout, reply */
-#define DT_UDP_TUN 0x30   /* TCP frame: one UDP-tunnel datagram (UDP-over-TCP mode) */
-#define DT_UDP_MODE 0x31  /* TCP frame: declare UDP-over-TCP mode (empty) */
+#define DU_PDAT 0x03
+#define DU_NODE 0x04      /* !H tlen + token + !I node + !H uport + !B flags */
+#define DU_ICMP_REQ 0x05  /* VN 02 05 | !I src + !I dest + !H id + !H seq + data (0 = relay) */
+#define DU_ICMP_REP 0x06  /* same layout, reply */
 /* virtual-IP membership (assigned by relay per token room) */
 static volatile unsigned g_node = 0;
 static unsigned g_myvirt = 0;      /* numeric, e.g. 0x0AC80002 */
@@ -278,7 +282,7 @@ struct dt_chunk { unsigned char *p; size_t n, off; struct dt_chunk *next; };
 struct dt_dgram { unsigned char *p; size_t n; struct sockaddr_in from; struct dt_dgram *next; };
 struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in orig;
                    struct dt_chunk *h, *t; size_t total; int dead;
-                   /* v2: one real TCP conn to the relay per stream */
+                   /* one real TCP conn to the relay per stream */
                    int state;          /* ST_CONNECTING/ST_OPEN/ST_DEAD */
                    unsigned fail;      /* STF_* when dead via handshake */
                    int in_paused;      /* in-queue full: stop reading relay */
@@ -302,7 +306,7 @@ static volatile int g_have_assign = 0;   /* first ASSIGN (our vnode) seen */
  * Report visibly and terminate the process with a distinct exit code.
  * LAN_HOOK_INIT_TIMEOUT (ms, default 30000, 0 = never fail) bounds how
  * long init waits for the first lease; LAN_HOOK_LEASE_WAIT=0 skips the
- * wait (and the watchdog) entirely for legacy unassigned starts. */
+ * wait (and the watchdog) entirely for unassigned starts. */
 #define SL_FATAL_NORELAY 200  /* relay unreachable (resolve/connect) */
 #define SL_FATAL_NOLEASE 201  /* link up but no virtual-IP lease */
 static volatile int g_init_done = 0;      /* LanHookInit/ensure_init finished */
@@ -560,37 +564,15 @@ static size_t dt_hello_payload(unsigned char *out) {
     if (g_token_len) memcpy(out + 2, g_token, (size_t)g_token_len);
     return (size_t)(2 + g_token_len);
 }
-static void dt_send_hello(void) {
-    unsigned char p[2 + 256];
-    dt_tcp_queue(DT_HELLO, p, dt_hello_payload(p));
-}
-static void dt_send_udp_hello(void) {
-    unsigned char d[4 + 2 + 256];
-    struct sockaddr_in sa;
-    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_HELLO;
-    size_t n = 4 + dt_hello_payload(d + 4);
-    if (dt_resolve(&sa) != 0) return;
-#ifdef LINUX_BUILD
-    dt_reals();
-    int u = g_udptun;
-    if (u >= 0) r_sendto(u, d, n, 0, (struct sockaddr *)&sa, sizeof(sa));
-#else
-    DTSOCK u = g_udptun;
-    if (u != INVALID_SOCKET) sendto(u, (const char *)d, (int)n, 0, (struct sockaddr *)&sa, sizeof(sa));
-#endif
-}
 /* Called when the local game starts serving: claim designated-host. */
+static void dt_send_node(void);      /* defined below (payload builders) */
+static void dt_send_udp_node(void);
 static void dt_claim(void) {
-    if (!g_direct) return;
+    if (!g_direct || g_claimed) return;
     g_claimed = 1;
-    DLOCK();
-    int need = !g_hello_conn;
-    if (need) g_hello_conn = 1;
-    DUNLOCK();
-    if (!need) return;  /* current link already hello'd */
     dlog("hosting claim: game serves locally");
-    dt_send_hello();      /* queued; flushes on (re)connect */
-    dt_send_udp_hello();  /* best-effort now; 15s tick refreshes */
+    dt_send_node();      /* re-register with NODE_F_HOST (queued) */
+    dt_send_udp_node();  /* best-effort UDP claim now too */
 }
 static int dt_tun_udp_port(void) {
 #ifdef LINUX_BUILD
@@ -605,8 +587,10 @@ static int dt_tun_udp_port(void) {
     return ntohs(a.sin_port);
 }
 static void dt_send_node(void) {
-    unsigned char p[2 + 256 + 6];
-    size_t h = dt_hello_payload(p);
+    unsigned char p[3 + 256 + 8];
+    size_t h;
+    p[0] = DT_PVER;
+    h = 1 + dt_hello_payload(p + 1);
     p[h] = (unsigned char)((g_node >> 24) & 255);
     p[h + 1] = (unsigned char)((g_node >> 16) & 255);
     p[h + 2] = (unsigned char)((g_node >> 8) & 255);
@@ -616,12 +600,13 @@ static void dt_send_node(void) {
         p[h + 4] = (unsigned char)((pt >> 8) & 255);
         p[h + 5] = (unsigned char)(pt & 255);
     }
-    dt_tcp_queue(DT_NODE, p, h + 6);
+    p[h + 6] = (unsigned char)(g_claimed ? DT_NODE_F_HOST : 0);
+    dt_tcp_queue(DT_NODE, p, h + 7);
 }
 static void dt_send_udp_node(void) {
-    unsigned char d[4 + 2 + 256 + 6];
+    unsigned char d[4 + 2 + 256 + 8];
     struct sockaddr_in sa;
-    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_NODE;
+    d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_NODE;
     size_t h = dt_hello_payload(d + 4);
     d[4 + h] = (unsigned char)((g_node >> 24) & 255);
     d[5 + h] = (unsigned char)((g_node >> 16) & 255);
@@ -632,7 +617,8 @@ static void dt_send_udp_node(void) {
         d[8 + h] = (unsigned char)((pt >> 8) & 255);
         d[9 + h] = (unsigned char)(pt & 255);
     }
-    size_t n = 4 + h + 6;
+    d[10 + h] = (unsigned char)(g_claimed ? DT_NODE_F_HOST : 0);
+    size_t n = 4 + h + 7;
     if (dt_resolve(&sa) != 0) return;
 #ifdef LINUX_BUILD
     dt_reals();
@@ -715,7 +701,7 @@ static unsigned dt_node_virt(unsigned node) {
 struct dt_hosted {
     int used; unsigned sid;
     DTSOCK real;          /* local loopback bridge to the game */
-    DTSOCK fd;            /* v2: per-stream TCP to the relay */
+    DTSOCK fd;            /* per-stream TCP to the relay */
     int live;             /* bridge up (STJOINED sent) */
     long long last;       /* last activity (pending sweep) */
     int dead;
@@ -744,14 +730,14 @@ static struct dt_hosted *dt_hs_by_sid(unsigned sid) {
         if (g_hs[i].used && g_hs[i].sid == sid) return &g_hs[i];
     return NULL;
 }
-static void dt_hs_close(unsigned sid, int keep_real) {
+static void dt_hs_close(unsigned sid) {
     struct dt_hosted hcp; int have = 0;
     DLOCK();
     struct dt_hosted *h = dt_hs_by_sid(sid);
     if (h) { hcp = *h; have = 1; h->used = 0; h->real = DTSOCK_BAD; h->fd = DTSOCK_BAD; }
     DUNLOCK();
     if (!have) return;
-    if (!keep_real && hcp.real != DTSOCK_BAD) {
+    if (hcp.real != DTSOCK_BAD) {
 #ifdef LINUX_BUILD
         dt_reals();
         if (hcp.real >= 0) r_close(hcp.real);
@@ -1184,7 +1170,7 @@ static void dt_dispatch_bcast(int port, int sport, const unsigned char *raw, siz
     dt_dispatch_bcast_from(0, port, sport, raw, n);
 }
 
-/* ---- v2 per-stream TCP ------------------------------------------------
+/* ---- per-stream TCP ------------------------------------------------
  * Every fake game TCP connection is one REAL tcp connection to the
  * relay, opened by THIS process (NAT-safe: both ends dial out). The
  * relay pipes raw bytes between the two per-stream connections, so a
@@ -1692,7 +1678,7 @@ static void dt_on_streq(unsigned sid, int gport) {
                (unsigned)current_pid(), sid, gport);
       dlog(lb); }
     struct { unsigned sid; int gport; } *a = (typeof(a))malloc(sizeof(*a));
-    if (!a) { dt_hs_close(sid, 0); return; }
+    if (!a) { dt_hs_close(sid); return; }
     a->sid = sid; a->gport = gport;
     dt_st_spawn(dt_join_thread, a);
 }
@@ -1711,7 +1697,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         snprintf(lb, sizeof(lb), "hosted join fail pid=%u sid=%u relay dial",
                  (unsigned)current_pid(), sid);
         dlog(lb);
-        dt_hs_close(sid, 0);
+        dt_hs_close(sid);
         return 0;
     }
     {
@@ -1719,7 +1705,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         dt_put32(p, g_node); dt_put32(p + 4, sid);
         if (dt_st_send_frame(fd, DT_STJOIN, p, 8) != 0) {
             dt_st_close_fd(fd);
-            dt_hs_close(sid, 0);
+            dt_hs_close(sid);
             return 0;
         }
         /* claim verdict: the relay answers STJOIN on this connection
@@ -1737,7 +1723,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                          (unsigned)current_pid(), sid);
                 dlog(lb);
                 dt_st_close_fd(fd);
-                dt_hs_close(sid, 0);
+                dt_hs_close(sid);
                 return 0;
             }
         }
@@ -1757,14 +1743,14 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                      (unsigned)current_pid(), sid, gport);
             dlog(lb);
             dt_st_close_fd(fd);
-            dt_hs_close(sid, 0);
+            dt_hs_close(sid);
             return 0;
         }
         unsigned char q[4];
         dt_put32(q, sid);
         if (dt_st_send_frame(fd, DT_STJOINED, q, 4) != 0) {
             dt_st_close_fd(fd);
-            dt_hs_close(sid, 0);
+            dt_hs_close(sid);
             return 0;
         }
         DLOCK();
@@ -1786,7 +1772,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
     struct dt_hosted *h0 = dt_hs_by_sid(sid);
     if (h0) real = h0->real;
     DUNLOCK();
-    if (real == DTSOCK_BAD) { dt_st_close_fd(fd); dt_hs_close(sid, 0); return 0; }
+    if (real == DTSOCK_BAD) { dt_st_close_fd(fd); dt_hs_close(sid); return 0; }
     for (;;) {
         if (!g_tun_run) break;
         DLOCK();
@@ -1868,7 +1854,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                (unsigned)current_pid(), sid,
                (unsigned long long)in0, (unsigned long long)out0);
       dlog(lb); }
-    dt_hs_close(sid, 0);
+    dt_hs_close(sid);
     return 0;
 }
 
@@ -1919,17 +1905,12 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
         { char lb[96];
           snprintf(lb, sizeof(lb), "tunnel TCP up pid=%u", (unsigned)current_pid());
           dlog(lb); }
-        DLOCK();
-        int need_hello = g_claimed && !g_hello_conn;
-        if (need_hello) g_hello_conn = 1;
-        DUNLOCK();
-        if (need_hello) dt_send_hello(); /* reclaim after redial, once */
-        dt_send_node(); /* (re)register membership + UDP endpoint */
+        dt_send_node(); /* (re)register membership + UDP endpoint (+host flag) */
         if (g_udp_tcp) {
             unsigned char z = 0;
             dt_tcp_queue(DT_UDP_MODE, &z, 0); /* declare UDP-over-TCP mode */
         }
-        /* v2: game TCP streams run on their own relay connections and
+        /* game TCP streams run on their own relay connections and
          * survive control redials; nothing to re-announce here. */
         for (;;) {
             if (!g_tun_run) break;
@@ -1993,7 +1974,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
             } else if (t == DT_ASSIGN && ml >= 2) {
                 dt_apply_assign(pl + 1, ml - 1);
             } else if (t == DT_STREQ && ml >= 7) {
-                /* v2: another player is joining OUR game. Serve it on a
+                /* another player is joining OUR game. Serve it on a
                  * dedicated per-stream relay connection (join thread);
                  * stream data never transits this control link. */
                 unsigned sid = dt_get32(pl + 1);
@@ -2007,7 +1988,6 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
         }
 redial:
         g_tcp_up = 0;
-        g_hello_conn = 0; /* next link re-hellos once */
         { char lb[96];
           snprintf(lb, sizeof(lb), "tunnel TCP redial pid=%u", (unsigned)current_pid());
           dlog(lb); }
@@ -2119,7 +2099,7 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
             {
                 /* hosted UDP: game -> tunnel (only our game talks here).
                  * Hosted TCP data flows on per-stream relay connections
-                 * (v2) and is served by the join threads, not here. */
+                 * and is served by the join threads, not here. */
 #ifdef LINUX_BUILD
                 ssize_t n = r_recv((int)fds[i].fd, buf, sizeof(buf), 0);
 #else
@@ -2139,7 +2119,7 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
                 size_t pktn = 4 + 2 + 2 + (size_t)ml + 2 + (size_t)n;
                 unsigned char *d = (unsigned char *)malloc(pktn);
                 if (!d) continue;
-                d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_S2C;
+                d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_S2C;
                 dt_put16(d + 4, (unsigned)fds[i].gport);
                 dt_put16(d + 6, (unsigned)ml);
                 memcpy(d + 8, mip, (size_t)ml);
@@ -2176,7 +2156,7 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
  * addressed game/ICMP traffic for our sockets. Shared by the UDP
  * thread and the TCP thread (UDP-over-TCP mode). */
 static void dt_udp_ingress(const unsigned char *buf, size_t n) {
-    if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) return;
+    if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != DU_VER) return;
     { char lb[80]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d pid=%u", buf[3], (int)n, (unsigned)current_pid()); dlog(lb); }
     if (buf[3] == DU_C2S) {
         /* inbound: another player targets OUR hosted game */
@@ -2253,11 +2233,6 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
                 dt_send_udp_node();  /* UDP: refresh NAT mapping */
             }
         }
-        {
-            static long long last_hb = 0;
-            long long nowhb = dt_now_ms();
-            if (g_claimed && nowhb - last_hb > 15000) { last_hb = nowhb; dt_send_udp_hello(); }
-        }
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         struct timeval tv = {0, 200000};
         int r = select(s + 1, &rf, NULL, NULL, &tv);
@@ -2290,11 +2265,6 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
                 dt_send_node();      /* TCP: membership + UDP endpoint */
                 dt_send_udp_node();  /* UDP: refresh NAT mapping */
             }
-        }
-        {
-            static long long last_hb = 0;
-            long long nowhb = dt_now_ms();
-            if (g_claimed && nowhb - last_hb > 15000) { last_hb = nowhb; dt_send_udp_hello(); }
         }
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
@@ -2419,7 +2389,7 @@ static void dt_start(void) {
      *
      * A missing lease is fatal (see dt_fatal): without it the tunnel
      * cannot work. LAN_HOOK_LEASE_WAIT=0 skips the wait AND the
-     * watchdog for legacy unassigned starts. */
+     * watchdog for unassigned starts. */
     {
         /* Default 3000ms: fail fast on a dead relay instead of hanging
          * the game startup. N>=0 caps the wait here; LAN_HOOK_LEASE_WAIT
@@ -2784,7 +2754,7 @@ static void dt_icmp_send_req(unsigned dest, unsigned id, unsigned seq,
     size_t n = 4 + 4 + 4 + 2 + 2 + dlen;
     unsigned char *d = (unsigned char *)malloc(n ? n : 1);
     if (!d) return;
-    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_ICMP_REQ;
+    d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_ICMP_REQ;
     dt_put32(d + 4, g_node);
     dt_put32(d + 8, dest);
     dt_put16(d + 12, id); dt_put16(d + 14, seq);
@@ -2865,7 +2835,7 @@ static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
         n = 4 + 4 + 4 + 2 + 2 + dlen;
         d = (unsigned char *)malloc(n ? n : 1);
         if (!d) return;
-        d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_ICMP_REP;
+        d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_ICMP_REP;
         dt_put32(d + 4, g_node);
         dt_put32(d + 8, src);
         dt_put16(d + 12, id); dt_put16(d + 14, seq);
@@ -2949,7 +2919,7 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         size_t n = 4 + 4 + 2 + 2 + (size_t)ml + 2 + len;
         unsigned char *d = (unsigned char *)malloc(n);
         if (!d) return 1;
-        d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_PDAT;
+        d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_PDAT;
         dt_put32(d + 4, vnode);
         dt_put16(d + 8, (unsigned)game_port); dt_put16(d + 10, (unsigned)ml);
         memcpy(d + 12, mip, (size_t)ml); dt_put16(d + 12 + ml, (unsigned)mark);
@@ -3007,14 +2977,14 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     int slot = sl ? (int)(sl - g_sl) : -1;
     DUNLOCK();
     if (slot < 0) { dlog("udp game: slot table full"); return 1; } /* table full: drop, pretend sent */
-    /* build U_GAME_C2S: VN 01 01 | H game | H iplen | ip | H mark | raw */
+    /* build U_GAME_C2S: VN 02 01 | H game | H iplen | ip | H mark | raw */
     char srcip2[32]; const char *mip = "127.0.0.1"; int ml = 9;
     if (dt_src_ip(srcip2, sizeof(srcip2))) { mip = srcip2; ml = (int)strlen(srcip2); }
     int mark = 50000 + slot;
     size_t n = 4 + 2 + 2 + (size_t)ml + 2 + len;
     unsigned char *d = (unsigned char *)malloc(n);
     if (!d) return 1;
-    d[0] = 'V'; d[1] = 'N'; d[2] = 1; d[3] = DU_C2S;
+    d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_C2S;
     dt_put16(d + 4, (unsigned)game_port); dt_put16(d + 6, (unsigned)ml);
     memcpy(d + 8, mip, (size_t)ml); dt_put16(d + 8 + ml, (unsigned)mark);
     if (len) memcpy(d + 10 + ml, buf, len);
@@ -3048,7 +3018,7 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
 /* Outbound connect routing. Virtual peer IP -> addressed stream (dest
  * node); other LAN target -> implicit stream (relay routes to the
  * designated host / newest beaconer). Each becomes its own real TCP
- * connection to the relay (v2). Returns 1 when consumed, 2 when the
+ * connection to the relay. Returns 1 when consumed, 2 when the
  * socket already has a live stream (WSAEALREADY), else 0 (real stack). */
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */

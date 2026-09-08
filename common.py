@@ -1,11 +1,11 @@
 """Shared framing + socket helpers. Stdlib only, Windows + Linux.
 
-Protocol v2 (1.2.0): game TCP streams no longer multiplex over the control
-TCP. Each fake game TCP connection is ONE real TCP connection to the relay,
-opened by the hook/client itself (NAT-safe: both ends dial out). The relay
-pipes raw bytes between the two per-stream connections. The control TCP
-carries only membership, host claim, discovery beacons and (UDP-over-TCP)
-game datagrams.
+Game TCP streams do not multiplex over the control TCP: each fake game
+TCP connection is ONE real TCP connection to the relay, opened by the
+hook/client itself (NAT-safe: both ends dial out). The relay pipes raw
+bytes between the two per-stream connections. The control TCP carries
+only registration (membership + role flags), discovery beacons and
+(UDP-over-TCP) game datagrams.
 """
 import asyncio
 import socket
@@ -15,14 +15,20 @@ import struct
 HDR = struct.Struct("!I")
 VERSION = "1.1.0"
 
-# ---- control-connection ops ---------------------------------------------
-T_BCAST = 0x01        # payload: !H disc_port + !H src_port + raw (unattributed)
-T_BCAST_FROM = 0x02   # relay->peer: !I src_node + !H disc_port + !H src_port + raw
-T_HELLO = 0x20        # payload: !H token_len + token (designated-host claim)
-T_NODE = 0x22         # payload: !H tlen + token + !I node_id + !H udp_port
-T_ASSIGN = 0x23       # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
-T_UDP_TUN = 0x30      # TCP frame carrying one UDP-tunnel datagram (UDP-over-TCP mode)
-T_UDP_MODE = 0x31     # declare UDP-over-TCP mode for this link (empty payload)
+# ---- control-connection ops (one contiguous block) ----------------------
+# Registration is a SINGLE frame: identity (node id), reachability (UDP
+# endpoint) and role (host claim flag). There is no separate "hello":
+# a claim without identity would be unroutable, and claims refresh with
+# the keepalives anyway.
+T_NODE = 0x01        # payload: !H tlen + token + !I node_id + !H udp_port + !B flags
+T_ASSIGN = 0x02      # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
+T_BCAST = 0x03       # payload: !H disc_port + !H src_port + raw (unattributed)
+T_BCAST_FROM = 0x04  # relay->peer: !I src_node + !H disc_port + !H src_port + raw
+T_UDP_MODE = 0x05    # declare UDP-over-TCP mode for this link (empty payload)
+T_UDP_TUN = 0x06     # TCP frame carrying one UDP-tunnel datagram (UDP-over-TCP mode)
+
+# T_NODE/U_NODE flags bits:
+NODE_F_HOST = 0x01   # this node hosts a game: claim designated-host
 
 # ---- per-stream TCP ops (first frame(s) of a stream connection) ----------
 # opener dials the relay, sends T_STOPEN; the relay asks the destination
@@ -33,28 +39,33 @@ T_UDP_MODE = 0x31     # declare UDP-over-TCP mode for this link (empty payload)
 # (STF_BUSY) = a sibling already claimed, stand down WITHOUT bridging.
 # The winner bridges to its local game and sends T_STJOINED; the relay
 # then replies T_STOK to the opener and pipes raw bytes both ways.
-T_STOPEN = 0x40   # opener->relay (per-stream TCP): !I node + !I dest_node + !I sid + !H gport
-T_STREQ = 0x41    # relay->dest (control TCP): !I sid + !H gport
-T_STJOIN = 0x42   # dest->relay (per-stream TCP): !I node + !I sid
-T_STJOINED = 0x43 # dest->relay (per-stream TCP, local bridge up): !I sid
-T_STOK = 0x44     # relay->opener / relay->joinee (claim): !I sid
-T_STFAIL = 0x45   # relay->opener/joinee or dest->relay: !I sid + !B reason
+T_STOPEN = 0x07   # opener->relay (per-stream TCP): !I node + !I dest_node + !I sid + !H gport
+T_STREQ = 0x08    # relay->dest (control TCP): !I sid + !H gport
+T_STJOIN = 0x09   # dest->relay (per-stream TCP): !I node + !I sid
+T_STJOINED = 0x0A # dest->relay (per-stream TCP, local bridge up): !I sid
+T_STOK = 0x0B     # relay->opener / relay->joinee (claim): !I sid
+T_STFAIL = 0x0C   # relay->opener/joinee or dest->relay: !I sid + !B reason
 STF_NO_ROUTE = 1  # destination node unknown / not connected / no host for port
 STF_JOIN_TIMEOUT = 2  # destination never joined in time
 STF_HOST_FAILED = 3  # destination could not reach its local game
 STF_BAD_ID = 4    # joining node is not the stream's destination
 STF_BUSY = 5      # stream id already in use
 
-# UDP tunnel datagrams: MAGIC + VER + TYPE + payload
+# Wire protocol version. Checked ONCE per node, at registration: the
+# relay only assigns a vnode from T_NODE, and every later frame on the
+# link plus every per-stream connection is routed by that node id -- so
+# gating registration gates the whole session. UDP frames are
+# connectionless and self-describing, so they carry UVER in every
+# datagram header instead.
+PVER = 0x02
 UMAGIC = b"VN"
-UVER = 0x01
+UVER = PVER
 U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
-U_GAME_P2P = 0x12  # payload: !I dest_node + std triple+raw
-U_ICMP_REQ = 0x20  # payload: !I src_node + !I dest_node + !H id + !H seq + data (0 = relay)
-U_ICMP_REP = 0x21  # same layout, reply
-U_HELLO_HOST = 0x10  # payload: !H token_len + token (host UDP heartbeat)
-U_NODE = 0x11        # payload: !H tlen + token + !I node_id + !H udp_port
+U_GAME_P2P = 0x03  # payload: !I dest_node + std triple+raw
+U_NODE = 0x04        # payload: !H tlen + token + !I node_id + !H udp_port + !B flags
+U_ICMP_REQ = 0x05  # payload: !I src_node + !I dest_node + !H id + !H seq + data (0 = relay)
+U_ICMP_REP = 0x06  # same layout, reply
 # game payload both dirs: !H game_port + !H iplen + ip + !H port + raw
 
 # stream handshake budget (both sides + relay)
@@ -134,58 +145,43 @@ def decode_udp_game(data):
     return mtype, game_port, ip, cport, raw
 
 
-def encode_hello(token: bytes) -> bytes:
-    return struct.pack("!H", len(token)) + token
-
-
-def decode_hello(payload: bytes):
-    """TCP HELLO frame payload -> token bytes, or None if malformed."""
-    try:
-        if len(payload) < 2:
-            return None
-        (n,) = struct.unpack("!H", payload[:2])
-        if len(payload) != 2 + n:
-            return None
-        return payload[2:]
-    except struct.error:
-        return None
-
-
-def encode_udp_hello(token: bytes) -> bytes:
-    return UMAGIC + bytes([UVER, U_HELLO_HOST]) + encode_hello(token)
-
-
-def decode_udp_hello(data):
-    """Full UDP HELLO datagram -> token bytes, or None."""
-    if len(data) < 6 or data[:2] != UMAGIC or data[2] != UVER:
-        return None
-    if data[3] != U_HELLO_HOST:
-        return None
-    return decode_hello(data[4:])
-
-
-def encode_node(token: bytes, node: int, udp_port: int) -> bytes:
+def encode_node(token: bytes, node: int, udp_port: int, flags: int = 0) -> bytes:
     return struct.pack("!H", len(token)) + token \
-        + struct.pack("!IH", node & 0xFFFFFFFF, udp_port & 0xFFFF)
+        + struct.pack("!IHB", node & 0xFFFFFFFF, udp_port & 0xFFFF, flags & 0xFF)
 
 
 def decode_node(payload: bytes):
-    """T_NODE / U_NODE payload -> (token, node_id, udp_port) or None."""
+    """T_NODE / U_NODE payload -> (token, node_id, udp_port, flags) or None."""
     try:
         if len(payload) < 2:
             return None
         (n,) = struct.unpack("!H", payload[:2])
-        if len(payload) != 2 + n + 6:
+        if len(payload) != 2 + n + 7:
             return None
         token = payload[2:2 + n]
-        node, uport = struct.unpack("!IH", payload[2 + n:8 + n])
-        return token, node, uport
+        node, uport, flags = struct.unpack("!IHB", payload[2 + n:9 + n])
+        return token, node, uport, flags
     except struct.error:
         return None
 
 
-def encode_udp_node(token: bytes, node: int, udp_port: int) -> bytes:
-    return UMAGIC + bytes([UVER, U_NODE]) + encode_node(token, node, udp_port)
+# ---- TCP control registration frame: body + 1-byte leading protocol
+# version (PVER). UDP carries UVER in the datagram header instead. ----
+
+def ctl_ver(payload: bytes) -> int:
+    return payload[0] if payload else 0
+
+
+def encode_ctl_node(token: bytes, node: int, udp_port: int, flags: int = 0) -> bytes:
+    return bytes([PVER]) + encode_node(token, node, udp_port, flags)
+
+
+def decode_ctl_node(payload: bytes):
+    return decode_node(payload[1:]) if ctl_ver(payload) == PVER else None
+
+
+def encode_udp_node(token: bytes, node: int, udp_port: int, flags: int = 0) -> bytes:
+    return UMAGIC + bytes([UVER, U_NODE]) + encode_node(token, node, udp_port, flags)
 
 
 def decode_udp_node(data):

@@ -26,7 +26,7 @@ from common import (
     T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN,
     U_GAME_C2S, U_GAME_S2C,
     U_ICMP_REQ, U_ICMP_REP,
-    encode_node, encode_pdat, encode_udp_game,
+    encode_ctl_node, encode_pdat, encode_udp_game,
     decode_udp_game, decode_icmp, encode_icmp,
     tcp_send, tcp_read,
 )
@@ -59,7 +59,7 @@ async def expect_silence(loop, sock, timeout=0.7):
 async def register_node(node_id, udp_sock):
     port = udp_sock.getsockname()[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", PUB)
-    await tcp_send(writer, T_NODE, encode_node(b"", node_id, port))
+    await tcp_send(writer, T_NODE, encode_ctl_node(b"", node_id, port))
     from common import encode_udp_node
     loop = asyncio.get_running_loop()
     await loop.sock_sendto(
