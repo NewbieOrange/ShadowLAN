@@ -18,6 +18,33 @@ is a pure passthrough. One source builds both the Windows DLL and the Linux
   sources with the sender's virtual IP, so each peer looks like its own
   machine on the same LAN.
 
+## TCP streams (v1.2.0 protocol)
+
+Every fake game TCP connection is ONE real TCP connection to the relay
+opened by the process itself (both peers dial out, so NATs never block a
+stream; no driver, no inbound ports). The control connection carries only
+membership, beacons and UDP-over-TCP datagrams, so a stalled stream can
+never head-of-line-block discovery or other streams.
+
+- `connect()` to a vnet/LAN address only returns success after the relay
+  confirms the destination actually bridged the stream to its local game
+  (STOPEN → STREQ → STJOIN → claim → STJOINED → STOK, 10s budget). With
+  a shared process-tree identity the STREQ goes to every sibling and the
+  relay answers each JOIN with a claim (`OK`/`BUSY`) before anything
+  touches the local game port. Nonblocking
+  sockets get `WSAEWOULDBLOCK` + a later `FD_CONNECT`/writable, like a
+  real in-flight connect; a refused/unreachable target fails the connect
+  with `WSAECONNREFUSED`/`WSAETIMEDOUT`.
+- After the handshake, bytes pipe raw on the per-stream TCP with kernel
+  backpressure both ways (full relay buffer blocks the sender; the local
+  game not reading backpressures the relay). UDP hook queues drop the NEW
+  datagram when full, like a real UDP rx buffer.
+- The process's vnet IP is also exposed as a standalone pseudo-adapter
+  ("ShadowLAN Virtual Interface", up, /24) in `GetAdaptersAddresses`/
+  `GetAdaptersInfo`, so apps that compute per-interface broadcast ranges
+  or sanity-check peers against local subnets see the vnet exactly like a
+  real LAN interface.
+
 ## Covered calls
 
 `sendto`, `WSASendTo`, `recvfrom`, `WSARecvFrom` (sync), `connect`,
@@ -40,6 +67,12 @@ answers at `.1` of the subnet and routes peer pings by node; self-pings
 and subnet-broadcast pings are answered locally, and the relay never
 echoes a packet back to its sender — loopback is always client-side,
 exactly like a NIC.
+Unfriendly NAT? `LAN_HOOK_UDP_OVER_TCP=1` (injector `--udp-over-tcp`) sends game
+datagrams over the existing TCP link instead of inbound UDP (UDP
+keepalives still go out so the relay keeps a fresh return mapping).
+Opt-in per peer; mixed rooms interoperate; costs head-of-line blocking of
+those datagrams (TCP streams are unaffected — they ride their own
+connections), so leave it off when plain UDP works.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
@@ -68,9 +101,10 @@ ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
 `LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these),
 `LAN_HOOK_CHILDREN=lobby.exe,game.exe` (inject only these children, empty =
 all), `LAN_HOOK_NOCHILD=1` (never inject children),
-`LAN_HOOK_TUNNEL_PORT=47584` (bind the tunnel UDP socket to that port too,
-so host-firewall program rules earned by the game also cover the tunnel;
-one hooked process per machine), `LAN_HOOK_LEASE_WAIT=3000` (game startup
+`LAN_HOOK_NODE=709102507` (force a node id — the hook sets this in its own
+environment automatically, so children inherit one identity per process
+tree; set it manually to merge separate launches into one virtual host),
+`LAN_HOOK_LEASE_WAIT=3000` (game startup
 waits up to N ms until the relay grants our address lease — installing means
 playing *on* ShadowLAN; `0` skips the wait, `-1` waits indefinitely.
 A missing lease is fatal: messagebox (Windows) or stderr (Linux) and the
@@ -85,6 +119,31 @@ injected, initialized and resumed automatically — env included, so the
 room config carries over. Same-bitness only; failures launch unhooked
 rather than breaking the game. (On Linux this is free: `LD_PRELOAD` is
 inherited — covered by a local parent-spawns-sender inheritance test.)
+
+## Process-tree identity (one vnode per tree)
+
+The whole tree shares **one virtual IP**: the first hooked process picks
+a node id, publishes it into its own environment (`LAN_HOOK_NODE`), and
+every descendant inherits it — the relay then keeps one node with one
+vnode and a list of live links, fanning beacons, memberships and stream
+requests to all of them. There is deliberately no "who is last"
+bookkeeping: the identity's lifetime is the environment copy the kernel
+already manages per process tree (Windows `CreateProcess` copies it; on
+Linux `execve` inherits it), just like a kernel-created file mapping
+dies with its last handle. Consequences you can rely on:
+
+- a launcher self-restart chain (e.g. GBE's `RestartAppIfNecessary`)
+  keeps the same vnode across the restart;
+- tool + game on one PC are one "machine" to peers (distinct apps are
+  still distinct GBE/steamid connections — exactly like real LAN);
+- a process started with a fresh environment (double-clicked, different
+  service) is a different machine — unrelated instances stay separate.
+
+`LAN_HOOK_NODE=709102507` forces an id (merge separate launches into one
+host if you ever need to). Inbound streams to a shared node are claimed
+first-come: every sibling gets the request, the one whose local game
+actually listens bridges it, the others stand down (relay answers the
+JOIN claim `OK`/`BUSY` before anyone touches the local port).
 
 ## Troubleshooting
 
