@@ -31,7 +31,7 @@ print("SURVIVED", flush=True)
 """
 
 
-def run_child(env_extra, timeout=20):
+def run_child(env_extra, timeout=12):
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(CHILD)
         path = f.name
@@ -60,7 +60,8 @@ def test_norelay():
     port = free_port()
     r = run_child({"LAN_HOOK_SERVER": "127.0.0.1",
                    "LAN_HOOK_PORT": str(port),
-                   "LAN_HOOK_INIT_TIMEOUT": "2500"})
+                   "LAN_HOOK_LEASE_WAIT": "900",
+                   "LAN_HOOK_INIT_TIMEOUT": "900"})
     assert r.returncode == 200, (r.returncode, r.stderr[-500:], r.stdout)
     assert "cannot reach relay" in r.stderr, r.stderr[-500:]
     assert "SURVIVED" not in r.stdout
@@ -103,7 +104,8 @@ def test_nolease():
     try:
         r = run_child({"LAN_HOOK_SERVER": "127.0.0.1",
                        "LAN_HOOK_PORT": str(port),
-                       "LAN_HOOK_INIT_TIMEOUT": "2500"})
+                       "LAN_HOOK_LEASE_WAIT": "900",
+                       "LAN_HOOK_INIT_TIMEOUT": "900"})
     finally:
         stop.set()
         srv.close()
@@ -131,7 +133,7 @@ def test_healthy_relay():
     env["LAN_HOOK_LEASE_WAIT"] = "8000"
 
     async def amain():
-        relay = Relay(47811)
+        relay = Relay(47811, bind="127.0.0.1")
         task = asyncio.create_task(relay.run())
         await asyncio.sleep(0.2)
         try:
@@ -141,7 +143,7 @@ def test_healthy_relay():
                 sys.executable, path, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env)
             try:
-                out, err = await asyncio.wait_for(proc.communicate(), 25)
+                out, err = await asyncio.wait_for(proc.communicate(), 12)
             except asyncio.TimeoutError:
                 proc.kill()
                 raise AssertionError("healthy child hung")

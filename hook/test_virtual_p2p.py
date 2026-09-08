@@ -27,7 +27,7 @@ def hook_env():
 
 
 async def main():
-    relay_task = asyncio.create_task(Relay(PUB).run())
+    relay_task = asyncio.create_task(Relay(PUB, bind="127.0.0.1").run())
     await asyncio.sleep(0.3)
 
     proc_a = await asyncio.create_subprocess_exec(
@@ -73,5 +73,12 @@ async def main():
     await asyncio.gather(relay_task, return_exceptions=True)
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())

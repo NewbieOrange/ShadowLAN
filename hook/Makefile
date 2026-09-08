@@ -20,7 +20,15 @@ test: lan_hook.so
 	python3 test_direct.py
 	python3 test_virtual_p2p.py
 	python3 test_childprop.py
+	python3 test_treeid.py
 	python3 test_perdest.py
+	python3 test_noloop.py
+	python3 test_udptcp.py
+	python3 test_fatal.py
+	python3 test_icmp.py
+
+test-all: test
+	SHADOWLAN_WINEPREFIX=~/.wine python3 test_late.py
 
 clean:
 	rm -f lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so

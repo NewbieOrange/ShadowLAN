@@ -21,11 +21,16 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #else
@@ -49,11 +54,15 @@
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
 #define SHADOWLAN_VERSION "1.1.0"
+static long long dt_now_ms(void);
+static void dt_stamp(char *out, size_t n);
+static void dt_fatal(int code, const char *msg);
 static int g_debug = 0;
 /* direct-tunnel mode: hook dials server itself (no wclient.py needed) */
 static char g_server[256] = {0};
 static int g_srvport = 47777;
 static int g_direct = 0;
+static int g_udp_tcp = 0;   /* UDP-over-TCP mode (policy_init, used everywhere) */
 /* hosting claim: set when the local game serves (listen() hook) */
 static volatile int g_claimed = 0;
 static volatile int g_hello_conn = 0; /* hello already sent on this link */
@@ -82,8 +91,64 @@ static void policy_init(void) {
         if (pp && pp[0]) { int v = atoi(pp); if (v > 0 && v < 65536) g_srvport = v; }
         g_direct = 1;
     }
+    {
+        /* UDP-over-TCP (unfriendly NAT): game datagrams ride the TCP
+         * link; UDP keepalives still go out so the relay keeps a fresh
+         * return mapping. LAN_HOOK_UDP_OVER_TCP=1 (or injector --udp-over-tcp). */
+        const char *ut = getenv("LAN_HOOK_UDP_OVER_TCP");
+        g_udp_tcp = (ut && ut[0] && ut[0] != '0') ? 1 : 0;
+    }
 }
 
+#ifndef LINUX_BUILD
+static void flog(const char *m);         /* defined below in Windows section */
+#endif
+/* One-line startup census of every option (set or default): makes
+ * "which build/flags actually ran?" answerable from the log alone. */
+static void dt_log_options(void) {
+    char lb[1024];
+    const char *e;
+    long lease = 3000, ito = 30000;
+    if ((e = getenv("LAN_HOOK_LEASE_WAIT")) && e[0]) {
+        long long v = atoll(e);
+        lease = (v == 0) ? 0 : (v < 0 ? -1 : (v > 600000 ? 600000 : v));
+    }
+    if ((e = getenv("LAN_HOOK_INIT_TIMEOUT")) && e[0]) {
+        long long v = atoll(e);
+        ito = (v < 0) ? -1 : (v > 600000 ? 600000 : v);
+    }
+    snprintf(lb, sizeof(lb),
+             "options v%s pid=%u server=%s port=%d token=%s ports=%s debug=%d "
+             "node=%s lease_wait=%ld init_timeout=%ld udp_over_tcp=%d "
+             "modules=%s children=%s nochild=%s logfile=%s",
+             SHADOWLAN_VERSION,
+#ifdef LINUX_BUILD
+             (unsigned)getpid(),
+#else
+             (unsigned)GetCurrentProcessId(),
+#endif
+             g_server[0] ? g_server : "(unset)", g_srvport,
+             g_token_len ? "set" : "(unset)",
+             getenv("LAN_HOOK_PORTS") ? getenv("LAN_HOOK_PORTS") : "(all)",
+             g_debug,
+             getenv("LAN_HOOK_NODE") ? getenv("LAN_HOOK_NODE") : "(gen)",
+             lease, ito, g_udp_tcp,
+             getenv("LAN_HOOK_MODULES") ? getenv("LAN_HOOK_MODULES") : "(all)",
+             getenv("LAN_HOOK_CHILDREN") ? getenv("LAN_HOOK_CHILDREN") : "(all)",
+             getenv("LAN_HOOK_NOCHILD") ? getenv("LAN_HOOK_NOCHILD") : "0",
+             getenv("LAN_HOOK_LOGFILE") ? getenv("LAN_HOOK_LOGFILE") : "(debugview)");
+    lb[sizeof(lb) - 1] = 0;
+    /* Unconditional (not gated on debug): the point is answering
+     * "which flags actually ran?" from any log. */
+#ifdef LINUX_BUILD
+    { char ts[32]; dt_stamp(ts, sizeof(ts)); fprintf(stderr, "[%s lan_hook] %s\n", ts, lb); }
+#else
+    OutputDebugStringA("lan_hook: ");
+    OutputDebugStringA(lb);
+    OutputDebugStringA("\n");
+    flog(lb);
+#endif
+}
 static int port_allowed(int port) {
     if (g_nports == 0) return 1;
     for (int i = 0; i < g_nports; i++) if (g_only_ports[i] == port) return 1;
@@ -139,16 +204,43 @@ typedef SOCKET DTSOCK;
 #define DTSOCK_BAD INVALID_SOCKET
 #endif
 
+/* Control-connection frames (one per hook instance): membership, host
+ * claim, discovery beacons, UDP-over-TCP. Game TCP streams are NOT
+ * multiplexed here: every fake game TCP connection is its own real TCP
+ * connection to the relay (v2, see "per-stream TCP" section below), so a
+ * stalled stream can never head-of-line-block beacons or other streams. */
 #define DT_BCAST 0x01
 #define DT_BCAST_FROM 0x02
-#define DT_OPEN  0x10
-#define DT_C2S   0x11
-#define DT_S2C   0x12
-#define DT_CLOSE 0x13
 #define DT_HELLO 0x20
 #define DT_NODE 0x22
 #define DT_ASSIGN 0x23
-#define DT_POPEN 0x24
+#define DT_UDP_TUN 0x30   /* one UDP-tunnel datagram (UDP-over-TCP mode) */
+#define DT_UDP_MODE 0x31  /* declare UDP-over-TCP mode (empty) */
+/* v2 per-stream ops. Opener dials the relay on a NEW tcp conn, sends
+ * DT_STOPEN; the relay asks the destination (DT_STREQ on EVERY control
+ * link of the dest node -- process-tree identity means sibling processes
+ * race to serve); a destination dials the relay on its OWN new tcp conn,
+ * sends DT_STJOIN, and the relay answers the CLAIM on that conn right
+ * away (DT_STOK = you serve it / DT_STFAIL(BUSY) = a sibling won, stand
+ * down before bridging); the winner bridges to its local game and sends
+ * DT_STJOINED; the relay confirms DT_STOK to the opener and pipes raw
+ * bytes both ways. */
+#define DT_STOPEN 0x40    /* opener->relay: !I node + !I dest_node + !I sid + !H gport */
+#define DT_STREQ  0x41    /* relay->dest (control): !I sid + !H gport */
+#define DT_STJOIN 0x42    /* dest->relay: !I node + !I sid */
+#define DT_STJOINED 0x43  /* dest->relay: !I sid (local bridge up) */
+#define DT_STOK   0x44    /* relay->opener (confirmed) / relay->dest (claim): !I sid */
+#define DT_STFAIL 0x45    /* relay->opener/dest, dest->relay: !I sid + !B reason */
+#define STF_NO_ROUTE 1
+#define STF_JOIN_TIMEOUT 2
+#define STF_HOST_FAILED 3
+#define STF_BAD_ID 4
+#define STF_BUSY 5
+#define DT_ST_TIMEOUT_MS 10000   /* handshake budget, both sides + relay */
+/* stream states (opener side) */
+#define ST_CONNECTING 1
+#define ST_OPEN 2
+#define ST_DEAD 3
 #define DU_C2S 0x01
 #define DU_S2C 0x02
 #define DU_HELLO 0x10
@@ -156,6 +248,8 @@ typedef SOCKET DTSOCK;
 #define DU_PDAT 0x12
 #define DU_ICMP_REQ 0x20  /* VN 01 20 | !I src + !I dest + !H id + !H seq + data (0 = relay) */
 #define DU_ICMP_REP 0x21  /* same layout, reply */
+#define DT_UDP_TUN 0x30   /* TCP frame: one UDP-tunnel datagram (UDP-over-TCP mode) */
+#define DT_UDP_MODE 0x31  /* TCP frame: declare UDP-over-TCP mode (empty) */
 /* virtual-IP membership (assigned by relay per token room) */
 static volatile unsigned g_node = 0;
 static unsigned g_myvirt = 0;      /* numeric, e.g. 0x0AC80002 */
@@ -183,7 +277,16 @@ static unsigned dt_rand(void) {
 struct dt_chunk { unsigned char *p; size_t n, off; struct dt_chunk *next; };
 struct dt_dgram { unsigned char *p; size_t n; struct sockaddr_in from; struct dt_dgram *next; };
 struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in orig;
-                   struct dt_chunk *h, *t; size_t total; int dead; };
+                   struct dt_chunk *h, *t; size_t total; int dead;
+                   /* v2: one real TCP conn to the relay per stream */
+                   int state;          /* ST_CONNECTING/ST_OPEN/ST_DEAD */
+                   unsigned fail;      /* STF_* when dead via handshake */
+                   int in_paused;      /* in-queue full: stop reading relay */
+                   int connect_signaled; /* FD_CONNECT reported once */
+                   DTSOCK fd;          /* per-stream TCP (DTSOCK_BAD = none) */
+                   struct dt_chunk *oh, *ot; size_t ototal;  /* app out-queue */
+                   /* field diagnostics: app-facing byte counters + log throttle */
+                   unsigned an_rx, an_tx; size_t ab_rx, ab_tx; long long a_log; };
 struct dt_udp { int used; long long gsock; struct dt_dgram *h, *t; int nq; int closed; int vport; };
 struct dt_slot { int used; long long gsock; int game_port; struct sockaddr_in orig; };
 struct dt_frame { unsigned char type; unsigned char *p; size_t n; struct dt_frame *next; };
@@ -192,7 +295,6 @@ static struct dt_stream g_st[DT_MAXSTREAM];
 static struct dt_udp g_uq[DT_MAXUDP];
 static struct dt_slot g_sl[DT_MAXSLOT];
 static struct dt_frame *g_sqh = NULL, *g_sqt = NULL;
-static unsigned g_sid = 0;
 static volatile int g_tun_run = 0, g_tun_started = 0, g_tcp_up = 0;
 static volatile int g_have_assign = 0;   /* first ASSIGN (our vnode) seen */
 /* Fatal startup errors: without a relay link AND an address lease the
@@ -207,7 +309,6 @@ static volatile int g_init_done = 0;      /* LanHookInit/ensure_init finished */
 static volatile int g_tcp_ever_up = 0;    /* any TCP link since process start */
 static long long g_init_t0 = 0;
 static long long g_fatal_after_ms = 30000;
-static long long dt_now_ms(void);
 static void dt_fatal(int code, const char *msg);
 #ifndef LINUX_BUILD
 static void flog(const char *m);         /* defined below; lease logs use it */
@@ -237,10 +338,38 @@ static void dt_msleep(int ms) {
     Sleep(ms);
 #endif
 }
+static unsigned current_pid(void) {
+#ifdef LINUX_BUILD
+    return (unsigned)getpid();
+#else
+    return GetCurrentProcessId();
+#endif
+}
+/* forward decls: stream helpers defined in the per-stream section below */
+static struct dt_stream *dt_stream_by_sid(unsigned sid);
+/* wall-clock stamp for file logs: "MM-DD HH:MM:SS.mmm" */
+static void dt_stamp(char *out, size_t n) {
+#ifdef LINUX_BUILD
+    struct timeval tv;
+    struct tm tm;
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm);
+    snprintf(out, n, "%02d-%02d %02d:%02d:%02d.%03d",
+             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (int)(tv.tv_usec / 1000));
+#else
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(out, n, "%02d-%02d %02d:%02d:%02d.%03d",
+             (int)st.wMonth, (int)st.wDay, (int)st.wHour,
+             (int)st.wMinute, (int)st.wSecond, (int)st.wMilliseconds);
+#endif
+    out[n - 1] = 0;
+}
 static void dlog(const char *m) {
     if (!g_debug) return;
 #ifdef LINUX_BUILD
-    fprintf(stderr, "[lan_hook] %s\n", m);
+    { char ts[32]; dt_stamp(ts, sizeof(ts)); fprintf(stderr, "[%s lan_hook] %s\n", ts, m); }
 #else
     OutputDebugStringA("lan_hook: ");
     OutputDebugStringA(m);
@@ -253,7 +382,12 @@ static void dlog(const char *m) {
             const char *p = getenv("LAN_HOOK_LOGFILE");
             if (p && p[0]) lf = fopen(p, "a");
         }
-        if (lf) { fputs("lan_hook: ", lf); fputs(m, lf); fputc('\n', lf); fflush(lf); }
+        if (lf) {
+            char ts[32];
+            dt_stamp(ts, sizeof(ts));
+            fputs(ts, lf); fputs(" lan_hook: ", lf);
+            fputs(m, lf); fputc('\n', lf); fflush(lf);
+        }
     }
 #endif
 }
@@ -284,7 +418,12 @@ static void dt_fatal(int code, const char *msg) {
         static FILE *lf = NULL;
         const char *p = getenv("LAN_HOOK_LOGFILE");
         if (p && p[0]) lf = fopen(p, "a");
-        if (lf) { fputs("lan_hook: ", lf); fputs(full, lf); fputc('\n', lf); fflush(lf); fclose(lf); }
+        if (lf) {
+            char ts[32];
+            dt_stamp(ts, sizeof(ts));
+            fputs(ts, lf); fputs(" lan_hook: ", lf);
+            fputs(full, lf); fputc('\n', lf); fflush(lf); fclose(lf);
+        }
     }
     OutputDebugStringA("lan_hook: ");
     OutputDebugStringA(full);
@@ -326,6 +465,7 @@ static void dt_sig_locked(long long gsock);
 static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
                        unsigned id, unsigned seq,
                        const unsigned char *data, size_t dlen);
+static void dt_udp_ingress(const unsigned char *buf, size_t n);
 #ifndef LINUX_BUILD
 static int dt_icmp_pend_complete(unsigned id, unsigned seq,
                                  const unsigned char *data, size_t dlen,
@@ -530,7 +670,13 @@ static void dt_apply_assign(const unsigned char *p, size_t n) {
         DUNLOCK();
     }
     g_have_assign = 1;
-    dlog("assign: membership updated");
+    { char lb[160];
+      snprintf(lb, sizeof(lb),
+               "assign pid=%u node=%u self=%u.%u.%u.%u members=%d",
+               (unsigned)current_pid(), g_node,
+               (g_myvirt >> 24) & 255, (g_myvirt >> 16) & 255,
+               (g_myvirt >> 8) & 255, g_myvirt & 255, g_nmembers);
+      dlog(lb); }
 }
 /* Network-order address -> node id (0 = not a known virtual peer). */
 static unsigned dt_virt_node(unsigned long inaddr) {
@@ -568,12 +714,11 @@ static unsigned dt_node_virt(unsigned node) {
 #define DT_MAXUSESS 64
 struct dt_hosted {
     int used; unsigned sid;
-#ifdef LINUX_BUILD
-    int real;
-#else
-    SOCKET real;
-#endif
-    struct dt_chunk *h, *t; int dead;
+    DTSOCK real;          /* local loopback bridge to the game */
+    DTSOCK fd;            /* v2: per-stream TCP to the relay */
+    int live;             /* bridge up (STJOINED sent) */
+    long long last;       /* last activity (pending sweep) */
+    int dead;
 };
 static struct dt_hosted g_hs[DT_MAXHOST];
 struct dt_usess {
@@ -599,52 +744,50 @@ static struct dt_hosted *dt_hs_by_sid(unsigned sid) {
         if (g_hs[i].used && g_hs[i].sid == sid) return &g_hs[i];
     return NULL;
 }
-static void dt_hs_close(unsigned sid, int notify) {
+static void dt_hs_close(unsigned sid, int keep_real) {
     struct dt_hosted hcp; int have = 0;
     DLOCK();
     struct dt_hosted *h = dt_hs_by_sid(sid);
-    if (h) { hcp = *h; have = 1; h->used = 0; h->h = h->t = NULL; }
+    if (h) { hcp = *h; have = 1; h->used = 0; h->real = DTSOCK_BAD; h->fd = DTSOCK_BAD; }
     DUNLOCK();
     if (!have) return;
-    struct dt_chunk *c = hcp.h;
-    while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+    if (!keep_real && hcp.real != DTSOCK_BAD) {
 #ifdef LINUX_BUILD
-    dt_reals();
-    if (hcp.real >= 0) r_close(hcp.real);
+        dt_reals();
+        if (hcp.real >= 0) r_close(hcp.real);
 #else
-    if (hcp.real != INVALID_SOCKET) closesocket(hcp.real);
+        if (hcp.real != INVALID_SOCKET) closesocket(hcp.real);
 #endif
-    if (notify) { unsigned char b[4]; dt_put32(b, sid); dt_tcp_queue(DT_CLOSE, b, 4); }
+    }
+    if (hcp.fd != DTSOCK_BAD) {
+#ifdef LINUX_BUILD
+        dt_reals();
+        if (hcp.fd >= 0) r_close(hcp.fd);
+#else
+        if (hcp.fd != INVALID_SOCKET) closesocket(hcp.fd);
+#endif
+    }
 }
-/* Open a real loopback connection to our own game server. */
-static int dt_host_open(unsigned sid, int port) {
+/* Local loopback bridge to our own game server (joinee side). */
+static int dt_host_bridge(unsigned sid, int port) {
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    DTSOCK s;
 #ifdef LINUX_BUILD
     dt_reals();
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    s = (DTSOCK)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
     if (r_connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { r_close(s); return -1; }
 #else
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    s = (DTSOCK)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
     if (connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { closesocket(s); return -1; }
 #endif
     DLOCK();
-    struct dt_hosted *h = NULL;
-    for (int i = 0; i < DT_MAXHOST; i++)
-        if (!g_hs[i].used) { h = &g_hs[i]; break; }
-    if (h) { h->used = 1; h->sid = sid; h->real = s; h->h = h->t = NULL; h->dead = 0; }
+    struct dt_hosted *h = dt_hs_by_sid(sid);
+    if (h) { h->real = s; h->live = 1; h->last = dt_now_ms(); }
     DUNLOCK();
-    if (!h) {
-#ifdef LINUX_BUILD
-        r_close(s);
-#else
-        closesocket(s);
-#endif
-        return -1;
-    }
     return 0;
 }
 static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
@@ -734,7 +877,7 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
     if (from.sin_addr.s_addr == INADDR_NONE) return;
     int matched = 0, shown = 0;
     char lb[256]; int hp = 0;
-    hp = snprintf(lb, sizeof(lb), "udp direct gport=%d:", game_port);
+    hp = snprintf(lb, sizeof(lb), "udp direct pid=%u gport=%d:", (unsigned)current_pid(), game_port);
     DLOCK();
     for (int i = 0; i < DT_MAXUDP; i++) {
         if (!g_uq[i].used || g_uq[i].closed) continue;
@@ -766,7 +909,8 @@ static void dt_direct_udp_in(int game_port, const unsigned char *ipb, int iplen,
         if (g_debug) {
             char lb[320]; int hp = 0;
             size_t hn = rl < 130 ? rl : 130;
-            hp = snprintf(lb, sizeof(lb), "udp direct sock=%lld n=%d hex=", gs, (int)rl);
+            hp = snprintf(lb, sizeof(lb), "udp direct pid=%u sock=%lld n=%d hex=",
+                          (unsigned)current_pid(), gs, (int)rl);
             for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
                 hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", raw[qi]);
             dlog(lb);
@@ -822,35 +966,39 @@ static struct dt_udp *dt_udp_entry(long long s, int create) {
         }
     return NULL;
 }
-/* Event-driven readers (WSAEventSelect family): inbound tunnel data
- * lands in hook-internal queues, so the real socket never becomes
- * readable and the app's event would never fire. Track socket->event
- * associations and signal on every queue insert. Windows-only in
- * effect (event-driven socket loops); Linux gets stubs so the shared queue
- * code compiles unchanged. */
+/* socket state for wait hooks (platform-independent). */
+static void dt_sock_state_locked(long long gsock, int *data, int *dead,
+                                 int *writable, int *connect) {
+    int i;
+    *data = 0; *dead = 0; *writable = 0; *connect = 0;
+    for (i = 0; i < DT_MAXUDP; i++)
+        if (g_uq[i].used && !g_uq[i].closed && g_uq[i].gsock == gsock) {
+            if (g_uq[i].h) *data = 1;
+            *writable = 1; /* datagram send never blocks */
+        }
+    for (i = 0; i < DT_MAXSTREAM; i++)
+        if (g_st[i].used && g_st[i].gsock == gsock) {
+            if (g_st[i].h) *data = 1;
+            if (g_st[i].dead || g_st[i].state == ST_DEAD) *dead = 1;
+            if (g_st[i].state == ST_OPEN && !g_st[i].dead) {
+                *writable = 1;
+                if (!g_st[i].connect_signaled) *connect = 1;
+            }
+        }
+}
+static void dt_sock_state_full(long long gsock, int *data, int *dead,
+                               int *writable, int *connect) {
+    DLOCK(); dt_sock_state_locked(gsock, data, dead, writable, connect); DUNLOCK();
+}
 #ifndef LINUX_BUILD
 #define DT_MAXEV 128
-static struct { int used; long long sock; WSAEVENT ev; } g_evmap[DT_MAXEV];
+static struct { int used; long long sock; WSAEVENT ev; long mask; } g_evmap[DT_MAXEV];
 /* DLOCK must be held (every queue-insert path holds it). */
 static void dt_sig_locked(long long gsock) {
     int i;
     for (i = 0; i < DT_MAXEV; i++)
         if (g_evmap[i].used && g_evmap[i].sock == gsock)
             (void)WSASetEvent(g_evmap[i].ev);
-}
-static void dt_sock_state_locked(long long gsock, int *data, int *dead) {
-    int i;
-    *data = 0; *dead = 0;
-    for (i = 0; i < DT_MAXUDP; i++)
-        if (g_uq[i].used && !g_uq[i].closed && g_uq[i].gsock == gsock && g_uq[i].h) *data = 1;
-    for (i = 0; i < DT_MAXSTREAM; i++)
-        if (g_st[i].used && g_st[i].gsock == gsock) {
-            if (g_st[i].h) *data = 1;
-            if (g_st[i].dead) *dead = 1;
-        }
-}
-static void dt_sock_state(long long gsock, int *data, int *dead) {
-    DLOCK(); dt_sock_state_locked(gsock, data, dead); DUNLOCK();
 }
 static void dt_ev_unhook_sock(long long sock) {
     int i;
@@ -874,9 +1022,14 @@ static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
     DLOCK();
     struct dt_udp *e = dt_udp_entry(gsock, 1);
     if (e && !e->closed) {
-        if (e->nq >= DT_MAXQ) { /* drop oldest */
-            struct dt_dgram *o = e->h; e->h = o->next; if (!e->h) e->t = NULL;
-            free(o->p); free(o); e->nq--;
+        if (e->nq >= DT_MAXQ) {
+            /* full: drop THIS datagram, like a real udp rx buffer
+             * (kernel drops new arrivals, never reorders/drops old) */
+            DUNLOCK();
+            { char lb[96];
+              snprintf(lb, sizeof(lb), "udp q full gsock=%lld nq=%d: drop new", gsock, e->nq);
+              dlog(lb); }
+            return;
         }
         struct dt_dgram *d = (struct dt_dgram *)malloc(sizeof(*d));
         if (d) {
@@ -1004,7 +1157,8 @@ static void dt_dispatch_bcast_from(unsigned node, int port, int sport,
         long long gs = g_uq[i].gsock;
         DUNLOCK();
         int bp = dt_bound_port(gs);
-        { char lb[128]; snprintf(lb, sizeof(lb), "fanout port=%d sock=%lld bound=%d", port, gs, bp); dlog(lb); }
+        { char lb[160]; snprintf(lb, sizeof(lb), "fanout pid=%u port=%d sock=%lld bound=%d",
+                                 (unsigned)current_pid(), port, gs, bp); dlog(lb); }
         DLOCK();
         /* re-find (table may shift); keep simple: match by gsock again */
         struct dt_udp *e = NULL;
@@ -1029,53 +1183,697 @@ static void dt_dispatch_bcast_from(unsigned node, int port, int sport,
 static void dt_dispatch_bcast(int port, int sport, const unsigned char *raw, size_t n) {
     dt_dispatch_bcast_from(0, port, sport, raw, n);
 }
-static void dt_dispatch_s2c(unsigned sid, const unsigned char *raw, size_t n) {
-    DLOCK();
-    struct dt_stream *st = dt_stream_by_sid(sid);
-    if (st && !st->dead) {
-        struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
-        if (c) {
-            c->p = (unsigned char *)malloc(n ? n : 1);
-            if (c->p) { if (n) memcpy(c->p, raw, n); c->n = n; c->off = 0; c->next = NULL;
-                if (st->t) st->t->next = c; else st->h = c; st->t = c; st->total += n;
-                dt_sig_locked(st->gsock);
-            } else free(c);
+
+/* ---- v2 per-stream TCP ------------------------------------------------
+ * Every fake game TCP connection is one REAL tcp connection to the
+ * relay, opened by THIS process (NAT-safe: both ends dial out). The
+ * relay pipes raw bytes between the two per-stream connections, so a
+ * stalled stream can never head-of-line-block beacons or other streams
+ * on the control link, and connect() only "completes" after the relay
+ * confirms the destination bridged its local game (real connect
+ * semantics, kernel-style blocking backpressure both directions).
+ *
+ * opener:  app connect(vnet) -> dt_on_connect -> stream thread:
+ *          dial relay, DT_STOPEN, wait DT_STOK/DT_STFAIL (10s), pipe.
+ * joinee:  control link DT_STREQ -> dt_on_streq -> join thread:
+ *          dial relay, DT_STJOIN, local bridge connect, DT_STJOINED,
+ *          pipe per-stream-tcp <-> local bridge.
+ * Frame layout on per-stream TCPs (handshake only, then raw bytes):
+ *          [u32 len][u8 type][payload]  (same framing as the control
+ *          connection; the relay swaps to raw after DT_STOK/DT_STJOINED).
+ * -------------------------------------------------------------------- */
+#define DT_ST_MAXIN  (1024 * 1024)    /* app-read backpressure cap */
+#define DT_ST_MAXOUT (4 * 1024 * 1024)
+
+static DTSOCK dt_st_dial_relay(void) {
+    struct sockaddr_in sa;
+    if (dt_resolve(&sa) != 0) return DTSOCK_BAD;
+    DTSOCK s;
+#ifdef LINUX_BUILD
+    dt_reals();
+    s = (DTSOCK)socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return DTSOCK_BAD;
+    int fl = fcntl((int)s, F_GETFL, 0);
+    fcntl((int)s, F_SETFL, fl | O_NONBLOCK);
+    int r = r_connect(s, (struct sockaddr *)&sa, sizeof(sa));
+    if (r != 0 && errno != EINPROGRESS) { r_close(s); return DTSOCK_BAD; }
+    if (r == 0) return s;
+    fd_set wf; FD_ZERO(&wf); FD_SET((int)s, &wf);
+    struct timeval tv = { DT_ST_TIMEOUT_MS / 1000,
+                          (DT_ST_TIMEOUT_MS % 1000) * 1000 };
+    if (select((int)s + 1, NULL, &wf, NULL, &tv) <= 0) { r_close(s); return DTSOCK_BAD; }
+    int err = 0; socklen_t el = sizeof(err);
+    getsockopt((int)s, SOL_SOCKET, SO_ERROR, &err, &el);
+    if (err) { r_close(s); return DTSOCK_BAD; }
+    return s;
+#else
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return DTSOCK_BAD;
+    u_long on = 1;
+    ioctlsocket(s, FIONBIO, &on); /* stays nonblocking (select-driven) */
+    int r = connect(s, (struct sockaddr *)&sa, sizeof(sa));
+    if (r != 0 && WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); return DTSOCK_BAD; }
+    if (r == 0) return s;
+    fd_set wf; FD_ZERO(&wf); FD_SET(s, &wf);
+    struct timeval tv = { DT_ST_TIMEOUT_MS / 1000,
+                          (DT_ST_TIMEOUT_MS % 1000) * 1000 };
+    if (select(0, NULL, &wf, NULL, &tv) <= 0) { closesocket(s); return DTSOCK_BAD; }
+    int err = 0; int el = sizeof(err);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &el);
+    if (err) { closesocket(s); return DTSOCK_BAD; }
+    return s;
+#endif
+}
+/* blocking-ish framed send/recv over the (nonblocking) per-stream fd */
+static int dt_st_send_all_tmo(DTSOCK fd, const unsigned char *b, size_t n,
+                              long long tmo_ms) {
+    long long t0 = dt_now_ms();
+    while (n) {
+#ifdef LINUX_BUILD
+        ssize_t k = r_send(fd, b, n, 0);
+        if (k > 0) { b += (size_t)k; n -= (size_t)k; continue; }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            { char lb[80]; snprintf(lb, sizeof(lb), "st send: err=%d", errno); dlog(lb); }
+            return -1;
         }
+#else
+        int k = send(fd, (const char *)b, (int)n, 0);
+        if (k > 0) { b += (size_t)k; n -= (size_t)k; continue; }
+        if (WSAGetLastError() != WSAEWOULDBLOCK) return -1;
+#endif
+        fd_set wf; FD_ZERO(&wf);
+#ifdef LINUX_BUILD
+        FD_SET((int)fd, &wf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select((int)fd + 1, NULL, &wf, NULL, &tv);
+        if (sr < 0) {
+            if (errno == EINTR) continue;
+            { char lb[80]; snprintf(lb, sizeof(lb), "st send: select err=%d", errno); dlog(lb); }
+            return -1;
+        }
+        /* sr == 0: not writable yet; retry until the budget runs out */
+#else
+        FD_SET(fd, &wf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select(0, NULL, &wf, NULL, &tv);
+        if (sr < 0) { if (WSAGetLastError() == WSAEINTR) continue; return -1; }
+#endif
+        if (dt_now_ms() - t0 > tmo_ms) return -1;
+    }
+    return 0;
+}
+static int dt_st_send_frame(DTSOCK fd, unsigned char type,
+                            const unsigned char *p, size_t n) {
+    unsigned char hdr[5];
+    dt_put32(hdr, (unsigned)(1 + n));
+    hdr[4] = type;
+    if (dt_st_send_all_tmo(fd, hdr, 5, DT_ST_TIMEOUT_MS)) return -1;
+    if (n && dt_st_send_all_tmo(fd, p, n, DT_ST_TIMEOUT_MS)) return -1;
+    return 0;
+}
+static int dt_st_recv_frame(DTSOCK fd, unsigned char *type, unsigned char *p,
+                            size_t pcap, size_t *pn, long long tmo_ms) {
+    unsigned char hdr[4];
+    long long t0 = dt_now_ms();
+    size_t got = 0;
+    while (got < 4) {
+#ifdef LINUX_BUILD
+        ssize_t k = r_recv(fd, hdr + got, 4 - got, 0);
+        if (k > 0) { got += (size_t)k; continue; }
+        { int e = errno;
+          if (e != EAGAIN && e != EWOULDBLOCK) {
+              char lb[96];
+              snprintf(lb, sizeof(lb), "st recv hdr: err=%d (n=%ld)", e, (long)got);
+              dlog(lb);
+              return -1; } }
+#else
+        int k = recv(fd, (char *)hdr + got, (int)(4 - got), 0);
+        if (k > 0) { got += (size_t)k; continue; }
+        { int e = WSAGetLastError();
+          if (e != WSAEWOULDBLOCK) {
+              char lb[96];
+              snprintf(lb, sizeof(lb), "st recv hdr: err=%d (n=%ld)", e, (long)got);
+              dlog(lb);
+              return -1; } }
+#endif
+        fd_set rf; FD_ZERO(&rf);
+#ifdef LINUX_BUILD
+        FD_SET((int)fd, &rf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select((int)fd + 1, &rf, NULL, NULL, &tv);
+        if (sr < 0) {
+            if (errno == EINTR) continue;
+            { char lb[80]; snprintf(lb, sizeof(lb), "st recv: select err=%d", errno); dlog(lb); }
+            return -1;
+        }
+        /* sr == 0: no data yet; retry until the budget runs out */
+#else
+        FD_SET(fd, &rf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select(0, &rf, NULL, NULL, &tv);
+        if (sr < 0) { if (WSAGetLastError() == WSAEINTR) continue; return -1; }
+#endif
+        if (dt_now_ms() - t0 > tmo_ms) return -1;
+    }
+    unsigned ml = dt_get32(hdr);
+    if (ml < 1 || ml > 65536) return -1;
+    if (ml > pcap + 1) return -1;   /* body = type byte + payload */
+    got = 0;
+    t0 = dt_now_ms();
+    while (got < ml) {
+#ifdef LINUX_BUILD
+        ssize_t k = r_recv(fd, p + got, (size_t)(ml - got), 0);
+        if (k > 0) { got += (size_t)k; continue; }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+#else
+        int k = recv(fd, (char *)p + got, (int)(ml - got), 0);
+        if (k > 0) { got += (size_t)k; continue; }
+        if (WSAGetLastError() != WSAEWOULDBLOCK) return -1;
+#endif
+        fd_set rf; FD_ZERO(&rf);
+#ifdef LINUX_BUILD
+        FD_SET((int)fd, &rf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select((int)fd + 1, &rf, NULL, NULL, &tv);
+        if (sr < 0) { if (errno == EINTR) continue; return -1; }
+        /* sr == 0: not readable yet; retry until budget runs out */
+#else
+        FD_SET(fd, &rf);
+        struct timeval tv = { 0, 50000 };
+        int sr = select(0, &rf, NULL, NULL, &tv);
+        if (sr < 0) { if (WSAGetLastError() == WSAEINTR) continue; return -1; }
+#endif
+        if (dt_now_ms() - t0 > tmo_ms) return -1;
+    }
+    *type = p[0];
+    if (ml > 1) memmove(p, p + 1, (size_t)(ml - 1));
+    *pn = (size_t)(ml - 1);
+    return 0;
+}
+static void dt_st_close_fd(DTSOCK fd) {
+    if (fd == DTSOCK_BAD) return;
+#ifdef LINUX_BUILD
+    dt_reals();
+    if (fd >= 0) r_close(fd);
+#else
+    if (fd != INVALID_SOCKET) closesocket(fd);
+#endif
+}
+/* fail an opener stream locally (no relay involved) */
+static void dt_st_fail_local(struct dt_stream *st, unsigned reason) {
+    DLOCK();
+    if (st->used && st->state != ST_DEAD) {
+        st->state = ST_DEAD;
+        st->fail = reason;
+        dt_sig_locked(st->gsock);
+        { char lb[160];
+          snprintf(lb, sizeof(lb), "stream fail pid=%u gsock=%lld sid=%u reason=%u (local)",
+                   (unsigned)current_pid(), st->gsock, st->sid, (unsigned)reason);
+          dlog(lb); }
     }
     DUNLOCK();
 }
-static void dt_dispatch_close(unsigned sid) {
+#ifdef LINUX_BUILD
+static void *dt_stream_thread(void *u);
+static void *dt_join_thread(void *u);
+static void dt_st_spawn(void *(*fn)(void *), void *arg) {
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &a, fn, arg);
+    pthread_attr_destroy(&a);
+}
+#else
+static DWORD WINAPI dt_stream_thread(LPVOID u);
+static DWORD WINAPI dt_join_thread(LPVOID u);
+static void dt_st_spawn(LPTHREAD_START_ROUTINE fn, void *arg) {
+    HANDLE h = CreateThread(NULL, 0, fn, arg, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#endif
+/* Opener side: handshake + raw pipe for one fake game connection. */
+#ifdef LINUX_BUILD
+static void *dt_stream_thread(void *u)
+#else
+static DWORD WINAPI dt_stream_thread(LPVOID u)
+#endif
+{
+    unsigned sid = (unsigned)(uintptr_t)u;
+    long long gsock = 0;
+    struct sockaddr_in orig; unsigned origport = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sid(sid);
-    if (st) { st->dead = 1; dt_sig_locked(st->gsock); }
-    struct dt_hosted *h = dt_hs_by_sid(sid);
-    if (h) h->dead = 1;
+    if (st) { gsock = st->gsock; orig = st->orig; origport = ntohs(st->orig.sin_port); }
     DUNLOCK();
-}
-/* Inbound game data for a hosted stream -> real loopback socket. */
-static void dt_host_data(unsigned sid, const unsigned char *p, size_t n) {
+    if (!st || !gsock) return 0;
+    DTSOCK fd = dt_st_dial_relay();
+    if (fd == DTSOCK_BAD) {
+        dt_st_fail_local(st, STF_JOIN_TIMEOUT);
+        return 0;
+    }
+    {
+        int st_aborted = 0;
+        DLOCK();
+        st_aborted = !st->used || st->dead;
+        DUNLOCK();
+        if (st_aborted) {
+            dt_st_close_fd(fd);
+            return 0;
+        }
+        unsigned dest = dt_virt_node(orig.sin_addr.s_addr); /* 0 = implicit host */
+        unsigned char p[14];
+        dt_put32(p, g_node); dt_put32(p + 4, dest);
+        dt_put32(p + 8, sid); dt_put16(p + 12, origport);
+        { char lb[200];
+          snprintf(lb, sizeof(lb), "stream open pid=%u gsock=%lld sid=%u dest=%u port=%u",
+                   (unsigned)current_pid(), gsock, sid, dest, origport);
+          dlog(lb); }
+        if (dt_st_send_frame(fd, DT_STOPEN, p, 14) != 0) {
+            dt_st_close_fd(fd);
+            dt_st_fail_local(st, STF_JOIN_TIMEOUT);
+            return 0;
+        }
+        DLOCK();
+        if (st->used && st->sid == sid) st->fd = fd;
+        DUNLOCK();
+        unsigned char type = 0, rp[16]; size_t rn = 0;
+        int r = dt_st_recv_frame(fd, &type, rp, sizeof(rp), &rn, DT_ST_TIMEOUT_MS);
+        DLOCK();
+        int gone = !st->used || st->sid != sid || st->dead;
+        if (!gone) {
+            if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid) {
+                st->state = ST_OPEN;
+                dt_sig_locked(gsock);
+            } else if (r == 0 && type == DT_STFAIL && rn >= 5 && dt_get32(rp) == sid) {
+                st->state = ST_DEAD; st->fail = rp[4];
+                dt_sig_locked(gsock);
+            } else {
+                st->state = ST_DEAD; st->fail = STF_JOIN_TIMEOUT;
+                dt_sig_locked(gsock);
+            }
+        }
+        int open = (!gone && st->state == ST_OPEN);
+        int fail = st->fail;
+        DUNLOCK();
+        if (open) {
+            char lb[128];
+            snprintf(lb, sizeof(lb), "stream ok pid=%u gsock=%lld sid=%u",
+                     (unsigned)current_pid(), gsock, sid);
+            dlog(lb);
+        } else if (!gone) {
+            char lb[160];
+            snprintf(lb, sizeof(lb), "stream fail pid=%u gsock=%lld sid=%u reason=%u",
+                     (unsigned)current_pid(), gsock, sid, (unsigned)fail);
+            dlog(lb);
+            dt_st_close_fd(fd);
+            return 0;
+        } else {
+            dt_st_close_fd(fd);
+            return 0;
+        }
+    }
+    /* raw pipe: app out-queue -> relay; relay -> app in-queue.
+     * Blocking semantics like the kernel: full relay buffer blocks the
+     * thread here (backpressure), full app queue pauses reads. */
+    unsigned char buf[65536];
+    size_t in0 = 0, out0 = 0;
+    for (;;) {
+        if (!g_tun_run) break;
+        DLOCK();
+        int mine = st->used && st->sid == sid;
+        int has_out = mine && st->ototal > 0;
+        int pause = !mine || st->in_paused;
+        int dead = !mine || st->dead;
+        DUNLOCK();
+        if (dead) break;
+        fd_set rf, wf;
+        FD_ZERO(&rf); FD_ZERO(&wf);
+        if (!pause)
 #ifdef LINUX_BUILD
-    dt_reals();
+            FD_SET((int)fd, &rf)
+#else
+            FD_SET(fd, &rf)
 #endif
+            ;
+        if (has_out)
+#ifdef LINUX_BUILD
+            FD_SET((int)fd, &wf)
+#else
+            FD_SET(fd, &wf)
+#endif
+            ;
+        struct timeval tv = { 0, 25000 };
+#ifdef LINUX_BUILD
+        int sr = select((int)fd + 1, pause ? NULL : &rf, has_out ? &wf : NULL, NULL, &tv);
+#else
+        int sr = select(0, pause ? NULL : &rf, has_out ? &wf : NULL, NULL, &tv);
+#endif
+        if (!g_tun_run) break;
+        if (sr < 0) break;
+        int can_rd = (!pause &&
+#ifdef LINUX_BUILD
+                      FD_ISSET((int)fd, &rf)
+#else
+                      FD_ISSET(fd, &rf)
+#endif
+                     );
+        int can_wr = (has_out &&
+#ifdef LINUX_BUILD
+                      FD_ISSET((int)fd, &wf)
+#else
+                      FD_ISSET(fd, &wf)
+#endif
+                     );
+        if (can_wr) {
+            for (;;) {
+                unsigned char *sp = NULL; size_t sn = 0;
+                DLOCK();
+                if (st->used && st->sid == sid && st->oh) {
+                    sp = st->oh->p + st->oh->off; sn = st->oh->n - st->oh->off;
+                }
+                DUNLOCK();
+                if (!sp || !sn) break;
+#ifdef LINUX_BUILD
+                ssize_t k = r_send(fd, sp, sn, 0);
+#else
+                int k = send(fd, (const char *)sp, (int)sn, 0);
+#endif
+                if (k <= 0) {
+#ifdef LINUX_BUILD
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+#else
+                    if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+#endif
+                    { char lb[80]; snprintf(lb, sizeof(lb), "stream pipe: send err=%d",
+#ifdef LINUX_BUILD
+                                             errno
+#else
+                                             WSAGetLastError()
+#endif
+                                         ); dlog(lb); }
+                    break;
+                }
+                out0 += (size_t)k;
+                DLOCK();
+                if (st->used && st->sid == sid && st->oh) {
+                    st->oh->off += (size_t)k;
+                    st->ototal -= (size_t)k;
+                    if (st->oh->off >= st->oh->n) {
+                        struct dt_chunk *o = st->oh;
+                        st->oh = o->next;
+                        if (!st->oh) st->ot = NULL;
+                        free(o->p); free(o);
+                    }
+                }
+                DUNLOCK();
+            }
+        }
+        if (can_rd) {
+#ifdef LINUX_BUILD
+            ssize_t n = r_recv(fd, buf, sizeof(buf), 0);
+#else
+            int n = recv(fd, (char *)buf, (int)sizeof(buf), 0);
+#endif
+            if (n < 0) {
+#ifdef LINUX_BUILD
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+#else
+                if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
+#endif
+                { char lb[96];
+                  snprintf(lb, sizeof(lb), "stream pipe: recv err=%d",
+#ifdef LINUX_BUILD
+                           errno
+#else
+                           WSAGetLastError()
+#endif
+                      ); dlog(lb); }
+                DLOCK();
+                if (st->used && st->sid == sid) {
+                    st->state = ST_DEAD; st->fail = 0;
+                    dt_sig_locked(gsock);
+                }
+                DUNLOCK();
+                break;
+            }
+            if (n == 0) {
+                DLOCK();
+                if (st->used && st->sid == sid) {
+                    st->state = ST_DEAD; st->fail = 0; /* peer closed / reset */
+                    dt_sig_locked(gsock);
+                }
+                DUNLOCK();
+                { char lb[190];
+                  snprintf(lb, sizeof(lb),
+                           "stream eof pid=%u gsock=%lld sid=%u in=%llu out=%llu",
+                           (unsigned)current_pid(), gsock, sid,
+                           (unsigned long long)in0, (unsigned long long)out0);
+                  dlog(lb); }
+                break;
+            }
+            in0 += (size_t)n;
+            DLOCK();
+            if (st->used && st->sid == sid) {
+                if (st->total + (size_t)n > DT_ST_MAXIN) {
+                    st->in_paused = 1; /* kernel window would close; resume on drain */
+                } else {
+                    struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
+                    if (c) {
+                        c->p = (unsigned char *)malloc((size_t)n);
+                        if (c->p) {
+                            memcpy(c->p, buf, (size_t)n);
+                            c->n = (size_t)n; c->off = 0; c->next = NULL;
+                            if (st->t) st->t->next = c; else st->h = c;
+                            st->t = c; st->total += (size_t)n;
+                            dt_sig_locked(gsock);
+                        } else { st->in_paused = 1; }
+                        if (!c->p) free(c);
+                    } else st->in_paused = 1;
+                }
+            }
+            DUNLOCK();
+        }
+    }
     DLOCK();
-    struct dt_hosted *h = dt_hs_by_sid(sid);
-#ifdef LINUX_BUILD
-    int rs = h ? h->real : -1;
-    int dead = h ? h->dead : 1;
-#else
-    SOCKET rs = h ? h->real : INVALID_SOCKET;
-    int dead = h ? h->dead : 1;
-#endif
+    if (st->used && st->sid == sid) {
+        int app_closed = st->dead;
+        st->state = ST_DEAD;
+        if (app_closed) {
+            st->used = 0;
+            st->fd = DTSOCK_BAD;
+            struct dt_chunk *c = st->h;
+            while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+            c = st->oh;
+            while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+            st->h = st->t = st->oh = st->ot = NULL;
+            st->total = st->ototal = 0;
+            dt_sig_locked(gsock);
+        }
+    }
     DUNLOCK();
-    if (!h || dead) return;
+    dt_st_close_fd(fd);
+    return 0;
+}
+/* Joinee side: serve one inbound stream (DT_STREQ from the control link). */
+static void dt_on_streq(unsigned sid, int gport) {
+    DLOCK();
+    struct dt_hosted *h = NULL;
+    for (int i = 0; i < DT_MAXHOST; i++)
+        if (!g_hs[i].used) {
+            h = &g_hs[i];
+            h->used = 1; h->sid = sid; h->real = DTSOCK_BAD; h->fd = DTSOCK_BAD;
+            h->live = 0; h->dead = 0; h->last = dt_now_ms();
+            break;
+        }
+    DUNLOCK();
+    if (!h) { dlog("hosted req: session table full"); return; }
+    { char lb[160];
+      snprintf(lb, sizeof(lb), "hosted req pid=%u sid=%u port=%d",
+               (unsigned)current_pid(), sid, gport);
+      dlog(lb); }
+    struct { unsigned sid; int gport; } *a = (typeof(a))malloc(sizeof(*a));
+    if (!a) { dt_hs_close(sid, 0); return; }
+    a->sid = sid; a->gport = gport;
+    dt_st_spawn(dt_join_thread, a);
+}
 #ifdef LINUX_BUILD
-    while (n) { ssize_t k = r_send(rs, p, n, 0); if (k <= 0) break; p += k; n -= (size_t)k; }
+static void *dt_join_thread(void *u)
 #else
-    while (n) { int k = send(rs, (const char *)p, (int)n, 0); if (k <= 0) break; p += k; n -= (size_t)k; }
+static DWORD WINAPI dt_join_thread(LPVOID u)
 #endif
+{
+    struct { unsigned sid; int gport; } *a = u;
+    unsigned sid = a->sid; int gport = a->gport;
+    free(a);
+    DTSOCK fd = dt_st_dial_relay();
+    if (fd == DTSOCK_BAD) {
+        char lb[128];
+        snprintf(lb, sizeof(lb), "hosted join fail pid=%u sid=%u relay dial",
+                 (unsigned)current_pid(), sid);
+        dlog(lb);
+        dt_hs_close(sid, 0);
+        return 0;
+    }
+    {
+        unsigned char p[8];
+        dt_put32(p, g_node); dt_put32(p + 4, sid);
+        if (dt_st_send_frame(fd, DT_STJOIN, p, 8) != 0) {
+            dt_st_close_fd(fd);
+            dt_hs_close(sid, 0);
+            return 0;
+        }
+        /* claim verdict: the relay answers STJOIN on this connection
+         * immediately (STOK = this link serves the stream; anything else
+         * = a sibling process of the same identity already won). Read it
+         * BEFORE bridging so losers never open the game port. */
+        {
+            unsigned char type = 0, rp[16]; size_t rn = 0;
+            if (dt_st_recv_frame(fd, &type, rp, sizeof(rp), &rn,
+                                 DT_ST_TIMEOUT_MS) != 0 ||
+                type != DT_STOK || rn < 4 || dt_get32(rp) != sid) {
+                char lb[160];
+                snprintf(lb, sizeof(lb),
+                         "hosted join stood down pid=%u sid=%u (dup/busy)",
+                         (unsigned)current_pid(), sid);
+                dlog(lb);
+                dt_st_close_fd(fd);
+                dt_hs_close(sid, 0);
+                return 0;
+            }
+        }
+        /* local game bridge; retry briefly (the game may still be
+         * binding its port right now) */
+        int ok = 0;
+        for (int i = 0; i < 4 && !ok; i++) {
+            if (dt_host_bridge(sid, gport) == 0) ok = 1;
+            else dt_msleep(250);
+        }
+        if (!ok) {
+            unsigned char q[5];
+            dt_put32(q, sid); q[4] = STF_HOST_FAILED;
+            dt_st_send_frame(fd, DT_STFAIL, q, 5);
+            char lb[160];
+            snprintf(lb, sizeof(lb), "hosted open fail pid=%u sid=%u port=%d",
+                     (unsigned)current_pid(), sid, gport);
+            dlog(lb);
+            dt_st_close_fd(fd);
+            dt_hs_close(sid, 0);
+            return 0;
+        }
+        unsigned char q[4];
+        dt_put32(q, sid);
+        if (dt_st_send_frame(fd, DT_STJOINED, q, 4) != 0) {
+            dt_st_close_fd(fd);
+            dt_hs_close(sid, 0);
+            return 0;
+        }
+        DLOCK();
+        struct dt_hosted *h = dt_hs_by_sid(sid);
+        if (h) h->fd = fd;
+        DUNLOCK();
+        char lb[160];
+        snprintf(lb, sizeof(lb), "hosted stream up pid=%u sid=%u port=%d",
+                 (unsigned)current_pid(), sid, gport);
+        dlog(lb);
+    }
+    /* raw pipe: relay <-> local game bridge (both directions, blocking
+     * sends so a slow local game backpressures the relay like a kernel
+     * would, and vice versa). */
+    unsigned char buf[65536];
+    size_t in0 = 0, out0 = 0;
+    DTSOCK real = DTSOCK_BAD;
+    DLOCK();
+    struct dt_hosted *h0 = dt_hs_by_sid(sid);
+    if (h0) real = h0->real;
+    DUNLOCK();
+    if (real == DTSOCK_BAD) { dt_st_close_fd(fd); dt_hs_close(sid, 0); return 0; }
+    for (;;) {
+        if (!g_tun_run) break;
+        DLOCK();
+        struct dt_hosted *h = dt_hs_by_sid(sid);
+        int dead = h ? h->dead : 1;
+        DUNLOCK();
+        if (dead) break;
+        fd_set rf;
+        FD_ZERO(&rf);
+#ifdef LINUX_BUILD
+        FD_SET((int)fd, &rf);
+        FD_SET((int)real, &rf);
+        int mx = (int)fd > (int)real ? (int)fd : (int)real;
+        struct timeval tv = { 0, 25000 };
+        int sr = select(mx + 1, &rf, NULL, NULL, &tv);
+        if (sr <= 0) continue;
+        if (FD_ISSET((int)fd, &rf)) {
+            ssize_t n = r_recv(fd, buf, sizeof(buf), 0);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                { char lb[96]; snprintf(lb, sizeof(lb), "hosted pipe: relay recv err=%d", errno); dlog(lb); }
+                break;
+            }
+            if (n == 0) {
+                char lb[64]; snprintf(lb, sizeof(lb), "hosted pipe: relay EOF"); dlog(lb);
+                break;
+            }
+            in0 += (size_t)n;
+            const unsigned char *p = buf;
+            while ((size_t)n > 0) {
+                ssize_t k = r_send(real, p, (size_t)n, 0);
+                if (k <= 0) { if (errno == EINTR) continue; break; }
+                p += (size_t)k; n -= (size_t)k;
+            }
+        }
+        if (FD_ISSET((int)real, &rf)) {
+            ssize_t n = r_recv(real, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            out0 += (size_t)n;
+            const unsigned char *p = buf;
+            while ((size_t)n > 0) {
+                ssize_t k = r_send(fd, p, (size_t)n, 0);
+                if (k <= 0) { if (errno == EINTR) continue; break; }
+                p += (size_t)k; n -= (size_t)k;
+            }
+        }
+#else
+        FD_SET(fd, &rf);
+        FD_SET(real, &rf);
+        struct timeval tv = { 0, 25000 };
+        int sr = select(0, &rf, NULL, NULL, &tv);
+        if (sr <= 0) continue;
+        if (FD_ISSET(fd, &rf)) {
+            int n = recv(fd, (char *)buf, (int)sizeof(buf), 0);
+            if (n <= 0) break;
+            in0 += (size_t)n;
+            const char *p = (const char *)buf;
+            while (n > 0) {
+                int k = send(real, p, n, 0);
+                if (k <= 0) break;
+                p += k; n -= k;
+            }
+        }
+        if (FD_ISSET(real, &rf)) {
+            int n = recv(real, (char *)buf, (int)sizeof(buf), 0);
+            if (n <= 0) break;
+            out0 += (size_t)n;
+            const char *p = (const char *)buf;
+            while (n > 0) {
+                int k = send(fd, p, n, 0);
+                if (k <= 0) break;
+                p += k; n -= k;
+            }
+        }
+#endif
+    }
+    { char lb[190];
+      snprintf(lb, sizeof(lb), "hosted eof pid=%u sid=%u in=%llu out=%llu",
+               (unsigned)current_pid(), sid,
+               (unsigned long long)in0, (unsigned long long)out0);
+      dlog(lb); }
+    dt_hs_close(sid, 0);
+    return 0;
 }
 
-/* TCP tunnel thread: one link carrying BCAST + all TCP streams */
+/* TCP tunnel thread: control link (membership, beacons, UDP-over-TCP,
+ * stream requests). Game TCP stream DATA never transits this link. */
 #ifdef LINUX_BUILD
 static void *dt_tcp_thread(void *u) {
 #else
@@ -1093,9 +1891,9 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #endif
 #ifdef LINUX_BUILD
-        if (s < 0) { dt_msleep(1000); continue; }
+        if (s < 0) { dt_msleep(g_init_done ? 1000 : 250); continue; }
 #else
-        if (s == INVALID_SOCKET) { dt_msleep(1000); continue; }
+        if (s == INVALID_SOCKET) { dt_msleep(g_init_done ? 1000 : 250); continue; }
 #endif
         struct sockaddr_in sa;
         if (dt_resolve(&sa) != 0) {
@@ -1104,12 +1902,12 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
 #else
             closesocket(s);
 #endif
-            dt_msleep(1000); continue;
+            dt_msleep(g_init_done ? 1000 : 250); continue;
         }
 #ifdef LINUX_BUILD
-        if (r_connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) { r_close(s); dt_msleep(1000); continue; }
+        if (r_connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) { r_close(s); dt_msleep(g_init_done ? 1000 : 250); continue; }
 #else
-        if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) { closesocket(s); dt_msleep(1000); continue; }
+        if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) { closesocket(s); dt_msleep(g_init_done ? 1000 : 250); continue; }
 #endif
 #ifdef LINUX_BUILD
         g_tcp = s;
@@ -1118,52 +1916,21 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
 #endif
         g_tcp_up = 1;
         g_tcp_ever_up = 1;
-        dlog("tunnel TCP up");
+        { char lb[96];
+          snprintf(lb, sizeof(lb), "tunnel TCP up pid=%u", (unsigned)current_pid());
+          dlog(lb); }
         DLOCK();
         int need_hello = g_claimed && !g_hello_conn;
         if (need_hello) g_hello_conn = 1;
         DUNLOCK();
         if (need_hello) dt_send_hello(); /* reclaim after redial, once */
         dt_send_node(); /* (re)register membership + UDP endpoint */
-        /* Re-announce live TCP streams: the server drops per-connection
-         * streams on disconnect. Requeue OPENs at the FRONT (ahead of any
-         * still-queued DATA) and drop stale queued OPENs to avoid dups. */
-        DLOCK();
-        {
-            struct dt_frame *kept_h = NULL, *kept_t = NULL;
-            struct dt_frame *f = g_sqh;
-            while (f) {
-                struct dt_frame *nx = f->next;
-                if (f->type != DT_OPEN) {
-                    f->next = NULL;
-                    if (kept_t) kept_t->next = f; else kept_h = f;
-                    kept_t = f;
-                } else { free(f->p); free(f); }
-                f = nx;
-            }
-            g_sqh = NULL; g_sqt = NULL;
-            for (int i = 0; i < DT_MAXSTREAM; i++) {
-                if (g_st[i].used && !g_st[i].dead && g_st[i].sid) {
-                    unsigned char ob[6];
-                    dt_put32(ob, g_st[i].sid);
-                    dt_put16(ob + 4, (unsigned)ntohs(g_st[i].orig.sin_port));
-                    struct dt_frame *nf = (struct dt_frame *)malloc(sizeof(*nf));
-                    if (nf) {
-                        nf->p = (unsigned char *)malloc(6);
-                        if (nf->p) {
-                            memcpy(nf->p, ob, 6); nf->type = DT_OPEN; nf->n = 6; nf->next = NULL;
-                            if (g_sqt) g_sqt->next = nf; else g_sqh = nf;
-                            g_sqt = nf;
-                        } else free(nf);
-                    }
-                }
-            }
-            if (kept_h) {
-                if (g_sqt) g_sqt->next = kept_h; else g_sqh = kept_h;
-                g_sqt = kept_t;
-            }
+        if (g_udp_tcp) {
+            unsigned char z = 0;
+            dt_tcp_queue(DT_UDP_MODE, &z, 0); /* declare UDP-over-TCP mode */
         }
-        DUNLOCK();
+        /* v2: game TCP streams run on their own relay connections and
+         * survive control redials; nothing to re-announce here. */
         for (;;) {
             if (!g_tun_run) break;
             dt_init_watchdog();
@@ -1214,10 +1981,10 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                 int bport = (int)dt_get16(pl + 5);
                 int sport = (int)dt_get16(pl + 7);
                 {
-                    char lb[320]; int hp = 0;
+                    char lb[360]; int hp = 0;
                     size_t hn = ml - 9 < 110 ? ml - 9 : 110;
-                    hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d sp=%d n=%u hex=",
-                                  node, bport, sport, ml - 9);
+                    hp = snprintf(lb, sizeof(lb), "rx FROM node=%u port=%d sp=%d n=%u pid=%u hex=",
+                                  node, bport, sport, ml - 9, (unsigned)current_pid());
                     for (size_t qi = 0; qi < hn && hp < (int)sizeof(lb) - 3; qi++)
                         hp += snprintf(lb + hp, sizeof(lb) - hp, "%02x", pl[9 + qi]);
                     dlog(lb);
@@ -1225,26 +1992,25 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                 dt_dispatch_bcast_from(node, bport, sport, pl + 9, ml - 9);
             } else if (t == DT_ASSIGN && ml >= 2) {
                 dt_apply_assign(pl + 1, ml - 1);
-            } else if (t == DT_S2C && ml >= 5) {
-                dt_dispatch_s2c(dt_get32(pl + 1), pl + 5, ml - 5);
-            } else if (t == DT_CLOSE && ml >= 5) {
-                dt_dispatch_close(dt_get32(pl + 1));
-            } else if (t == DT_OPEN && ml >= 7) {
-                /* inbound: another player joins OUR game */
+            } else if (t == DT_STREQ && ml >= 7) {
+                /* v2: another player is joining OUR game. Serve it on a
+                 * dedicated per-stream relay connection (join thread);
+                 * stream data never transits this control link. */
                 unsigned sid = dt_get32(pl + 1);
                 int gport = (int)dt_get16(pl + 5);
-                if (dt_host_open(sid, gport) != 0) {
-                    unsigned char b[4]; dt_put32(b, sid);
-                    dt_tcp_queue(DT_CLOSE, b, 4);
-                } else dlog("hosted TCP stream up");
-            } else if (t == DT_C2S && ml >= 5) {
-                dt_host_data(dt_get32(pl + 1), pl + 5, ml - 5);
+                dt_on_streq(sid, gport);
+            } else if (t == DT_UDP_TUN && ml >= 2) {
+                /* UDP-over-TCP mode: one decapsulated UDP-tunnel
+                 * datagram; same ingress path as the UDP socket */
+                dt_udp_ingress(pl + 1, ml - 1);
             }
         }
 redial:
         g_tcp_up = 0;
         g_hello_conn = 0; /* next link re-hellos once */
-        dlog("tunnel TCP redial");
+        { char lb[96];
+          snprintf(lb, sizeof(lb), "tunnel TCP redial pid=%u", (unsigned)current_pid());
+          dlog(lb); }
 #ifdef LINUX_BUILD
         r_close(s);
 #else
@@ -1266,7 +2032,8 @@ redial:
 #endif
 }
 
-/* Hosted poller: serves loopback sockets owned by inbound sessions. */
+/* Hosted UDP poller: forwards loopback usess datagrams to the relay.
+ * (Hosted TCP streams are served per-connection by join threads.) */
 #ifdef LINUX_BUILD
 static void *dt_hosted_thread(void *u) {
 #else
@@ -1279,23 +2046,22 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
     unsigned char buf[65536];
     for (;;) {
         if (!g_tun_run) break;
-        /* snapshot live fds */
-        struct { long long fd; unsigned sid; int udp; int gport;
-                 struct sockaddr_in cli; int slot; } fds[DT_MAXHOST + DT_MAXUSESS];
+        /* sweep hosted sessions stuck in PENDING (relay redial lost the
+         * STREQ; the join thread will free its own on handshake failure) */
+        {
+            long long now = dt_now_ms();
+            DLOCK();
+            for (int i = 0; i < DT_MAXHOST; i++)
+                if (g_hs[i].used && !g_hs[i].live && now - g_hs[i].last > 30000)
+                    g_hs[i].used = 0;
+            DUNLOCK();
+        }
+        /* snapshot live usess (hosted UDP) fds */
+        struct { long long fd; unsigned sid; int gport;
+                 struct sockaddr_in cli; int slot; } fds[DT_MAXUSESS];
         int nfds = 0;
         long long now = dt_now_ms();
         DLOCK();
-        for (int i = 0; i < DT_MAXHOST && nfds < (int)(sizeof(fds) / sizeof(fds[0])); i++) {
-            if (g_hs[i].used && !g_hs[i].dead) {
-#ifdef LINUX_BUILD
-                if (g_hs[i].real < 0) continue;
-#else
-                if (g_hs[i].real == INVALID_SOCKET) continue;
-#endif
-                fds[nfds].fd = (long long)g_hs[i].real;
-                fds[nfds].sid = g_hs[i].sid; fds[nfds].udp = 0; nfds++;
-            }
-        }
         for (int i = 0; i < DT_MAXUSESS && nfds < (int)(sizeof(fds) / sizeof(fds[0])); i++) {
             if (g_us[i].used) {
 #ifdef LINUX_BUILD
@@ -1321,7 +2087,7 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
                     continue;
                 }
                 fds[nfds].fd = (long long)g_us[i].real;
-                fds[nfds].sid = 0; fds[nfds].udp = 1;
+                fds[nfds].sid = 0;
                 fds[nfds].gport = g_us[i].game_port;
                 fds[nfds].cli = g_us[i].cli; fds[nfds].slot = i; nfds++;
             }
@@ -1350,26 +2116,10 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
 #else
             if (!FD_ISSET((SOCKET)fds[i].fd, &rf)) continue;
 #endif
-            if (!fds[i].udp) {
-                /* hosted TCP: game -> tunnel */
-#ifdef LINUX_BUILD
-                ssize_t n = r_recv((int)fds[i].fd, buf, sizeof(buf), 0);
-#else
-                int n = recv((SOCKET)fds[i].fd, (char *)buf, (int)sizeof(buf), 0);
-#endif
-                if (n <= 0) {
-                    dt_hs_close(fds[i].sid, 1);
-                } else {
-                    unsigned char *p = (unsigned char *)malloc(4 + (size_t)n);
-                    if (p) {
-                        dt_put32(p, fds[i].sid);
-                        memcpy(p + 4, buf, (size_t)n);
-                        dt_tcp_queue(DT_S2C, p, 4 + (size_t)n);
-                        free(p);
-                    }
-                }
-            } else {
-                /* hosted UDP: game -> tunnel (only our game talks here) */
+            {
+                /* hosted UDP: game -> tunnel (only our game talks here).
+                 * Hosted TCP data flows on per-stream relay connections
+                 * (v2) and is served by the join threads, not here. */
 #ifdef LINUX_BUILD
                 ssize_t n = r_recv((int)fds[i].fd, buf, sizeof(buf), 0);
 #else
@@ -1422,6 +2172,57 @@ static DWORD WINAPI dt_hosted_thread(LPVOID u) {
 #endif
 }
 
+/* One UDP-tunnel datagram (UDP socket or decapsulated T_UDP_TUN):
+ * addressed game/ICMP traffic for our sockets. Shared by the UDP
+ * thread and the TCP thread (UDP-over-TCP mode). */
+static void dt_udp_ingress(const unsigned char *buf, size_t n) {
+    if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) return;
+    { char lb[80]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d pid=%u", buf[3], (int)n, (unsigned)current_pid()); dlog(lb); }
+    if (buf[3] == DU_C2S) {
+        /* inbound: another player targets OUR hosted game */
+        int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
+        if (8 + il2 + 2 > (int)n) return;
+        {
+            int cport2 = dt_get16(buf + 8 + il2);
+            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
+                                  buf + 10 + il2, n - 10 - (size_t)il2))
+                dt_direct_udp_in(gp2, buf + 8, il2,
+                                 buf + 10 + il2, n - 10 - (size_t)il2);
+        }
+        return;
+    }
+    if (buf[3] == DU_ICMP_REQ || buf[3] == DU_ICMP_REP) {
+        /* ping request/reply: addressed, never looped back by relay */
+        if (n >= 16) {
+            unsigned src = dt_get32(buf + 4), dest = dt_get32(buf + 8);
+            unsigned iid = dt_get16(buf + 12), seq = dt_get16(buf + 14);
+            dt_icmp_in(buf[3] == DU_ICMP_REP, src, dest, iid, seq,
+                       buf + 16, n - 16);
+        }
+        return;
+    }
+    if (buf[3] != DU_S2C) return;
+    dlog("udp tun: S2C in");
+    {
+        int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
+        int mp, slot;
+        const unsigned char *raw;
+        size_t rl;
+        struct sockaddr_in orig; long long gs = -1; int ok = 0;
+        if (8 + il + 2 > (int)n) return;
+        mp = dt_get16(buf + 8 + il);
+        raw = buf + 10 + il; rl = n - 10 - (size_t)il;
+        slot = mp - 50000;
+        DLOCK();
+        if (slot >= 0 && slot < DT_MAXSLOT && g_sl[slot].used && g_sl[slot].game_port == gp) {
+            orig = g_sl[slot].orig; gs = g_sl[slot].gsock; ok = 1;
+        }
+        DUNLOCK();
+        if (ok) dt_udp_push(gs, raw, rl, &orig);
+        else dlog("udp tun: slot miss");
+    }
+}
+
 /* UDP tunnel thread: game-UDP datagrams stay UDP */
 #ifdef LINUX_BUILD
 static void *dt_udp_thread(void *u) {
@@ -1465,44 +2266,7 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         unsigned char buf[65535];
         ssize_t n = r_recv(s, buf, sizeof(buf), 0);
         if (n <= 0) continue;
-        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
-        { char lb[64]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d", buf[3], (int)n); dlog(lb); }
-        if (buf[3] == DU_C2S) {
-            /* inbound: another player targets OUR hosted game */
-            int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
-            if (8 + il2 + 2 > n) continue;
-            int cport2 = dt_get16(buf + 8 + il2);
-            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
-                                  buf + 10 + il2, (size_t)(n - 10 - il2)))
-                dt_direct_udp_in(gp2, buf + 8, il2,
-                                 buf + 10 + il2, (size_t)(n - 10 - il2));
-            continue;
-        }
-        if (buf[3] == DU_ICMP_REQ || buf[3] == DU_ICMP_REP) {
-            /* ping request/reply: addressed, never looped back by relay */
-            if (n >= 16) {
-                unsigned src = dt_get32(buf + 4), dest = dt_get32(buf + 8);
-                unsigned iid = dt_get16(buf + 12), seq = dt_get16(buf + 14);
-                dt_icmp_in(buf[3] == DU_ICMP_REP, src, dest, iid, seq,
-                           buf + 16, (size_t)(n - 16));
-            }
-            continue;
-        }
-        if (buf[3] != DU_S2C) continue;
-        dlog("udp tun: S2C in");
-        int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
-        if (8 + il + 2 > n) continue;
-        int mp = dt_get16(buf + 8 + il);
-        const unsigned char *raw = buf + 10 + il; size_t rl = (size_t)(n - 10 - il);
-        int slot = mp - 50000;
-        struct sockaddr_in orig; long long gs = -1; int ok = 0;
-        DLOCK();
-        if (slot >= 0 && slot < DT_MAXSLOT && g_sl[slot].used && g_sl[slot].game_port == gp) {
-            orig = g_sl[slot].orig; gs = g_sl[slot].gsock; ok = 1;
-        }
-        DUNLOCK();
-        if (ok) dt_udp_push(gs, raw, rl, &orig);
-        else dlog("udp tun: slot miss");
+        dt_udp_ingress(buf, (size_t)(n > 0 ? n : 0));
     }
     return NULL;
 #else
@@ -1540,43 +2304,7 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
         unsigned char buf[65535];
         int n = recv(s, (char *)buf, (int)sizeof(buf), 0);
         if (n <= 0) continue;
-        if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != 1) continue;
-        { char lb[64]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d", buf[3], n); dlog(lb); }
-        if (buf[3] == DU_C2S) {
-            /* inbound: another player targets OUR hosted game */
-            int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
-            if (8 + il2 + 2 > n) continue;
-            int cport2 = dt_get16(buf + 8 + il2);
-            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
-                                  buf + 10 + il2, (size_t)(n - 10 - il2)))
-                dt_direct_udp_in(gp2, buf + 8, il2,
-                                 buf + 10 + il2, (size_t)(n - 10 - il2));
-            continue;
-        }
-        if (buf[3] == DU_ICMP_REQ || buf[3] == DU_ICMP_REP) {
-            /* ping request/reply: addressed, never looped back by relay */
-            if (n >= 16) {
-                unsigned src = dt_get32(buf + 4), dest = dt_get32(buf + 8);
-                unsigned iid = dt_get16(buf + 12), seq = dt_get16(buf + 14);
-                dt_icmp_in(buf[3] == DU_ICMP_REP, src, dest, iid, seq,
-                           buf + 16, (size_t)(n - 16));
-            }
-            continue;
-        }
-        if (buf[3] != DU_S2C) continue;
-        int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
-        if (8 + il + 2 > n) continue;
-        int mp = dt_get16(buf + 8 + il);
-        const unsigned char *raw = buf + 10 + il; size_t rl = (size_t)(n - 10 - il);
-        int slot = mp - 50000;
-        struct sockaddr_in orig; long long gs = -1; int ok = 0;
-        DLOCK();
-        if (slot >= 0 && slot < DT_MAXSLOT && g_sl[slot].used && g_sl[slot].game_port == gp) {
-            orig = g_sl[slot].orig; gs = g_sl[slot].gsock; ok = 1;
-        }
-        DUNLOCK();
-        if (ok) dt_udp_push(gs, raw, rl, &orig);
-        else dlog("udp tun: slot miss");
+        dt_udp_ingress(buf, (size_t)(n > 0 ? n : 0));
     }
     return 0;
 #endif
@@ -1588,13 +2316,40 @@ static void dt_start(void) {
     g_init_t0 = dt_now_ms(); /* watchdog baseline: threads start below */
     g_fakeip = inet_addr("192.168.7.1");
     if (!g_node) {
-        /* stable-ish random node id (loopback tests fork rarely collide) */
+        /* One identity per process TREE: a child (GBE self-restart chain,
+         * injected sub-process, plain fork/exec) inherits LAN_HOOK_NODE
+         * from the parent environment and adopts the same node_id -> the
+         * relay sees the whole tree as ONE host (one vnode, many links).
+         * Roots generate once, then publish into their OWN environment so
+         * every later CreateProcess/exec child inherits it. Can also be
+         * set manually (LAN_HOOK_NODE=709102507) to merge separate
+         * launches into one identity. */
+        const char *ne = getenv("LAN_HOOK_NODE");
+        unsigned long ev = (ne && ne[0]) ? strtoul(ne, NULL, 0) : 0;
+        if (ev) {
+            g_node = (unsigned)ev;
+        } else {
+            /* stable-ish random node id (loopback tests fork rarely collide) */
 #ifdef LINUX_BUILD
-        dt_rand_state = (unsigned)dt_now_ms() ^ ((unsigned)getpid() << 16);
+            dt_rand_state = (unsigned)dt_now_ms() ^ ((unsigned)getpid() << 16);
 #else
-        dt_rand_state = (unsigned)GetTickCount() ^ (GetCurrentProcessId() << 16);
+            dt_rand_state = (unsigned)GetTickCount() ^ (GetCurrentProcessId() << 16);
 #endif
-        g_node = dt_rand() | 1;
+            g_node = dt_rand() | 1;
+        }
+        {
+            char nb[24];
+            snprintf(nb, sizeof nb, "%u", g_node);
+#ifdef LINUX_BUILD
+            setenv("LAN_HOOK_NODE", nb, 1);
+#else
+            SetEnvironmentVariableA("LAN_HOOK_NODE", nb);
+#endif
+        }
+        { char lb[96];
+          snprintf(lb, sizeof(lb), "identity pid=%u node=%u%s",
+                   (unsigned)current_pid(), g_node, ev ? " (inherited)" : "");
+          dlog(lb); }
     }
     dt_send_udp_node(); /* refresh even if the socket below already exists */
     /* Create the UDP tunnel socket synchronously: game threads may send
@@ -1721,11 +2476,11 @@ static void dt_start(void) {
 
 /* --- hook call-ins: 1 = consumed (tunnel), 0 = passthrough to real --- */
 static unsigned dt_next_sid(void) {
-#ifdef LINUX_BUILD
-    return (unsigned)__sync_add_and_fetch(&g_sid, 1);
-#else
-    return (unsigned)InterlockedIncrement((volatile LONG *)&g_sid);
-#endif
+    /* room-wide unique stream id (the relay keys streams by it): random,
+     * not a per-process counter (two nodes would otherwise collide) */
+    unsigned v;
+    do { v = dt_rand(); } while (!v);
+    return v;
 }
 /* Outbound UDP source identity: our virtual IP (unique per node) when
  * assigned, else loopback. Unique triples keep relay per-dest flows and
@@ -1741,40 +2496,11 @@ static int dt_src_ip(char *out, size_t n) {
     return 1;
 }
 /* Raw tunnel-UDP transmit to the relay. */
-/* Firewall ride (LAN_HOOK_TUNNEL_PORT=<port>): bind the tunnel socket to
- * the game's own UDP port. Windows program rules key on the executable,
- * so replies pass under rules the game legitimately earned; connect()
- * then pins exact 4-tuple demux so tunnel traffic lands on this socket
- * even when the app's own socket shares the port, and REUSEADDR lets
- * both bind. Use on at most ONE hooked process per machine. Unset
- * (default): ephemeral port, relying on the stateful unicast-reply
- * pinhole opened by our outbound keepalives. */
+/* Prepare the UDP tunnel socket: connect() pins the exact 4-tuple to
+ * the relay (so the reply pinhole stays unambiguous) on an ephemeral
+ * port; outbound keepalives keep the NAT mapping fresh. */
 static void dt_tun_setup(DTSOCK s) {
     struct sockaddr_in sa;
-    const char *tp = getenv("LAN_HOOK_TUNNEL_PORT");
-    if (tp && tp[0]) {
-        int p = atoi(tp);
-        if (p > 0 && p < 65536) {
-            struct sockaddr_in tb;
-            int on = 1;
-            memset(&tb, 0, sizeof(tb));
-            tb.sin_family = AF_INET;
-            tb.sin_addr.s_addr = htonl(INADDR_ANY);
-            tb.sin_port = htons((unsigned short)p);
-#ifdef LINUX_BUILD
-            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-#else
-            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
-#endif
-            if (bind(s, (struct sockaddr *)&tb, sizeof(tb)) != 0)
-                dlog("udp tun: ride-port bind failed, ephemeral");
-            else {
-                char lb[64];
-                snprintf(lb, sizeof(lb), "udp tun: bound ride-port %d", p);
-                dlog(lb);
-            }
-        }
-    }
     if (dt_resolve(&sa) == 0 &&
         connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
         g_tun_conn = 1;
@@ -1783,6 +2509,18 @@ static void dt_tun_setup(DTSOCK s) {
 }
 static void dt_udp_tun_send(const unsigned char *d, size_t n) {
     struct sockaddr_in sa;
+    if (g_udp_tcp) {
+        /* UDP-over-TCP: game datagrams ride the TCP link (same bytes,
+         * decapsulated by the relay). Keeps working where inbound UDP
+         * is filtered; costs head-of-line blocking, hence opt-in. */
+        unsigned char *p = (unsigned char *)malloc(n ? n : 1);
+        if (!p) return;
+        if (n) memcpy(p, d, n);
+        dt_tcp_queue(DT_UDP_TUN, p, n);
+        free(p);
+        dlog("udp game: via TCP link");
+        return;
+    }
     if (dt_resolve(&sa) != 0) { dlog("udp game: resolve failed"); return; }
 #ifdef LINUX_BUILD
     dt_reals();
@@ -2297,56 +3035,104 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
     if (st) {
         st->used = 1; st->gsock = gsock; st->sid = sid; st->orig = *dst;
         st->h = st->t = NULL; st->total = 0; st->dead = 0;
+        st->state = ST_CONNECTING; st->fail = 0;
+        st->in_paused = 0; st->connect_signaled = 0;
+        st->fd = DTSOCK_BAD;
+        st->oh = st->ot = NULL; st->ototal = 0;
+        st->an_rx = st->an_tx = 0; st->ab_rx = st->ab_tx = 0; st->a_log = 0;
     }
     DUNLOCK();
     if (st) *sid_out = sid;
     return st;
 }
-/* Outbound connect routing. Virtual peer IP -> addressed POPEN stream;
- * other LAN -> plain OPEN (relay resolves the target). Returns 1 when
- * consumed (fake success; data follows via stream send), else 0. */
+/* Outbound connect routing. Virtual peer IP -> addressed stream (dest
+ * node); other LAN target -> implicit stream (relay routes to the
+ * designated host / newest beaconer). Each becomes its own real TCP
+ * connection to the relay (v2). Returns 1 when consumed, 2 when the
+ * socket already has a live stream (WSAEALREADY), else 0 (real stack). */
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */
-    unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
-    if (vnode) {
-        /* addressed P2P stream */
-        if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
-        unsigned sid = 0;
-        if (!dt_stream_alloc(gsock, dst, &sid)) return 1;
-        unsigned char ob[10];
-        dt_put32(ob, sid); dt_put32(ob + 4, vnode);
-        dt_put16(ob + 8, (unsigned)ntohs(dst->sin_port));
-        dt_tcp_queue(DT_POPEN, ob, 10);
-        return 1;
-    }
-    int port = 0;
-    if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
     if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
+    DLOCK();
+    struct dt_stream *ex = dt_stream_by_sock(gsock);
+    DUNLOCK();
+    if (ex) return 2;
+    unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
+    int is_vnode = vnode != 0;
+    if (!is_vnode) {
+        int port = 0;
+        if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
+    }
     unsigned sid = 0;
     if (!dt_stream_alloc(gsock, dst, &sid)) return 1; /* table full */
-    unsigned char ob[6]; dt_put32(ob, sid); dt_put16(ob + 4, (unsigned)ntohs(dst->sin_port));
-    dt_tcp_queue(DT_OPEN, ob, 6);
+    dt_st_spawn(dt_stream_thread, (void *)(uintptr_t)sid);
     return 1;
 }
+/* App -> stream out-queue. Returns: len queued; 0 not our stream;
+ * -1 stream dead (ECONNRESET); -2 our stream, out-queue full
+ * (caller: nonblocking app -> EWOULDBLOCK, blocking app -> wait+retry). */
 static int dt_stream_send(long long gsock, const unsigned char *buf, size_t len) {
+    unsigned lsid = 0; size_t ln = 0, tot = 0; int dolog = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    int dead = st ? st->dead : 1; unsigned sid = st ? st->sid : 0;
-    int ok = (st && !dead);
+    if (!st) { DUNLOCK(); return 0; }
+    if (st->dead || st->state == ST_DEAD) { DUNLOCK(); return -1; }
+    if (st->ototal + len > DT_ST_MAXOUT) { DUNLOCK(); return -2; }
+    if (len) {
+        struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
+        if (!c) { DUNLOCK(); return -2; }
+        c->p = (unsigned char *)malloc(len);
+        if (!c->p) { free(c); DUNLOCK(); return -2; }
+        memcpy(c->p, buf, len);
+        c->n = len; c->off = 0; c->next = NULL;
+        if (st->ot) st->ot->next = c; else st->oh = c;
+        st->ot = c; st->ototal += len;
+        st->ab_tx += len; st->an_tx++;
+        tot = st->ab_tx; lsid = st->sid; ln = len;
+        long long now = dt_now_ms();
+        if (st->an_tx <= 3 || now - st->a_log > 1000) { st->a_log = now; dolog = 1; }
+    }
     DUNLOCK();
-    if (!st) return 0;
-    if (dead) return -1;
-    unsigned char *p = (unsigned char *)malloc(4 + len);
-    if (!p) return (int)len;
-    dt_put32(p, sid);
-    if (len) memcpy(p + 4, buf, len);
-    dt_tcp_queue(DT_C2S, p, 4 + len);
-    free(p);
-    (void)ok; return (int)len;
+    if (dolog) {
+        char lb[160];
+        snprintf(lb, sizeof(lb), "app tx pid=%u gsock=%lld sid=%u n=%zu tot=%zu",
+                 (unsigned)current_pid(), gsock, lsid, ln, tot);
+        dlog(lb);
+    }
+    return (int)len;
+}
+/* App -> stream out-queue with kernel-like backpressure: a nonblocking
+ * app gets EWOULDBLOCK when the queue is full; a blocking app simply
+ * blocks until there is room (or the stream dies). Shared by the Linux
+ * send() and Windows send()/WSASend() hooks. Returns: len queued,
+ * 0 not our stream, -1 dead (ECONNRESET set), -2 full (EWOULDBLOCK set
+ * for nonblocking apps; blocking apps never see -2). */
+static void dt_stream_send_err(int r) {
+#ifdef LINUX_BUILD
+    if (r == -1) errno = ECONNRESET;
+    else if (r == -2) errno = EAGAIN;
+#else
+    if (r == -1) WSASetLastError(WSAECONNRESET);
+    else if (r == -2) WSASetLastError(WSAEWOULDBLOCK);
+#endif
+}
+static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len) {
+    int nonblock = dt_is_nonblock(s);
+    for (;;) {
+        int r = dt_stream_send(s, buf, len);
+        if (r >= 0) return r;
+        if (r == -1) { dt_stream_send_err(-1); return -1; }
+        if (r == -2) {
+            if (nonblock) { dt_stream_send_err(-2); return -2; }
+            dt_msleep(5);
+            continue;
+        }
+    }
 }
 /* pop stream bytes; 1 got (>0), 0 empty, -1 dead */
 static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_t *outn) {
-    int r = 0; DLOCK();
+    int r = 0; size_t ln = 0; unsigned lsid = 0; int dolog = 0; size_t tot = 0;
+    DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st && st->h) {
         size_t n = st->h->n - st->h->off;
@@ -2357,8 +3143,19 @@ static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_
             struct dt_chunk *o = st->h; st->h = o->next; if (!st->h) st->t = NULL;
             free(o->p); free(o);
         }
-    } else if (st && st->dead) r = -1;
-    DUNLOCK(); return r;
+        if (st->in_paused && st->total < DT_ST_MAXIN / 2) st->in_paused = 0;
+        ln = n; lsid = st->sid; st->ab_rx += n; st->an_rx++; tot = st->ab_rx;
+        long long now = dt_now_ms();
+        if (st->an_rx <= 3 || now - st->a_log > 1000) { st->a_log = now; dolog = 1; }
+    } else if (st && (st->dead || st->state == ST_DEAD)) r = -1;
+    DUNLOCK();
+    if (dolog) {
+        char lb[160];
+        snprintf(lb, sizeof(lb), "app rx pid=%u gsock=%lld sid=%u n=%zu tot=%zu",
+                 (unsigned)current_pid(), gsock, lsid, ln, tot);
+        dlog(lb);
+    }
+    return r;
 }
 static int dt_getpeer(long long gsock, struct sockaddr_in *out) {
     int ok = 0; DLOCK();
@@ -2377,8 +3174,16 @@ static int dt_udp_has(long long gsock) {
 static int dt_stream_has(long long gsock) {
     int r = 0; DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    if (st) r = (st->h || st->dead) ? 1 : 0; /* dead reads EOF = readable */
+    if (st) r = (st->h || st->dead || st->state == ST_DEAD) ? 1 : 0; /* dead = readable EOF */
     DUNLOCK(); return r;
+}
+/* one-shot connect-completed (FD_CONNECT): mark reported (Windows
+ * WSAEnum path). inline: referenced only there, no unused warning elsewhere. */
+static inline void dt_stream_mark_connect(long long gsock) {
+    DLOCK();
+    struct dt_stream *st = dt_stream_by_sock(gsock);
+    if (st) st->connect_signaled = 1;
+    DUNLOCK();
 }
 /* Timeout sockets park in poll()/select() BEFORE ever calling recvfrom,
  * so the wait hooks must register DGRAM interest too — otherwise fan-out
@@ -2397,9 +3202,21 @@ static int dt_fd_readable(long long gsock) {
 static void dt_on_close(long long gsock) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    unsigned sid = 0;
-    if (st) { sid = st->sid; st->used = 0;
-        struct dt_chunk *c = st->h; while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; } }
+    int stream_freed = 0;
+    if (st) {
+        st->dead = 1;          /* stream thread finishes + frees the slot */
+        if (st->state != ST_CONNECTING) {
+            /* thread already exited (or never started): free now */
+            st->used = 0; st->fd = DTSOCK_BAD;
+            struct dt_chunk *c = st->h;
+            while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+            c = st->oh;
+            while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+            st->h = st->t = st->oh = st->ot = NULL;
+            st->total = st->ototal = 0;
+            stream_freed = 1;
+        }
+    }
     struct dt_udp *e = dt_udp_entry(gsock, 0);
     if (e) { e->closed = 1; e->used = 0;
         struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
@@ -2411,7 +3228,10 @@ static void dt_on_close(long long gsock) {
         if (g_evmap[i].used && g_evmap[i].sock == gsock) g_evmap[i].used = 0;
 #endif
     DUNLOCK();
-    if (sid) { unsigned char b[4]; dt_put32(b, sid); dt_tcp_queue(DT_CLOSE, b, 4); }
+    if (!stream_freed && st && st->state == ST_CONNECTING) {
+        /* wake the (starting) stream thread so it aborts the handshake */
+        dt_st_fail_local(st, STF_HOST_FAILED);
+    }
 #ifndef LINUX_BUILD
     DLOCK();
     for (int i = 0; i < (int)(sizeof(g_nbt) / sizeof(g_nbt[0])); i++)
@@ -2461,7 +3281,7 @@ static void ensure_init(void) {
     static int done = 0;
     if (!done) { done = 1;
         dlog("ShadowLAN hook v" SHADOWLAN_VERSION " init");
-        policy_init(); if (g_direct) dt_start(); g_init_done = 1; }
+        policy_init(); dt_log_options(); if (g_direct) dt_start(); g_init_done = 1; }
 }
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest, socklen_t addrlen) {
@@ -2525,9 +3345,10 @@ ssize_t send(int s, const void *buf, size_t len, int flags) {
     ensure_init();
     if (!real_send) real_send = dlsym(RTLD_NEXT, "send");
     if (g_direct) {
-        int r = dt_stream_send((long long)s, (const unsigned char *)buf, len);
+        int r = dt_stream_send_wait((long long)s, (const unsigned char *)buf, len);
         if (r > 0) return (ssize_t)r;
-        if (r < 0) { errno = ECONNRESET; return -1; }
+        if (r == -1) { errno = ECONNRESET; return -1; }
+        if (r == -2) { errno = EAGAIN; return -1; }
     }
     return real_send(s, buf, len, flags);
 }
@@ -2556,7 +3377,30 @@ int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
     ensure_init();
     if (!real_connect) real_connect = dlsym(RTLD_NEXT, "connect");
     if (g_direct && a && a->sa_family == AF_INET && l >= sizeof(struct sockaddr_in)) {
-        if (dt_on_connect((long long)s, (const struct sockaddr_in *)a)) return 0;
+        int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 1) {
+            int nonblock = dt_is_nonblock((long long)s);
+            if (nonblock) { errno = EINPROGRESS; return -1; }
+            long long t0 = dt_now_ms();
+            for (;;) {
+                DLOCK();
+                struct dt_stream *st = dt_stream_by_sock((long long)s);
+                int state = st ? st->state : 0;
+                unsigned fail = st ? st->fail : 0;
+                DUNLOCK();
+                if (state == ST_OPEN) return 0;
+                if (state == ST_DEAD) {
+                    errno = (fail == STF_JOIN_TIMEOUT) ? ETIMEDOUT : ECONNREFUSED;
+                    return -1;
+                }
+                if (dt_now_ms() - t0 > (long long)DT_ST_TIMEOUT_MS + 500) {
+                    errno = ETIMEDOUT;
+                    return -1;
+                }
+                dt_msleep(10);
+            }
+        }
+        if (r == 2) { errno = EALREADY; return -1; }
     }
     return real_connect(s, a, l);
 }
@@ -2590,6 +3434,24 @@ int close(int fd) {
     if (g_direct) dt_on_close((long long)fd);
     return real_close(fd);
 }
+int ioctl(int fd, unsigned long request, ...) {
+    static int (*real_ioctl)(int, unsigned long, ...) = 0;
+    va_list ap;
+    ensure_init();
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    if (g_direct && request == FIONREAD && arg) {
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)fd);
+        int v = 0;
+        if (st) v = (int)st->total;
+        DUNLOCK();
+        if (st) { *(int *)arg = v; return 0; }
+    }
+    return real_ioctl(fd, request, arg);
+}
 /* poll/select must report tunnel-queued data as readable, or apps with
  * timeouts (incl. every CPython socket with settimeout) sleep in poll
  * and never call recvfrom. Slices bound tunnel latency to ~25ms. */
@@ -2600,10 +3462,30 @@ static int dt_select_scan(int nfds, fd_set *r, fd_set *w, fd_set *x);
 static int dt_poll_scan(struct pollfd *fds, nfds_t nfds) {
     int n = 0;
     for (nfds_t i = 0; i < nfds; i++) {
-        if (fds[i].fd >= 0 && (fds[i].events & POLLIN)) {
-            if (dt_fd_readable((long long)fds[i].fd)) { fds[i].revents |= POLLIN; n++; }
+        if (fds[i].fd < 0) continue;
+        if ((fds[i].events & POLLIN) && dt_fd_readable((long long)fds[i].fd))
+            fds[i].revents |= POLLIN;
+        if (fds[i].events & (POLLOUT | POLLWRNORM)) {
+            int data, dead, wr, cn;
+            dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
+            if (wr || cn) fds[i].revents |= POLLOUT;
         }
+        if (fds[i].revents) n++;
     }
+    return n;
+}
+/* tunneled writable set: streams that are open (or just connected) and
+ * udp sockets; like a real select would report for those */
+static int dt_wscan(int nfds, fd_set *w0, fd_set *wout) {
+    int n = 0;
+    if (!w0 || !wout) return 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        if (!FD_ISSET(fd, w0)) continue;
+        int data, dead, wr, cn;
+        dt_sock_state_full((long long)fd, &data, &dead, &wr, &cn);
+        if (wr || cn) FD_SET(fd, wout);
+    }
+    for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, wout)) n++;
     return n;
 }
 int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
@@ -2664,10 +3546,11 @@ int pselect(int nfds, fd_set *r, fd_set *w, fd_set *x,
                 for (int fd = 0; fd < nfds; fd++)
                     if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             }
-            if (w) FD_ZERO(w);
+            if (w) { FD_ZERO(w); dt_wscan(nfds, &w0, w); }
             if (x) FD_ZERO(x);
             int n = 0;
             if (r) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, r)) n++;
+            if (w) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, w)) n++;
             return n;
         }
     }
@@ -2690,7 +3573,7 @@ int pselect(int nfds, fd_set *r, fd_set *w, fd_set *x,
         int rr_ = real_pselect(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv, mask);
         if (rr_ < 0) return rr_;
         if (rr_ > 0) {
-            if (r) *r = rr; if (w) *w = ww; if (x) *x = xx;
+            if (r) *r = rr; if (w) { *w = ww; dt_wscan(nfds, &w0, w); } if (x) *x = xx;
             if (r) for (int fd = 0; fd < nfds; fd++)
                 if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             int n = 0;
@@ -2786,10 +3669,11 @@ int select(int nfds, fd_set *r, fd_set *w, fd_set *x, struct timeval *tmo) {
                 for (int fd = 0; fd < nfds; fd++)
                     if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             }
-            if (w) FD_ZERO(w);
+            if (w) { FD_ZERO(w); dt_wscan(nfds, &w0, w); }
             if (x) FD_ZERO(x);
             int n = 0;
             if (r) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, r)) n++;
+            if (w) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, w)) n++;
             return n;
         }
     }
@@ -2811,7 +3695,7 @@ int select(int nfds, fd_set *r, fd_set *w, fd_set *x, struct timeval *tmo) {
         int rr_ = real_select(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv);
         if (rr_ < 0) return rr_;
         if (rr_ > 0) {
-            if (r) *r = rr; if (w) *w = ww; if (x) *x = xx;
+            if (r) *r = rr; if (w) { *w = ww; dt_wscan(nfds, &w0, w); } if (x) *x = xx;
             if (r) for (int fd = 0; fd < nfds; fd++)
                 if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             int n = 0;
@@ -2902,7 +3786,12 @@ static void dbg(const char *m) {
             const char *p = getenv("LAN_HOOK_LOGFILE");
             if (p && p[0]) lf = fopen(p, "a");
         }
-        if (lf) { fputs(m, lf); fflush(lf); }
+        if (lf) {
+            char ts[32];
+            dt_stamp(ts, sizeof(ts));
+            fputs(ts, lf); fputc(' ', lf);
+            fputs(m, lf); fflush(lf);
+        }
     }
 }
 
@@ -2945,7 +3834,12 @@ static void flog_open(void) {
 }
 static void flog(const char *m) {
     if (!g_logf) flog_open();
-    if (g_logf) { fputs(m, g_logf); fputc('\n', g_logf); fflush(g_logf); }
+    if (g_logf) {
+        char ts[32];
+        dt_stamp(ts, sizeof(ts));
+        fputs(ts, g_logf); fputc(' ', g_logf);
+        fputs(m, g_logf); fputc('\n', g_logf); fflush(g_logf);
+    }
 }
 static void write_minidump(void) {
     HMODULE hd = GetModuleHandleA("dbghelp.dll");
@@ -3003,8 +3897,9 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
             if (g_debug) {
                 unsigned long av = 0; memcpy(&av, &tfrom.sin_addr.s_addr, 4);
                 char lb[128];
-                snprintf(lb, sizeof(lb), "grecv sock=%lld n=%d src=%lu.%lu.%lu.%lu:%d",
-                         (long long)s, (int)on, (av & 255), ((av >> 8) & 255),
+                snprintf(lb, sizeof(lb), "grecv pid=%u sock=%lld n=%d src=%lu.%lu.%lu.%lu:%d",
+                         (unsigned)current_pid(), (long long)s, (int)on,
+                         (av & 255), ((av >> 8) & 255),
                          ((av >> 16) & 255), ((av >> 24) & 255),
                          (int)ntohs(tfrom.sin_port));
                 dlog(lb);
@@ -3023,8 +3918,9 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
             int n = p_recvfrom(s, buf, len, flags, from, fromlen);
             if (g_debug) {
                 char lb[96];
-                snprintf(lb, sizeof(lb), "grecv REAL-WIRE sock=%lld n=%d err=%d",
-                         (long long)s, n, n == SOCKET_ERROR ? WSAGetLastError() : 0);
+                snprintf(lb, sizeof(lb), "grecv REAL-WIRE pid=%u sock=%lld n=%d err=%d",
+                         (unsigned)current_pid(), (long long)s, n,
+                         n == SOCKET_ERROR ? WSAGetLastError() : 0);
                 dlog(lb);
             }
             return n;
@@ -3151,12 +4047,43 @@ int WSAAPI hk_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD
     int n = p_WSARecvFrom(s, b, nb, recvd, flags, from, fromlen, NULL, NULL);
     return n;
 }
+/* Real connect semantics for tunneled streams: the stream thread runs
+ * the handshake (relay dial + STOPEN/STOK) and only then reports the
+ * socket open. Nonblocking apps get WSAEWOULDBLOCK + later FD_CONNECT /
+ * writable; blocking apps wait here until confirmed (or failed). */
+static int dt_stfail_wsae(unsigned reason) {
+    switch (reason) {
+    case STF_JOIN_TIMEOUT: return WSAETIMEDOUT;
+    case STF_NO_ROUTE:
+    case STF_HOST_FAILED:
+    case STF_BAD_ID:
+    case STF_BUSY:         return WSAECONNREFUSED;
+    default:               return WSAETIMEDOUT;
+    }
+}
+static int dt_connect_wait(long long gsock, int nonblock) {
+    if (nonblock) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
+    long long t0 = dt_now_ms();
+    for (;;) {
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock(gsock);
+        int state = st ? st->state : 0;
+        unsigned fail = st ? st->fail : 0;
+        DUNLOCK();
+        if (state == ST_OPEN) return 0;
+        if (state == ST_DEAD) { WSASetLastError(dt_stfail_wsae(fail)); return SOCKET_ERROR; }
+        if (dt_now_ms() - t0 > DT_ST_TIMEOUT_MS + 500) {
+            WSASetLastError(WSAETIMEDOUT);
+            return SOCKET_ERROR;
+        }
+        dt_msleep(10);
+    }
+}
 int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
-        if (dt_on_connect((long long)s, (const struct sockaddr_in *)a)) {
-            dbg("lan_hook: connect tunneled\n");
-            return 0;
-        }
+        int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
+        if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
     return p_connect(s, a, l);
 }
@@ -3237,10 +4164,13 @@ int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
     return r;
 }
 int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1, LPWSABUF b2, LPQOS q1, LPQOS q2) {
+    (void)b1; (void)b2; (void)q1; (void)q2;
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
-        if (dt_on_connect((long long)s, (const struct sockaddr_in *)a)) return 0;
+        int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
+        if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
-    return p_WSAConnect(s, a, l, b1, b2, q1, q2);
+    return p_WSAConnect ? p_WSAConnect(s, a, l, b1, b2, q1, q2) : SOCKET_ERROR;
 }
 int WSAAPI hk_getpeername(SOCKET s, struct sockaddr *a, int *l) {
     if (g_direct && a && l && *l >= (int)sizeof(struct sockaddr_in)) {
@@ -3269,9 +4199,10 @@ int WSAAPI hk_listen(SOCKET s, int backlog) {
 int WSAAPI hk_send(SOCKET s, const char *buf, int len, int flags) {
     (void)flags;
     if (g_direct) {
-        int r = dt_stream_send((long long)s, (const unsigned char *)buf, (size_t)(len < 0 ? 0 : len));
+        int r = dt_stream_send_wait((long long)s, (const unsigned char *)buf, (size_t)(len < 0 ? 0 : len));
         if (r > 0) return r;
-        if (r < 0) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+        if (r == 0) { /* fall through to real socket */ }
+        else return SOCKET_ERROR;
     }
     return p_send(s, buf, len, flags);
 }
@@ -3307,14 +4238,20 @@ int WSAAPI hk_WSASend(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
             if (tmp) {
                 size_t off = 0;
                 for (i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
-                int r = dt_stream_send((long long)s, tmp, total);
+                int r = dt_stream_send_wait((long long)s, tmp, total);
                 free(tmp);
                 if (r > 0) {
                     if (sent) *sent = (DWORD)r;
                     if (ov->hEvent) WSASetEvent(ov->hEvent);
                     return 0;
                 }
-                if (r < 0) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+                if (r == 0) { /* not our stream: fall through */ }
+                else {
+                    WSASetLastError(WSAECONNRESET);
+                    if (r == -2) WSASetLastError(WSAEWOULDBLOCK);
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return SOCKET_ERROR;
+                }
             }
         }
         return p_WSASend(s, b, nb, sent, flags, ov, cr);
@@ -3326,10 +4263,14 @@ int WSAAPI hk_WSASend(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flags,
         if (tmp) {
             size_t off = 0;
             for (DWORD i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
-            int r = dt_stream_send((long long)s, tmp, total);
+            int r = dt_stream_send_wait((long long)s, tmp, total);
             free(tmp);
             if (r > 0) { if (sent) *sent = (DWORD)r; return 0; }
-            if (r < 0) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+            if (r == 0) { /* not our stream: fall through */ }
+            else {
+                WSASetLastError(r == -2 ? WSAEWOULDBLOCK : WSAECONNRESET);
+                return SOCKET_ERROR;
+            }
         }
     }
     return p_WSASend(s, b, nb, sent, flags, ov, cr);
@@ -3393,6 +4334,29 @@ int WSAAPI hk_WSARecv(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD recvd, LPDWORD fla
 int WSAAPI hk_ioctlsocket(SOCKET s, long cmd, u_long *argp) {
     int r = p_ioctlsocket(s, cmd, argp);
     if (r == 0 && cmd == (long)FIONBIO && argp) dt_set_nonblock((long long)s, *argp ? 1 : 0);
+    /* FIONREAD on a tunneled stream: report the hook in-queue (the real
+     * socket never sees the bytes). Readers driven by FIONREAD (e.g.
+     * GBE's recv_tcp) never read otherwise and the peer can never
+     * "connect" from their side. */
+    if (cmd == (long)FIONREAD && argp && g_direct) {
+        int dolog = 0; unsigned qn = 0;
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)s);
+        if (st) {
+            qn = (unsigned)st->total; *argp = (u_long)qn;
+            /* key field signal: bytes waiting but app has read NONE yet */
+            if (qn && st->an_rx == 0 && !st->a_log) { st->a_log = 1; dolog = 1; }
+            DUNLOCK();
+            if (dolog) {
+                char lb[128];
+                snprintf(lb, sizeof(lb), "fion: queued=%u unread pid=%u sock=%lld sid=%u",
+                         qn, (unsigned)current_pid(), (long long)s, st->sid);
+                dlog(lb);
+            }
+            return 0;
+        }
+        DUNLOCK();
+    }
     return r;
 }
 /* select/WSAPoll must report tunnel data readable (same reason as Linux). */
@@ -3418,7 +4382,15 @@ int WSAAPI hk_select(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct tim
                 if (dt_fd_readable((long long)r0.fd_array[i])) FD_SET(r0.fd_array[i], r);
             for (u_int i = 0; i < r->fd_count; i++) n++;
         }
-        if (w) { *w = wq; for (u_int i = 0; i < w->fd_count; i++) n++; }
+        if (w) {
+            *w = wq;
+            for (u_int i = 0; i < w0.fd_count; i++) {
+                int data, dead, wr, cn;
+                dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
+                if (wr || cn) FD_SET(w0.fd_array[i], w);
+            }
+            for (u_int i = 0; i < w->fd_count; i++) n++;
+        }
         if (x) { *x = xq; for (u_int i = 0; i < x->fd_count; i++) n++; }
         if (n) return n;
     }
@@ -3446,10 +4418,20 @@ int WSAAPI hk_select(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct tim
                     if (dt_fd_readable((long long)r0.fd_array[i])) FD_SET(r0.fd_array[i], r);
                 for (u_int i = 0; i < r->fd_count; i++) n++;
             }
-            if (w && rr_ > 0) { *w = wq; for (u_int i = 0; i < w->fd_count; i++) n++; }
-            else if (w) FD_ZERO(w);
-            if (x && rr_ > 0) { *x = xq; for (u_int i = 0; i < x->fd_count; i++) n++; }
-            else if (x) FD_ZERO(x);
+            if (w) {
+                FD_ZERO(w);
+                if (rr_ > 0) for (u_int i = 0; i < wq.fd_count; i++) FD_SET(wq.fd_array[i], w);
+                for (u_int i = 0; i < w0.fd_count; i++) {
+                    int data, dead, wr, cn;
+                    dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
+                    if (wr || cn) FD_SET(w0.fd_array[i], w);
+                }
+                for (u_int i = 0; i < w->fd_count; i++) n++;
+            }
+            if (x) {
+                if (rr_ > 0) { *x = xq; for (u_int i = 0; i < x->fd_count; i++) n++; }
+                else FD_ZERO(x);
+            }
             if (n) return n;
         }
         waited += slice;
@@ -3467,10 +4449,16 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
     for (ULONG i = 0; i < nfds; i++) fds[i].revents = 0;
     {
         int n = 0;
-        for (ULONG i = 0; i < nfds; i++)
-            if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd)) {
-                fds[i].revents |= POLLRDNORM; n++;
+        for (ULONG i = 0; i < nfds; i++) {
+            if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd))
+                fds[i].revents |= POLLRDNORM;
+            if (fds[i].events & (POLLOUT | POLLWRNORM)) {
+                int data, dead, wr, cn;
+                dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
+                if (wr || cn) fds[i].revents |= POLLOUT;
             }
+            if (fds[i].revents) n++;
+        }
         if (n) return n;
     }
     int waited = 0;
@@ -3483,11 +4471,16 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
         int r = p_p(fds, nfds, slice);
         if (r < 0) return r;
         int n = 0;
-        for (ULONG i = 0; i < nfds; i++)
-            if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd)) {
+        for (ULONG i = 0; i < nfds; i++) {
+            if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd))
                 if (!(fds[i].revents & POLLRDNORM)) fds[i].revents |= POLLRDNORM;
+            if (fds[i].events & (POLLOUT | POLLWRNORM)) {
+                int data, dead, wr, cn;
+                dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
+                if ((wr || cn) && !(fds[i].revents & POLLOUT)) fds[i].revents |= POLLOUT;
             }
-        for (ULONG i = 0; i < nfds; i++) if (fds[i].revents) n++;
+            if (fds[i].revents) n++;
+        }
         if (n) return n;
         if (r < 0) return r;
         waited += slice;
@@ -3514,13 +4507,17 @@ int WSAAPI hk_WSAEventSelect(SOCKET s, WSAEVENT hEvent, long lNetworkEvents) {
         DLOCK();
         for (i = 0; i < DT_MAXEV; i++) if (!g_evmap[i].used) {
             g_evmap[i].used = 1; g_evmap[i].sock = (long long)s;
-            g_evmap[i].ev = hEvent; done = 1; break;
+            g_evmap[i].ev = hEvent; g_evmap[i].mask = lNetworkEvents; done = 1; break;
         }
         DUNLOCK();
         if (done) {
-            int data = 0, dead = 0;
-            dt_sock_state((long long)s, &data, &dead);
-            if (data || dead) WSASetEvent(hEvent); /* already waiting */
+            int data = 0, dead = 0, wr = 0, cn = 0;
+            dt_sock_state_full((long long)s, &data, &dead, &wr, &cn);
+            if ((data && (lNetworkEvents & FD_READ)) ||
+                (dead && (lNetworkEvents & FD_CLOSE)) ||
+                (wr && (lNetworkEvents & FD_WRITE)) ||
+                (cn && (lNetworkEvents & FD_CONNECT)))
+                WSASetEvent(hEvent); /* already waiting */
         }
     }
     return r;
@@ -3530,14 +4527,32 @@ int WSAAPI hk_WSAEnumNetworkEvents(SOCKET s, WSAEVENT hEventObject,
     int r = p_WSAEnumNetworkEvents ?
         p_WSAEnumNetworkEvents(s, hEventObject, lpNetworkEvents) : SOCKET_ERROR;
     if (g_direct && r == 0 && lpNetworkEvents) {
-        int data = 0, dead = 0;
-        dt_sock_state((long long)s, &data, &dead);
-        if (data) lpNetworkEvents->lNetworkEvents |= FD_READ;
-        if (dead) lpNetworkEvents->lNetworkEvents |= FD_CLOSE;
+        int data = 0, dead = 0, wr = 0, cn = 0;
+        dt_sock_state_full((long long)s, &data, &dead, &wr, &cn);
+        long vm = 0;
+        if (data) { lpNetworkEvents->lNetworkEvents |= FD_READ; vm |= FD_READ; }
+        if (dead) { lpNetworkEvents->lNetworkEvents |= FD_CLOSE; vm |= FD_CLOSE; }
+        if (wr)   { lpNetworkEvents->lNetworkEvents |= FD_WRITE; vm |= FD_WRITE; }
+        if (cn)   {
+            lpNetworkEvents->lNetworkEvents |= FD_CONNECT; vm |= FD_CONNECT;
+            dt_stream_mark_connect((long long)s); /* one-shot, like the real one */
+        }
         /* real Enum reset the event: re-arm so later waits still fire */
-        if ((data || dead) && hEventObject) WSASetEvent(hEventObject);
+        if (vm && hEventObject) WSASetEvent(hEventObject);
     }
     return r;
+}
+/* mask-gated virtual-event hit for one mapped socket; DLOCK must be held */
+static int dt_ev_hit_locked(long long sock, long mask) {
+    int data = 0, dead = 0, wr = 0, cn = 0;
+    dt_sock_state_locked(sock, &data, &dead, &wr, &cn);
+    if (cn && (mask & FD_CONNECT)) {
+        for (int i = 0; i < DT_MAXSTREAM; i++)
+            if (g_st[i].used && g_st[i].gsock == sock && !g_st[i].connect_signaled)
+                g_st[i].connect_signaled = 1;
+    }
+    return (data && (mask & FD_READ)) || (dead && (mask & FD_CLOSE)) ||
+           (wr && (mask & FD_WRITE)) || (cn && (mask & FD_CONNECT));
 }
 DWORD WSAAPI hk_WSAWaitForMultipleEvents(DWORD cEvents, const WSAEVENT *lphEvents,
                                          BOOL fWaitAll, DWORD dwTimeout,
@@ -3552,9 +4567,10 @@ DWORD WSAAPI hk_WSAWaitForMultipleEvents(DWORD cEvents, const WSAEVENT *lphEvent
                 int j, hit = 0;
                 for (j = 0; j < DT_MAXEV; j++) {
                     if (!g_evmap[j].used || g_evmap[j].ev != lphEvents[i]) continue;
-                    { int data = 0, dead = 0;
-                      dt_sock_state_locked(g_evmap[j].sock, &data, &dead);
-                      if (data || dead) { hit = 1; break; } }
+                    if (dt_ev_hit_locked(g_evmap[j].sock, g_evmap[j].mask)) {
+                        hit = 1;
+                        break;
+                    }
                 }
                 if (hit) { DUNLOCK(); return WSA_WAIT_EVENT_0 + i; }
             }
@@ -3962,12 +4978,15 @@ DWORD WINAPI hk_IcmpSendEcho2(HANDLE h, HANDLE hev, FARPROC apc, PVOID ctx,
 /* ---- interface-identity shim --------------------------------------
  * A virtual-NIC product would expose the tunnel address as a real local
  * interface; without a driver we fake that view per-process: the vnode
- * is appended to the adapter address lists returned by the IP Helper
- * APIs (consumers that enumerate "my IPs" / compute per-interface
- * broadcasts / sanity-check peer addresses against local subnets then
- * see 10.200.0.x as legitimately ours), and binds to it are rewritten
- * to INADDR_ANY. Pure data surgery on caller-owned buffers; failures
- * degrade to the unshimmed answer. ---- */
+ * appears as a STANDALONE pseudo-adapter ("ShadowLAN Virtual Interface",
+ * up, /24) appended to the adapter lists returned by the IP Helper
+ * APIs. Consumers that enumerate "my IPs", compute per-interface
+ * broadcast ranges, or sanity-check peers against local subnets (via
+ * FirstUnicastAddress or the adapter walk) then see 10.200.0.x exactly
+ * like a real LAN interface; binds to it are rewritten to INADDR_ANY.
+ * Pure data surgery on caller-owned buffers; failures degrade to the
+ * unshimmed answer. ---- */
+#define DT_SL_IFINDEX 0x7F000001u  /* pseudo-adapter if-index (high, stable) */
 typedef ULONG (WINAPI *PFN_GetAdaptersAddresses)(ULONG, ULONG, PVOID,
                                                  PIP_ADAPTER_ADDRESSES, PULONG);
 typedef ULONG (WINAPI *PFN_GetAdaptersInfo)(PIP_ADAPTER_INFO, PULONG);
@@ -3977,28 +4996,25 @@ static int g_gaa_logged = 0;
 
 static int dt_vnode_str(char *out, int n) { return dt_src_ip(out, (size_t)n); }
 
-typedef struct { IP_ADAPTER_UNICAST_ADDRESS u; SOCKADDR_IN sa; } dt_uni_node;
-
 ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
                                      PIP_ADAPTER_ADDRESSES AdapterAddresses,
                                      PULONG SizePointer) {
     ULONG r, used, room, at;
-    dt_uni_node *nd;
-    IP_ADAPTER_ADDRESSES *a, *tgt = 0;
     char ip[48];
     if (!p_GetAdaptersAddresses) return ERROR_FUNCTION_FAILED;
     if (g_debug && !g_gaa_logged) { g_gaa_logged = 1;
         dlog("GAA shim active"); }
     if (!g_direct || !dt_vnode_str(ip, sizeof(ip)))
         return p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
+    if (Family != AF_INET && Family != AF_UNSPEC)
+        return p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
     room = SizePointer ? *SizePointer : 0;
     r = p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
     if (r == ERROR_BUFFER_OVERFLOW) {
         ULONG need = SizePointer ? *SizePointer : 0;
-        if (need < 0xFFFFFFFFu - 128 && SizePointer) *SizePointer = need + 128;
+        if (need < 0xFFFFFFFFu - 2560 && SizePointer) *SizePointer = need + 2560;
         return r;
     }
-
     if (r != NO_ERROR || !AdapterAddresses || !SizePointer) return r;
     used = *SizePointer;
     {   /* some implementations report the whole buffer as "used"; trust a
@@ -4008,33 +5024,95 @@ ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
         if (probe && probe < used) used = probe;
     }
     at = (used + 15u) & ~15u;
-    if (at + sizeof(dt_uni_node) > room) return r;   /* no slack: unshimmed */
-    /* target: first up, non-loop adapter; else head */
-    for (a = AdapterAddresses; a; a = a->Next)
-        if (a->OperStatus == IfOperStatusUp && a->IfType != IF_TYPE_SOFTWARE_LOOPBACK) { tgt = a; break; }
-    if (!tgt) tgt = AdapterAddresses;
-    nd = (dt_uni_node *)((BYTE *)AdapterAddresses + at);
-    memset(nd, 0, sizeof(*nd));
-    nd->u.Length = sizeof(IP_ADAPTER_UNICAST_ADDRESS);
-    nd->u.Address.lpSockaddr = (LPSOCKADDR)&nd->sa;
-    nd->u.Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-    nd->sa.sin_family = AF_INET;
-    nd->sa.sin_addr.s_addr = inet_addr(ip);
-    nd->u.OnLinkPrefixLength = 24;
     {
-        PIP_ADAPTER_UNICAST_ADDRESS u = &tgt->FirstUnicastAddress ? tgt->FirstUnicastAddress : 0;
-        if (!u) { tgt->FirstUnicastAddress = &nd->u; }
-        else { while (u->Next) u = u->Next; u->Next = &nd->u; }
+        size_t anode = (sizeof(IP_ADAPTER_ADDRESSES) + 15u) & ~(size_t)15;
+        size_t unode = (sizeof(IP_ADAPTER_UNICAST_ADDRESS) + sizeof(SOCKADDR_IN)
+                        + 15u) & ~(size_t)15;
+        size_t sname = 48;   /* PCHAR AdapterName + padding */
+        size_t sdesc = 64 * 2; /* PWCHAR Description/FriendlyName + padding */
+        if (at + anode + unode + sname + sdesc > room) return r; /* no slack */
+        IP_ADAPTER_ADDRESSES *na =
+            (IP_ADAPTER_ADDRESSES *)((BYTE *)AdapterAddresses + at);
+        memset(na, 0, anode);
+        na->Length = sizeof(IP_ADAPTER_ADDRESSES);
+        na->IfIndex = DT_SL_IFINDEX;
+        na->IfType = IF_TYPE_ETHERNET_CSMACD;
+        na->OperStatus = IfOperStatusUp;
+        na->Mtu = 1500;
+        /* locally-administered MAC, ASCII "SH" (ShadowLAN) in bytes 2-3 */
+        na->PhysicalAddress[0] = 0x02; na->PhysicalAddress[1] = 0x00;
+        na->PhysicalAddress[2] = 0x53; na->PhysicalAddress[3] = 0x48;
+        na->PhysicalAddressLength = 6;
+        {
+            static const char anm[] = "ShadowLAN Virtual Interface";
+            static const wchar_t dnm[] = L"ShadowLAN Virtual Interface";
+            char *pa = (char *)((BYTE *)na + anode + unode);
+            wchar_t *pd = (wchar_t *)(pa + sname);
+            memcpy(pa, anm, sizeof(anm));
+            memcpy(pd, dnm, sizeof(dnm));
+            na->AdapterName = pa;
+            na->Description = pd;
+            na->FriendlyName = pd;
+        }
+        IP_ADAPTER_UNICAST_ADDRESS *nu =
+            (IP_ADAPTER_UNICAST_ADDRESS *)((BYTE *)na + anode);
+        memset(nu, 0, unode);
+        nu->Length = sizeof(IP_ADAPTER_UNICAST_ADDRESS);
+        nu->Next = NULL;
+        nu->Address.lpSockaddr =
+            (PSOCKADDR)((BYTE *)nu + sizeof(IP_ADAPTER_UNICAST_ADDRESS));
+        nu->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
+        nu->PrefixOrigin = 0;      /* offset == XP OnLinkPrefixLength */
+        nu->SuffixOrigin = 0;
+        nu->DadState = IpDadStatePreferred;
+        SOCKADDR_IN *sa = (SOCKADDR_IN *)nu->Address.lpSockaddr;
+        sa->sin_family = AF_INET;
+        sa->sin_addr.s_addr = inet_addr(ip);
+        na->FirstUnicastAddress = nu;
+        na->Next = NULL;
+        {   /* append after the real adapters */
+            IP_ADAPTER_ADDRESSES *a = AdapterAddresses;
+            while (a && a->Next) a = a->Next;
+            if (a) a->Next = na;
+        }
+        *SizePointer = (ULONG)(at + anode + unode + sname + sdesc);
     }
-    *SizePointer = at + (ULONG)sizeof(dt_uni_node);
-
     return r;
 }
 
+/* Windows-SDK layout of the legacy GetAdaptersInfo structures. Some
+ * compiler SDKs ship a non-ABI-compatible definition, so the surgery
+ * below uses its own layout (byte-for-byte the MS one) and treats the
+ * caller buffer opaquely. */
+typedef struct dt_ms_ipa_str {
+    struct dt_ms_ipa_str *Next;
+    char IpAddress[16];
+    char IpMask[16];
+    DWORD Context;
+} dt_ms_ipa_str;
+typedef struct dt_ms_ip_adapter_info {
+    struct dt_ms_ip_adapter_info *Next;
+    DWORD Index;
+    UINT Type;
+    char Desc[260];
+    char Name[260];
+    UINT WksEnabled;
+    dt_ms_ipa_str *DomainDnsSuffix;
+    dt_ms_ipa_str *HostName;
+    dt_ms_ipa_str *CurrentDnsServer;
+    dt_ms_ipa_str IpAddressList;
+    dt_ms_ipa_str GatewayList;
+    dt_ms_ipa_str DnsServerList;
+    dt_ms_ipa_str DhcpServer;
+    UINT HaveWins;
+    dt_ms_ipa_str PrimaryWinsServer;
+    dt_ms_ipa_str SecondaryWinsServer;
+    FILETIME LeaseObtained;
+    FILETIME LeaseExpires;
+} dt_ms_ip_adapter_info;
+
 ULONG WINAPI hk_GetAdaptersInfo(PIP_ADAPTER_INFO InfoBuffer, PULONG SizePointer) {
     ULONG r, used, at, room;
-    IP_ADDR_STRING *nd;
-    PIP_ADAPTER_INFO a, tgt = 0;
     char ip[48];
     if (!p_GetAdaptersInfo) return ERROR_FUNCTION_FAILED;
     if (!g_direct || !dt_vnode_str(ip, sizeof(ip)))
@@ -4043,25 +5121,39 @@ ULONG WINAPI hk_GetAdaptersInfo(PIP_ADAPTER_INFO InfoBuffer, PULONG SizePointer)
     r = p_GetAdaptersInfo(InfoBuffer, SizePointer);
     if (r == ERROR_BUFFER_OVERFLOW) {
         ULONG need = SizePointer ? *SizePointer : 0;
-        if (need < 0xFFFFFFFFu - 128 && SizePointer) *SizePointer = need + 128;
+        if (need < 0xFFFFFFFFu - 2048 && SizePointer) *SizePointer = need + 2048;
         return r;
     }
     if (r != NO_ERROR || !InfoBuffer || !SizePointer) return r;
     used = *SizePointer;
     at = (used + 15u) & ~15u;
-    if (at + sizeof(IP_ADDR_STRING) > room) return r;
-    for (a = InfoBuffer; a; a = a->Next) { if (a->AddressLength == 6 && a->Index) { tgt = a; break; } }
-    if (!tgt) tgt = InfoBuffer;
-    nd = (IP_ADDR_STRING *)((BYTE *)InfoBuffer + at);
-    memset(nd, 0, sizeof(*nd));
-    strncpy(nd->IpAddress.String, ip, 15);
-    strncpy(nd->IpMask.String, "255.255.255.0", 15);
     {
-        PIP_ADDR_STRING s = &tgt->IpAddressList;
-        while (s->Next) s = s->Next;
-        s->Next = nd;
+        size_t ino = (sizeof(dt_ms_ip_adapter_info) + 15u) & ~(size_t)15;
+        if (at + ino > room) return r;   /* no slack: unshimmed */
+        dt_ms_ip_adapter_info *na =
+            (dt_ms_ip_adapter_info *)((BYTE *)InfoBuffer + at);
+        memset(na, 0, ino);
+        na->Index = DT_SL_IFINDEX;
+        na->Type = 6; /* MIB_IF_TYPE_ETHERNET */
+        na->WksEnabled = 1;
+        strncpy(na->Desc, "ShadowLAN Virtual Interface", sizeof(na->Desc) - 1);
+        strncpy(na->Name, "ShadowLAN Virtual Interface", sizeof(na->Name) - 1);
+        /* first (and only) address lives in the inline IpAddressList */
+        strncpy(na->IpAddressList.IpAddress, ip,
+                sizeof(na->IpAddressList.IpAddress) - 1);
+        strncpy(na->IpAddressList.IpMask, "255.255.255.0",
+                sizeof(na->IpAddressList.IpMask) - 1);
+        na->IpAddressList.Context = 0;
+        na->IpAddressList.Next = NULL;
+        na->Next = NULL;
+        {   /* append after the real adapters (Next is offset 0 in both
+             * SDK spellings, so the walk is safe) */
+            dt_ms_ip_adapter_info *a = (dt_ms_ip_adapter_info *)InfoBuffer;
+            while (a && a->Next) a = a->Next;
+            if (a) a->Next = na;
+        }
+        *SizePointer = (ULONG)(at + ino);
     }
-    *SizePointer = at + (ULONG)sizeof(IP_ADDR_STRING);
     return r;
 }
 
@@ -4426,6 +5518,62 @@ static void inject_child(PROCESS_INFORMATION *pi) {
     dbg("lan_hook: child injected\n");
 }
 
+/* Tree identity, explicit-env case: with lpEnvironment==NULL the child
+ * inherits our stamped process env already. When the caller supplies an
+ * explicit block (CREATE_NEW_ENVIRONMENT), append LAN_HOOK_NODE to it so
+ * the child still joins the parent's node. Returns a malloc'd replacement
+ * block (caller frees) or the original when untouched. */
+static LPVOID dt_env_with_node(LPVOID env, DWORD flags) {
+    char num[24];
+    if (!env || !g_node) return env;
+    snprintf(num, sizeof num, "%u", g_node);
+    if (flags & CREATE_UNICODE_ENVIRONMENT) {
+        static const WCHAR nm[] = L"LAN_HOOK_NODE=";
+        const WCHAR *p = (const WCHAR *)env;
+        size_t n = 0;
+        int found = 0;
+        while (p[n]) {
+            if (!_wcsnicmp(p + n, nm, 14)) found = 1;
+            n += wcslen(p + n) + 1;
+        }
+        if (found) return env;
+        {
+            WCHAR *blk = (WCHAR *)malloc((n + 48) * sizeof(WCHAR));
+            if (!blk) return env;
+            memcpy(blk, p, n * sizeof(WCHAR));
+            {
+                WCHAR *q = blk + n;
+                memcpy(q, nm, sizeof(nm) - sizeof(WCHAR));
+                q += 14;
+                MultiByteToWideChar(CP_UTF8, 0, num, -1, q, 16);
+                q += wcslen(q);
+                q[0] = 0;   /* string terminator + block terminator */
+                q[1] = 0;
+            }
+            return blk;
+        }
+    } else {
+        const char *p = (const char *)env;
+        size_t n = 0;
+        int found = 0;
+        while (p[n]) {
+            if (!_strnicmp(p + n, "LAN_HOOK_NODE=", 14)) found = 1;
+            n += strlen(p + n) + 1;
+        }
+        if (found) return env;
+        {
+            char *blk = (char *)malloc(n + 48);
+            if (!blk) return env;
+            memcpy(blk, p, n);
+            {
+                int w = snprintf(blk + n, 32, "LAN_HOOK_NODE=%s", num);
+                blk[n + (size_t)w + 1] = 0;   /* double-null terminate */
+            }
+            return blk;
+        }
+    }
+}
+
 BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
                               LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags,
                               LPVOID env, LPCSTR dir, LPSTARTUPINFOA si,
@@ -4440,8 +5588,12 @@ BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
         return p_CreateProcessA(app, cmd, pa, ta, inh, flags, env, dir, si, pi);
     }
     wantSuspend = (flags & CREATE_SUSPENDED) != 0;
-    ok = p_CreateProcessA(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
-                          env, dir, si, pi);
+    {
+        LPVOID cenv = dt_env_with_node(env, flags);
+        ok = p_CreateProcessA(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
+                              cenv, dir, si, pi);
+        if (cenv != env) free(cenv);
+    }
     if (!ok) return FALSE;
     inject_child(pi);
     if (!wantSuspend) ResumeThread(pi->hThread);
@@ -4465,8 +5617,12 @@ BOOL WINAPI hk_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
         return p_CreateProcessW(app, cmd, pa, ta, inh, flags, env, dir, si, pi);
     }
     wantSuspend = (flags & CREATE_SUSPENDED) != 0;
-    ok = p_CreateProcessW(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
-                          env, dir, si, pi);
+    {
+        LPVOID cenv = dt_env_with_node(env, flags);
+        ok = p_CreateProcessW(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
+                              cenv, dir, si, pi);
+        if (cenv != env) free(cenv);
+    }
     if (!ok) return FALSE;
     inject_child(pi);
     if (!wantSuspend) ResumeThread(pi->hThread);
@@ -4598,6 +5754,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     policy_init();
     dbg("lan_hook: policy ready\n");
     flog("LanHookInit: policy ready");
+    dt_log_options();
     {
         WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
     }

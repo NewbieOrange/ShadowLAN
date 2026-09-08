@@ -202,7 +202,7 @@ async def test_icmp():
 
 
 async def main():
-    relay = Relay(PUB)
+    relay = Relay(PUB, bind="127.0.0.1")
     assert (relay.relay_virt() & 0xFF) == 1, hex(relay.relay_virt())
     relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.15)
@@ -216,5 +216,12 @@ async def main():
     print("NOLOOP_ALL_PASS", flush=True)
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())

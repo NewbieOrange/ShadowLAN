@@ -1,7 +1,7 @@
 /* Launcher with env-from-args.
  *
  *   injector.exe [--server HOST] [--port PORT] [--token SECRET]
- *                [--ports LIST] [-e KEY=VAL]... [--debug] [--]
+ *                [--ports LIST] [--udp-over-tcp] [-e KEY=VAL]... [--debug] [--]
  *                <hook.dll> <game.exe> [game args...]
  *
  * Each option maps to the hook's env (child inherits it):
@@ -9,6 +9,9 @@
  *   --port   -> LAN_HOOK_PORT     (default 47777)
  *   --token  -> LAN_HOOK_TOKEN    (room key, must match relay --token)
  *   --ports  -> LAN_HOOK_PORTS    (e.g. 4444,27015,7777; empty = all LAN)
+ *   --udp-over-tcp -> LAN_HOOK_UDP_OVER_TCP=1 (game UDP over the TCP link; for
+ *                peers behind NATs/firewalls that filter inbound UDP.
+ *                Game args after the exe pass through untouched.)
  *   -e K=V   -> generic extra env
  *   --debug  -> LAN_HOOK_DEBUG=1
  *
@@ -44,7 +47,7 @@ static HMODULE find_remote(HANDLE hProcess, const char *dllfull) {
 static void usage(void) {
     fprintf(stderr,
         "usage: injector.exe [--server HOST] [--port PORT] [--token SECRET]\n"
-        "                    [--ports LIST] [-e KEY=VAL]... [--debug] [--]\n"
+        "                    [--ports LIST] [--udp-over-tcp] [-e KEY=VAL]... [--debug] [--]\n"
         "                    <hook.dll> <game.exe> [game args...]\n"
         "example: injector.exe --server 203.0.113.10 --port 47777 --token SECRET -- lan_hook64.dll game.exe -windowed\n");
 }
@@ -55,7 +58,7 @@ static int starts_with(const char *s, const char *pre) {
 
 int main(int argc, char **argv) {
     const char *server = NULL, *port = NULL, *token = NULL, *ports = NULL;
-    int debug = 0;
+    int debug = 0, udptcp = 0;
     int i = 1;
     /* collect leading options; stop at "--" or first non-option */
     int opts_done = 0;
@@ -70,6 +73,7 @@ int main(int argc, char **argv) {
         else if (starts_with(a, "--token=")) token = a + 8;
         else if (!strcmp(a, "--ports") && i + 1 < argc) ports = argv[++i];
         else if (starts_with(a, "--ports=")) ports = a + 8;
+        else if (!strcmp(a, "--udp-over-tcp")) udptcp = 1;
         else if (!strcmp(a, "--debug")) debug = 1;
         else if (!strcmp(a, "-e") && i + 1 < argc) {
             char *kv = argv[++i], *eq = strchr(kv, '=');
@@ -94,6 +98,7 @@ int main(int argc, char **argv) {
     if (port) SetEnvironmentVariableA("LAN_HOOK_PORT", port);
     if (token) SetEnvironmentVariableA("LAN_HOOK_TOKEN", token);
     if (ports) SetEnvironmentVariableA("LAN_HOOK_PORTS", ports);
+    if (udptcp) SetEnvironmentVariableA("LAN_HOOK_UDP_OVER_TCP", "1");
     if (debug) SetEnvironmentVariableA("LAN_HOOK_DEBUG", "1");
 
     if (argc - i < 2) { usage(); return 2; }

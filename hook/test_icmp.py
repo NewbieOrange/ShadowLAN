@@ -48,7 +48,7 @@ def parse_rep(pkt):
 
 tag = sys.argv[1]
 raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-raw.settimeout(6)
+raw.settimeout(2.5)
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 u.bind(("0.0.0.0", %DISC%))
@@ -86,14 +86,18 @@ for line in sys.stdin:
         continue
     got = []
     t1 = time.time()
-    while time.time() - t1 < 5 and len(got) < 4:
+    while time.time() - t1 < 2.0 and len(got) < 4:
         try:
             pkt, addr = raw.recvfrom(65535)
         except socket.timeout:
-            break
+            if got:
+                break           # have a reply; extra grace only for broadcast
+            continue
         pr = parse_rep(pkt)
         if pr and pr[0] == 0 and pr[2] == iid and pr[4] == b"shadowlan":
             got.append(addr[0])
+            raw.settimeout(0.4)  # first reply in: short grace for fan-out extras
+    raw.settimeout(2.5)
     print("REPLIES " + ",".join(sorted(set(got))), flush=True)
 """.replace("%DISC%", str(DISC))
 
@@ -123,21 +127,22 @@ async def main():
     except PermissionError:
         print("ICMP_SKIP (no raw socket privilege)")
         return 0
-    relay = Relay(PUB)
+    relay = Relay(PUB, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.2)
     env = dict(os.environ,
                LD_PRELOAD=os.path.join(HOOKDIR, "lan_hook.so"),
                LAN_HOOK_SERVER="127.0.0.1", LAN_HOOK_PORT=str(PUB),
                LAN_HOOK_DEBUG="0", LAN_HOOK_INIT_TIMEOUT="15000")
+    a = b = None
     try:
         a = await spawn("A", env)
         b = await spawn("B", env)
         for p, want in ((a, "A"), (b, "B")):
-            line = await read_line(p.stdout)
+            line = await read_line(p.stdout, timeout=10)
             assert line == "READY", (want, line)
-        la = await read_line(a.stdout)
-        lb = await read_line(b.stdout)
+        la = await read_line(a.stdout, timeout=10)
+        lb = await read_line(b.stdout, timeout=10)
         assert la.startswith("PEER ") and lb.startswith("PEER "), (la, lb)
         va = lb.split()[1]  # B saw A's beacon from VA
         vb = la.split()[1]  # A saw B's beacon from VB
@@ -147,7 +152,7 @@ async def main():
         async def ping(p, ip):
             p.stdin.write(f"PING {ip}\n".encode())
             await p.stdin.drain()
-            return await read_line(p.stdout, timeout=12)
+            return await read_line(p.stdout, timeout=6)
 
         # peer ping both directions
         r = await ping(a, vb)
@@ -168,14 +173,23 @@ async def main():
         got = set(r.split(" ", 1)[1].split(",")) if r.startswith("REPLIES ") else set()
         assert got == {va, vb}, (r, va, vb)
         print("PASS[icmp] broadcast ping fans out + self", flush=True)
-        for p in (a, b):
-            p.kill()
     finally:
+        for p in (a, b):
+            if p is not None:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
         relay_task.cancel()
         await asyncio.gather(relay_task, return_exceptions=True)
     print("ICMP_ALL_PASS", flush=True)
     return 0
 
 
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s."""
+    return await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(asyncio.run(_guarded()))

@@ -43,7 +43,7 @@ sys.exit(r.returncode)
 
 
 async def main():
-    relay_task = asyncio.create_task(Relay(PUB).run())
+    relay_task = asyncio.create_task(Relay(PUB, bind="127.0.0.1").run())
     await asyncio.sleep(0.3)
     usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     usock.bind(("127.0.0.1", UDP_REAL))
@@ -89,5 +89,12 @@ async def main():
                          return_exceptions=True)
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())

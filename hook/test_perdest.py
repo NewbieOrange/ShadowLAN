@@ -320,9 +320,8 @@ async def test_subnet_eviction(relay):
     junk = []
     for i in range(2, 255):
         nid = 0x70000000 + i
-        relay.nodes[nid] = {"writer": None, "tcp_ip": "", "udp_port": 0,
-                            "udp_addr": None, "virt": base | i,
-                            "seen_tcp": now, "seen_udp": 0.0}
+        relay.nodes[nid] = {"links": {}, "virt": base | i,
+                            "seen_tcp": now}
         junk.append(nid)
     try:
         assert len(relay.nodes) >= 253, len(relay.nodes)
@@ -346,7 +345,7 @@ async def test_subnet_eviction(relay):
 
 
 async def main():
-    relay = Relay(PUB)
+    relay = Relay(PUB, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.15)
     try:
@@ -361,5 +360,12 @@ async def main():
     print("PERDEST_ALL_PASS", flush=True)
 
 
+
+async def _guarded():
+    """Hard watchdog: a stuck future must fail loudly in <=20s, never
+    pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
+    await asyncio.wait_for(main(), timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_guarded())
