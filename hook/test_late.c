@@ -54,6 +54,78 @@ int main(int argc, char **argv) {
         printf("CLASH_NONE err=%d\n", WSAGetLastError());
         return 1;
     }
+    if (!strcmp(argv[1], "ifprobe")) {
+        /* Adapter-view check for the interface shim. Always: the vnode
+         * must appear as a local unicast address. With LAN_HOOK_LAN_ONLY=1
+         * additionally: the pseudo-adapter must be the ONLY interface, with
+         * the ShadowLAN if-index and a /24 on-link prefix (a machine whose
+         * only network is the tunnel). */
+        int iso = 0;
+        char ev[8];
+        if (GetEnvironmentVariableA("LAN_HOOK_LAN_ONLY", ev, sizeof(ev)) > 0
+            && ev[0] && ev[0] != '0') iso = 1;
+        int found = 0, count = 0, idx_ok = 0, prefix_ok = 0;
+        ULONG len = 0;
+        GetAdaptersAddresses(AF_INET, 0, 0, 0, &len);
+        IP_ADAPTER_ADDRESSES *ad = len ? (IP_ADAPTER_ADDRESSES *)malloc(len + 1024) : 0;
+        if (ad && GetAdaptersAddresses(AF_INET, 0, 0, ad, &len) == 0) {
+            IP_ADAPTER_ADDRESSES *p;
+            for (p = ad; p; p = p->Next) {
+                PIP_ADAPTER_UNICAST_ADDRESS u;
+                count++;
+                for (u = p->FirstUnicastAddress; u; u = u->Next) {
+                    char *s2;
+                    if (!u->Address.lpSockaddr ||
+                        u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                    s2 = inet_ntoa(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr);
+                    if (s2 && !strncmp(s2, "10.200.", 7)) {
+                        found = 1;
+                        prefix_ok = (u->OnLinkPrefixLength == 24);
+                        idx_ok = (p->IfIndex == 0x7F000001u);
+                        printf("ifprobe iface idx=%lu addr=%s prefix=%u\n",
+                               (unsigned long)p->IfIndex, s2,
+                               (unsigned)u->OnLinkPrefixLength);
+                    }
+                }
+            }
+        }
+        free(ad);
+        {
+        int found2 = 0, count2 = 0;
+        ULONG l2 = 0;
+        GetAdaptersInfo(NULL, &l2);
+        if (l2) {
+            IP_ADAPTER_INFO *i2 = (IP_ADAPTER_INFO *)malloc(l2 + 1024);
+            if (i2 && GetAdaptersInfo(i2, &l2) == 0) {
+                IP_ADAPTER_INFO *q;
+                for (q = i2; q; q = q->Next) {
+                    count2++;
+                    if (!strncmp(q->IpAddressList.IpAddress.String, "10.200.", 7)) {
+                        found2 = 1;
+                        printf("ifprobe2 desc=%s addr=%s mask=%s\n",
+                               q->Description, q->IpAddressList.IpAddress.String,
+                               q->IpAddressList.IpMask.String);
+                    }
+                }
+            }
+            free(i2);
+        }
+        printf("ifprobe count=%d found=%d count2=%d found2=%d idx=%d prefix=%d\n",
+               count, found, count2, found2, idx_ok, prefix_ok);
+        fflush(stdout);
+        if (!found || !found2) { printf("IF_MISS\n"); return 1; }
+        if (iso) {
+            if (count == 1 && count2 == 1 && idx_ok && prefix_ok) {
+                printf("IF_ISO_OK\n"); return 0;
+            }
+            printf("IF_ISO_BAD count=%d count2=%d idx=%d prefix=%d\n",
+                   count, count2, idx_ok, prefix_ok);
+            return 1;
+        }
+        printf("IF_OK\n");
+        return 0;
+        }
+    }
     if (!strcmp(argv[1], "host")) {
         Sleep(4000); /* well past LanHookInit: this load is "late" */
         char dir[MAX_PATH]; GetModuleFileNameA(NULL, dir, sizeof(dir));

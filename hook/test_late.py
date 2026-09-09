@@ -41,7 +41,7 @@ def build():
         cmd = [cc, "-O2", "-Wall"]
         if shared:
             cmd += ["-shared"]
-        cmd += ["-o", d, s, "-lws2_32"]
+        cmd += ["-o", d, s, "-lws2_32", "-liphlpapi"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             print(r.stderr[:400])
@@ -59,10 +59,12 @@ def cleanup():
     time.sleep(0.5)
 
 
-def launch(mode, winlog, outpath, ports=None):
+def launch(mode, winlog, outpath, ports=None, extra=None):
     env = dict(os.environ)
     env.update({"WINEDEBUG": "-all", "WINEPREFIX": WINEPREFIX,
                 "LAN_HOOK_LOGFILE": winlog, "LAN_HOOK_DEBUG": "1"})
+    if extra:
+        env.update(extra)
     h = winpath(HOOKDIR)
     portargs = " ".join(str(p) for p in (ports or (PUB + 1, PUB + 2)))
     cmd = (f'timeout 120 {WINE} "{h}\\injector.exe" --server 127.0.0.1 '
@@ -158,9 +160,28 @@ def main():
     if cli:
         cli.kill()
     host.kill()
+    cleanup()   # wine serializes: nothing else until children are gone
+    # ---- phase C: adapter view (interface shim, plain + isolated) ----
+    o1 = os.path.join(tmp, "if1.out")
+    p1 = launch("ifprobe", winpath(os.path.join(tmp, "if1-hook.log")), o1)
+    d1 = wait_for(o1, r"IF_(OK|MISS|ISO_OK|ISO_BAD)", 90)
+    p1.kill()
+    okC1 = d1 is not None and d1.startswith("IF_OK")
+    print("phase C plain:", d1)
+    o2 = os.path.join(tmp, "if2.out")
+    p2 = launch("ifprobe", winpath(os.path.join(tmp, "if2-hook.log")), o2,
+                extra={"LAN_HOOK_LAN_ONLY": "1"})
+    d2 = wait_for(o2, r"IF_(OK|MISS|ISO_OK|ISO_BAD)", 90)
+    p2.kill()
+    okC2 = d2 is not None and d2.startswith("IF_ISO_OK")
+    print("phase C isolate:", d2)
+    cleanup()
+    ok = ok and okC1 and okC2
     if not ok:
         dump_tail(os.path.join(tmp, "host.out"), 6)
         dump_tail(cout, 6)
+        dump_tail(o1, 4)
+        dump_tail(o2, 4)
         dump_tail(hlog)
         dump_tail(clog)
     relay.kill()
