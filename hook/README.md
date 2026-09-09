@@ -142,10 +142,10 @@ already manages per process tree (Windows `CreateProcess` copies it; on
 Linux `execve` inherits it), just like a kernel-created file mapping
 dies with its last handle. Consequences you can rely on:
 
-- a launcher self-restart chain (e.g. GBE's `RestartAppIfNecessary`)
+- a launcher self-restart chain (the app re-execs itself)
   keeps the same vnode across the restart;
 - tool + game on one PC are one "machine" to peers (distinct apps are
-  still distinct GBE/steamid connections — exactly like real LAN);
+  still distinct per-game connections - exactly like a real LAN);
 - a process started with a fresh environment (double-clicked, different
   service) is a different machine — unrelated instances stay separate.
 

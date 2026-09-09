@@ -23,9 +23,10 @@ pieces, all versioned together in this repo:
   same things (`listen()` ⇒ host claim, bound ports ⇒ serve).
 
 Hard constraints from the user:
-- Fixes go in hook/relay ONLY. The test app is **Goldberg Emulator (GBE)**
-  (`/tmp/opencode/gbe_fork` if present) plus the `lobby_connect` tool —
-  never patch them, never parse/rewrite game payloads (protobuf or else).
+- Fixes go in hook/relay ONLY. The test stack is a LAN-lobby reference
+  pair (a session-bridging library + a lobby viewer tool; sources live
+  on the local boxes only, never in this repo) — never patch them,
+  never parse/rewrite game payloads (protobuf or else).
 - The vnet must be indistinguishable from a real LAN to the app
   (addresses, ports, `getpeername`, adapters — see Interface shim).
 - Universal > game-specific. No timing hacks: real per-connection TCP
@@ -113,7 +114,7 @@ free (kernel copies env; `SetEnvironmentVariableA`/`setenv` before any
 spawn; Windows `CreateProcess` with an EXPLICIT env block gets the var
 appended — `dt_env_with_node`, ANSI + wide paths). Consequences:
 
-- GBE self-restart chains and game+child = ONE vnode, many links. The
+- Launcher self-restart chains and game+child = ONE vnode, many links. The
   relay fans out per-link; a sibling link dying never kills the node or
   its streams (whole-node-dark does; the peer sees EOF).
 - Streams to a shared node are CLAIMED (see protocol) — exactly one
@@ -146,8 +147,8 @@ The process sees a machine cabled ONLY to the tunnel:
   only what would hit the physical wire.
 - The own-broadcast NIC-style local echo MUST carry the vnode
   (`dt_src_ip`), never `dt_machine_ip`: apps fold announce sources into
-  own-IP/peer state and stamp them into payload `source_ip` (GBE does),
-  so a physical IP in that echo contradicts the vnode `getpeername`
+  own-IP/peer state and stamp them into payload `source_ip` (the
+  reference app does), so a physical IP in that echo contradicts the vnode `getpeername`
   presents and apps silently reject the connection. That leak was the
   real "lobby invisible under LAN_ONLY" root cause (fixed in 2.0.0); it
   also poisoned cross-machine runs without LAN_ONLY. `test_lanonly`
@@ -155,8 +156,8 @@ The process sees a machine cabled ONLY to the tunnel:
 
 ## Interface shim (Windows adapter APIs)
 
-Purpose: GBE (and many engines) enumerate adapters for own-IP, per-iface
-broadcast ranges, subnet sanity checks. The vnode appears as a
+Purpose: the reference test app (and many engines) enumerate adapters
+for own-IP, per-iface broadcast ranges, subnet sanity checks. The vnode appears as a
 standalone "ShadowLAN Virtual Interface" pseudo-adapter: if-index
 `0x7F000001`, `IF_TYPE_ETHERNET_CSMACD`, up, MAC `02:00:53:48:00:01`,
 vnode/24 unicast, 1 Gb/s. Appended after real adapters normally; the
@@ -195,8 +196,9 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   version "saw EOF" on the first 50 ms tick). Body reads consume the
   whole `ml` bytes (type + payload), payload len = ml-1.
 - `ioctlsocket(FIONREAD)` MUST return the hook in-queue count for
-  tunneled streams (GBE `recv_tcp` reads ONLY when FIONREAD>0 — this
-  exact bug was the original "lobby invisible" root cause). Linux:
+  tunneled streams (the reference app's TCP reader polls ONLY when
+  FIONREAD>0 — this exact bug was the original "lobby invisible" root
+  cause). Linux:
   `ioctl` hook does the same.
 - `getpeername`/`recvfrom` sources must present the vnode (orig addr),
   never 127.0.0.1/relay — apps key connections on peer IP.
@@ -225,26 +227,37 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 - Shared UDP ports: bind EADDRINUSE -> bind ephemeral + `vport` alias
   (SO_REUSEADDR broadcast semantics emulated; fanout matches vport).
 
-## GBE-specific facts (the app under test — never modify it)
+## Reference test app facts (never modify it)
 
-- GBE `dll/network.cpp`: listens on base 47584 + scans 10 ports,
+- Its network layer: listens on base 47584 + scans 10 ports,
   beacons announce every ~5s per port, HEARTBEAT/USER_TIMEOUT 20s;
   `recv_tcp` is FIONREAD-gated (see trap above); `handle_announce` sets
   `tcp_ip_port` from the recvfrom SOURCE (so spoofed vnode sources work)
   and adopts own-IP from `GetAdaptersAddresses` broadcast info.
 - A conn counts as visible/`connected` only after TCP data is READ on
   either socket — beacons alone create the conn but not `connected`.
-- KNOWN UPSTREAM BUG: `new_connection()` does `struct Connection
-  connection;` — uninitialized; `tcp_socket_outgoing.sock` may be
-  garbage so some instances never dial outgoing (per-process lottery).
+- KNOWN UPSTREAM BUG (viewer tool's library): `new_connection()` does
+  `struct Connection connection;` — uninitialized;
+  `tcp_socket_outgoing.sock` may be garbage so some instances never dial outgoing (per-process lottery).
   Don't chase this as a tunnel bug — check `app tx/app rx` lines first;
   inbound streams + FIONREAD make the peer visible regardless.
-- `lobby_connect.exe` tool: inits GBE (appids differ from game — beacon
-  payload sizes differ, e.g. n=42 vs n=41 = different appid), prints
-  `GetFriendCount` ONCE after 2 s then BLOCKS ON STDIN; invalid input =
-  re-list. Field procedure: friend hosts, wait ~10 s, press Enter/x in
-  the tool. Tool runs as a self-restart chain (RestartAppIfNecessary) —
-  now sharing one vnode via LAN_HOOK_NODE.
+- The viewer tool FORCES its own hard-coded application id
+  (sentinel (uint32)-2) into the session id environment variables at
+  startup, and that env beats every on-disk config in the shared
+  layer. A game SPAWNED BY THE TOOL inherits the sentinel and dies in
+  its own init check ("reported AppId != expected"; reported =
+  0xFFFFFE = the sentinel truncated to a 24-bit field) BEFORE its
+  first socket call - nothing to do with the vnet. The tool's config
+  file name may show the correct id - irrelevant, env wins. Fixes:
+  launch games directly (game<->game share the real id), or rebuild
+  the tool with the game's id (its browsing mode special-cases the
+  sentinel client-side).
+- The lobby viewer tool: inits the bridge library with its own appid
+  (differs from the game's — beacon payload sizes differ, e.g. n=42
+  vs n=41), prints the friend count ONCE after 2 s then BLOCKS ON
+  STDIN; invalid input = re-list. Field procedure: friend hosts, wait ~10 s, press Enter/x in
+  the tool. Tool runs as a self-restart chain (re-exec pattern) — now
+  sharing one vnode via LAN_HOOK_NODE.
 
 ## Version & release policy (user's rules — follow exactly)
 
@@ -328,22 +341,23 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   Wire changes ship to relay + ALL machines together, always.
 - Timing skew between machines is real (~11 s observed): correlate by
   event order/relay, never by wall clock across machines.
-- User's remote-test topology: own Windows PC (lobby_connect tool +
-  game, LAN 192.168.1.x, second unhooked game PC at .160 = noise source
-  — use LAN_ONLY=1) vs friend in China (game via GBE, symmetric NAT,
-  `LAN_HOOK_UDP_OVER_TCP=1`). Friend must run a single game instance.
+- User's remote-test topology: own Windows PC (viewer tool + game, LAN
+  192.168.1.x, second unhooked game PC at .160 = noise source — use
+  LAN_ONLY=1) vs friend in China (game via the bridge library,
+  symmetric NAT, `LAN_HOOK_UDP_OVER_TCP=1`). Friend must run a single
+  game instance.
 
 ## Open ideas / known gaps
 
 - DNS/`gethostname`/`GetIpAddrTable`/`GetIfTable` are NOT isolated yet —
-  GBE doesn't use them; add to LAN_ONLY if a game reveals the real NIC
-  through another door.
+  the reference app doesn't use them; add to LAN_ONLY if a game
+  reveals the real NIC through another door.
 - Blocking-socket `accept` under LAN_ONLY returns EAGAIN for dropped
   wire peers (callers may spin; rare) — could sleep-slice.
 - Host-claim ping-pong between two genuine hosts (both games listen) is
   log noise only: explicit addressing rules; last claim wins for
   implicit routing.
-- GBE's uninitialized-`Connection` dial lottery: consider a hook-side
+- The reference app's uninitialized-`Connection` dial lottery: consider
   nudge if it ever blocks a sale (e.g. treat a never-read garbage fd's
   FIONREAD/select on the tool side as retry-worthy) — unverified idea.
 - dist/ cleanup of v1.2.0-rc*/v1.0.0/v1.1.1 packages: offered to user,

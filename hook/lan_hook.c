@@ -2323,7 +2323,7 @@ static void dt_start(void) {
     g_init_t0 = dt_now_ms(); /* watchdog baseline: threads start below */
     g_fakeip = inet_addr("192.168.7.1");
     if (!g_node) {
-        /* One identity per process TREE: a child (GBE self-restart chain,
+        /* One identity per process TREE: a child (launcher self-restart chain,
          * injected sub-process, plain fork/exec) inherits LAN_HOOK_NODE
          * from the parent environment and adopts the same node_id -> the
          * relay sees the whole tree as ONE host (one vnode, many links).
@@ -3074,7 +3074,7 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
          * real stack always delivers to local sockets. Replicate -
          * sourced with OUR VIRTUAL address (the identity a peer's packet
          * carries on the wire). Never the physical NIC ip: apps adopt
-         * announce sources into own_ip/peer state (GBE does), so leaking
+         * announce sources into own_ip/peer state (the reference app does), so leaking
          * it breaks exactly the isolation LAN_ONLY promises and pollutes
          * PONG peer lists across machines. Pre-lease (no vnode yet) the
          * machine ip stays the honest answer unless we're isolated. */
@@ -4502,7 +4502,7 @@ int WSAAPI hk_ioctlsocket(SOCKET s, long cmd, u_long *argp) {
     if (r == 0 && cmd == (long)FIONBIO && argp) dt_set_nonblock((long long)s, *argp ? 1 : 0);
     /* FIONREAD on a tunneled stream: report the hook in-queue (the real
      * socket never sees the bytes). Readers driven by FIONREAD (e.g.
-     * GBE's recv_tcp) never read otherwise and the peer can never
+     * the classic polling reader) never read otherwise and the peer can never
      * "connect" from their side. */
     if (cmd == (long)FIONREAD && argp && g_direct) {
         int dolog = 0; unsigned qn = 0;
