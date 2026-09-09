@@ -25,6 +25,7 @@ PUB = 47871
 HOST_TCP, HOST_UDP, DISC = 47872, 47873, 47874
 IN_PORT = 47875
 ACC_PORT = 47876
+ECHO_PORT = 47877
 PUBLIC = "192.0.2.10"          # TEST-NET-1: guaranteed no route / unroutable
 
 PROBE = r"""
@@ -65,6 +66,25 @@ elif mode == "in":
     print("IN_GOT", got)
     assert b"WIRE" not in got and b"LOOP" in got, got
     print("IN_OK")
+elif mode == "echo":
+    # The hook loops our own broadcast back (NIC-style local echo). On a
+    # truly isolated LAN that echo can ONLY carry our virtual address:
+    # apps adopt announce sources into own_ip/peer state, so a physical
+    # NIC ip here leaks straight through the isolation.
+    port = int(sys.argv[2])
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    u.bind(("", port))
+    u.sendto(b"PINGME", ("255.255.255.255", port))
+    u.settimeout(4)
+    src = None
+    while src is None:
+        d, a = u.recvfrom(1024)
+        if d == b"PINGME":
+            src = a[0]
+    print("ECHO_SRC", src)
+    assert src.startswith("10.200."), src
+    print("ECHO_OK")
 elif mode == "acc":
     import threading
     port = int(sys.argv[2])
@@ -219,6 +239,12 @@ async def main():
         finally:
             os.unlink(path)
         print("PASS[lanonly] wire TCP peer dropped at accept", flush=True)
+
+
+    # phase 5: own-broadcast local echo carries the vnode, never the NIC
+    rc, out = await hooked_py(PROBE, ["echo", str(ECHO_PORT)], env)
+    assert rc == 0 and "ECHO_OK" in out, (rc, out[-400:])
+    print("PASS[lanonly] broadcast echo sourced with virtual address", flush=True)
 
     print("LANONLY_ALL_PASS", flush=True)
     relay_task.cancel()

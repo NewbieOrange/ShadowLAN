@@ -2563,6 +2563,24 @@ static void lips_refresh(void) {
 static int ipv4_is_loopback(unsigned long net_order) {
     return (ntohl(net_order) >> 24) == 127;
 }
+/* LAN_ONLY drops can be a steady stream (LAN beacons); log 1s bursts. */
+static void dt_log_wire_drop(unsigned long net_order) {
+    static long last = 0;
+    unsigned long h = ntohl(net_order), now;
+#ifdef LINUX_BUILD
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (unsigned long)(ts.tv_sec);
+#else
+    now = GetTickCount() / 1000;
+#endif
+    if (g_debug && (long)(now - last) > 0) {
+        char lb[112];
+        last = (long)now;
+        snprintf(lb, sizeof(lb), "lan-only: drop wire src=%lu.%lu.%lu.%lu",
+                 (h >> 24) & 255, (h >> 16) & 255, (h >> 8) & 255, h & 255);
+        dlog(lb);
+    }
+}
 static int ipv4_is_local(unsigned long net_order) {
     unsigned long h = ntohl(net_order);
     int i, hit = 0;
@@ -2990,10 +3008,20 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
         /* NIC-style local echo: many LAN discovery schemes seed their
          * peer table from the echo of their own broadcast, which the
-         * real stack always delivers to local sockets. Replicate. */
+         * real stack always delivers to local sockets. Replicate -
+         * sourced with OUR VIRTUAL address (the identity a peer's packet
+         * carries on the wire). Never the physical NIC ip: apps adopt
+         * announce sources into own_ip/peer state (GBE does), so leaking
+         * it breaks exactly the isolation LAN_ONLY promises and pollutes
+         * PONG peer lists across machines. Pre-lease (no vnode yet) the
+         * machine ip stays the honest answer unless we're isolated. */
         {
             char mip[64];
-            if (dt_machine_ip(mip, (int)sizeof(mip)))
+            if (dt_src_ip(mip, (int)sizeof(mip)))
+                dt_direct_udp_in(game_port, (const unsigned char *)mip,
+                                 (int)strlen(mip), buf, len);
+            else if (!g_lan_only &&
+                     dt_machine_ip(mip, (int)sizeof(mip)))
                 dt_direct_udp_in(game_port, (const unsigned char *)mip,
                                  (int)strlen(mip), buf, len);
         }
@@ -3332,6 +3360,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                 if (g_lan_only && rn > 0 && lp &&
                     *lp >= sizeof(struct sockaddr_in) &&
                     !ipv4_is_loopback(((struct sockaddr_in *)sp)->sin_addr.s_addr)) {
+                    dt_log_wire_drop(((struct sockaddr_in *)sp)->sin_addr.s_addr);
                     if (nb) { errno = EAGAIN; return -1; }
                     continue;  /* LAN_ONLY: no wire world beyond the tunnel */
                 }
@@ -3963,6 +3992,7 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
             if (g_lan_only && n > 0 && from && fromlen &&
                 *fromlen >= (int)sizeof(struct sockaddr_in) &&
                 !ipv4_is_loopback(((struct sockaddr_in *)from)->sin_addr.s_addr)) {
+                dt_log_wire_drop(((struct sockaddr_in *)from)->sin_addr.s_addr);
                 if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
                 continue;   /* LAN_ONLY: no wire world beyond the tunnel */
             }
