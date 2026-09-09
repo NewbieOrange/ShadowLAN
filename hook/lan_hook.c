@@ -63,6 +63,7 @@ static char g_server[256] = {0};
 static int g_srvport = 47777;
 static int g_direct = 0;
 static int g_udp_tcp = 0;   /* UDP-over-TCP mode (policy_init, used everywhere) */
+static int g_lan_only = 0;  /* LAN_HOOK_LAN_ONLY: ShadowLAN is the only network */
 /* hosting claim: set when the local game serves (listen() hook) */
 static volatile int g_claimed = 0;
 static unsigned char g_token[256];
@@ -97,6 +98,14 @@ static void policy_init(void) {
         const char *ut = getenv("LAN_HOOK_UDP_OVER_TCP");
         g_udp_tcp = (ut && ut[0] && ut[0] != '0') ? 1 : 0;
     }
+    {
+        /* LAN_HOOK_LAN_ONLY=1: emulate a machine whose only network is the
+         * ShadowLAN subnet (no WAN, no other LANs): wire destinations fail
+         * with ENETUNREACH and non-loopback wire frames are not delivered.
+         * The loopback interface stays fully functional (bridges, tools). */
+        const char *lo = getenv("LAN_HOOK_LAN_ONLY");
+        g_lan_only = (lo && lo[0] && lo[0] != '0') ? 1 : 0;
+    }
 }
 
 #ifndef LINUX_BUILD
@@ -119,7 +128,7 @@ static void dt_log_options(void) {
     snprintf(lb, sizeof(lb),
              "options v%s pid=%u server=%s port=%d token=%s ports=%s debug=%d "
              "node=%s lease_wait=%ld init_timeout=%ld udp_over_tcp=%d "
-             "modules=%s children=%s nochild=%s logfile=%s",
+             "modules=%s children=%s nochild=%s lan_only=%d logfile=%s",
              SHADOWLAN_VERSION,
 #ifdef LINUX_BUILD
              (unsigned)getpid(),
@@ -135,6 +144,7 @@ static void dt_log_options(void) {
              getenv("LAN_HOOK_MODULES") ? getenv("LAN_HOOK_MODULES") : "(all)",
              getenv("LAN_HOOK_CHILDREN") ? getenv("LAN_HOOK_CHILDREN") : "(all)",
              getenv("LAN_HOOK_NOCHILD") ? getenv("LAN_HOOK_NOCHILD") : "0",
+             g_lan_only,
              getenv("LAN_HOOK_LOGFILE") ? getenv("LAN_HOOK_LOGFILE") : "(debugview)");
     lb[sizeof(lb) - 1] = 0;
     /* Unconditional (not gated on debug): the point is answering
@@ -2548,6 +2558,11 @@ static void lips_refresh(void) {
         freeaddrinfo(res);
     }
 }
+/* strict loopback (inbound isolation predicate: tunnel data never rides
+ * the real stack; only the hook's own 127.0.0.1 bridge traffic may) */
+static int ipv4_is_loopback(unsigned long net_order) {
+    return (ntohl(net_order) >> 24) == 127;
+}
 static int ipv4_is_local(unsigned long net_order) {
     unsigned long h = ntohl(net_order);
     int i, hit = 0;
@@ -2852,6 +2867,17 @@ static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
 #endif
     dt_icmp_deliver(from_virt, id, seq, data, dlen);
 }
+/* LAN_ONLY verdict for an outbound v4 destination: loopback, mesh vnodes
+ * and (broadcast/lan) targets the tunnel itself serves are allowed;
+ * everything that would reach the physical NIC is a "no route" error. */
+static int dt_reject_wire4(const struct sockaddr_in *dst) {
+    int dummy = 0;
+    if (!g_lan_only) return 0;
+    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;
+    if (dt_virt_node(dst->sin_addr.s_addr)) return 0;
+    if (sockaddr_is_lan_target((const struct sockaddr *)dst, &dummy)) return 0;
+    return 1;
+}
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
     if (dt_is_icmp_sock(gsock))
@@ -2930,7 +2956,8 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         return 1;
     }
     int port = 0;
-    if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
+    if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port))
+        return dt_reject_wire4(dst) ? -1 : 0;
     if (ipv4_is_bcast(dst->sin_addr.s_addr)) {
         unsigned char *p = (unsigned char *)malloc(4 + len);
         if (!p) return 1;
@@ -3023,6 +3050,7 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */
     if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
+    if (dt_reject_wire4(dst)) return 3;  /* LAN_ONLY: no route to host */
     DLOCK();
     struct dt_stream *ex = dt_stream_by_sock(gsock);
     DUNLOCK();
@@ -3031,7 +3059,8 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     int is_vnode = vnode != 0;
     if (!is_vnode) {
         int port = 0;
-        if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port)) return 0;
+        if (!sockaddr_is_lan_target((const struct sockaddr *)dst, &port))
+            return dt_reject_wire4(dst) ? -1 : 0;
     }
     unsigned sid = 0;
     if (!dt_stream_alloc(gsock, dst, &sid)) return 1; /* table full */
@@ -3259,9 +3288,12 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     ensure_init();
     if (!real_sendto) real_sendto = dlsym(RTLD_NEXT, "sendto");
     if (g_direct && dest && dest->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
-        if (dt_on_sendto((long long)sockfd, (const unsigned char *)buf, len,
-                         (const struct sockaddr_in *)dest))
-            return (ssize_t)len;
+        {
+            int cr = dt_on_sendto((long long)sockfd, (const unsigned char *)buf, len,
+                                  (const struct sockaddr_in *)dest);
+            if (cr == -1) { errno = ENETUNREACH; return -1; }
+            if (cr) return (ssize_t)len;
+        }
     }
     return real_sendto(sockfd, buf, len, flags, dest, addrlen);
 }
@@ -3296,7 +3328,14 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                 struct sockaddr_in rfrom; socklen_t rfl = sizeof(rfrom);
                 struct sockaddr *sp = src ? src : (struct sockaddr *)&rfrom;
                 socklen_t *lp = src ? addrlen : &rfl;
-                return real_recvfrom(sockfd, buf, len, flags, sp, lp);
+                ssize_t rn = real_recvfrom(sockfd, buf, len, flags, sp, lp);
+                if (g_lan_only && rn > 0 && lp &&
+                    *lp >= sizeof(struct sockaddr_in) &&
+                    !ipv4_is_loopback(((struct sockaddr_in *)sp)->sin_addr.s_addr)) {
+                    if (nb) { errno = EAGAIN; return -1; }
+                    continue;  /* LAN_ONLY: no wire world beyond the tunnel */
+                }
+                return rn;
             }
             if (nb) { errno = EAGAIN; return -1; }
             struct timeval tvn; gettimeofday(&tvn, NULL);
@@ -3348,6 +3387,7 @@ int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
     if (!real_connect) real_connect = dlsym(RTLD_NEXT, "connect");
     if (g_direct && a && a->sa_family == AF_INET && l >= sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 3) { errno = ENETUNREACH; return -1; }
         if (r == 1) {
             int nonblock = dt_is_nonblock((long long)s);
             if (nonblock) { errno = EINPROGRESS; return -1; }
@@ -3397,6 +3437,31 @@ int getpeername(int s, struct sockaddr *a, socklen_t *l) {
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
     }
     return real_gp(s, a, l);
+}
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    static int (*real_accept)(int, struct sockaddr*, socklen_t*) = 0;
+    ensure_init();
+    if (!real_accept) real_accept = dlsym(RTLD_NEXT, "accept");
+    int fd = real_accept(sockfd, addr, addrlen);
+    /* LAN_ONLY: drop wire LAN peers; loopback (bridge) passes. */
+    if (g_direct && g_lan_only && fd >= 0 && addr && addrlen &&
+        *addrlen >= sizeof(struct sockaddr_in) &&
+        !ipv4_is_loopback(((struct sockaddr_in *)addr)->sin_addr.s_addr)) {
+        close(fd); errno = EAGAIN; return -1;
+    }
+    return fd;
+}
+int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    static int (*real_accept4)(int, struct sockaddr*, socklen_t*, int) = 0;
+    ensure_init();
+    if (!real_accept4) real_accept4 = dlsym(RTLD_NEXT, "accept4");
+    int fd = real_accept4(sockfd, addr, addrlen, flags);
+    if (g_direct && g_lan_only && fd >= 0 && addr && addrlen &&
+        *addrlen >= sizeof(struct sockaddr_in) &&
+        !ipv4_is_loopback(((struct sockaddr_in *)addr)->sin_addr.s_addr)) {
+        close(fd); errno = EAGAIN; return -1;
+    }
+    return fd;
 }
 int close(int fd) {
     static int (*real_close)(int) = 0;
@@ -3693,6 +3758,7 @@ int select(int nfds, fd_set *r, fd_set *w, fd_set *x, struct timeval *tmo) {
 /* ================= Windows DLL ================= */
 typedef int (WSAAPI *PFN_sendto)(SOCKET, const char*, int, int, const struct sockaddr*, int);
 typedef int (WSAAPI *PFN_recvfrom)(SOCKET, char*, int, int, struct sockaddr*, int*);
+typedef SOCKET (WSAAPI *PFN_accept)(SOCKET, struct sockaddr*, int*);
 typedef int (WSAAPI *PFN_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_WSARecvFrom)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, struct sockaddr*, LPINT, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI *PFN_connect)(SOCKET, const struct sockaddr*, int);
@@ -3719,6 +3785,7 @@ typedef HMODULE (WINAPI *PFN_LoadLibraryExA)(LPCSTR, HANDLE, DWORD);
 typedef HMODULE (WINAPI *PFN_LoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
 
 static PFN_sendto p_sendto = 0; static PFN_recvfrom p_recvfrom = 0;
+static PFN_accept p_accept = 0;
 static PFN_WSASendTo p_WSASendTo = 0; static PFN_WSARecvFrom p_WSARecvFrom = 0;
 static PFN_connect p_connect = 0; static PFN_WSAConnect p_WSAConnect = 0;
 static PFN_bind p_bind = 0;
@@ -3893,6 +3960,12 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
                          n == SOCKET_ERROR ? WSAGetLastError() : 0);
                 dlog(lb);
             }
+            if (g_lan_only && n > 0 && from && fromlen &&
+                *fromlen >= (int)sizeof(struct sockaddr_in) &&
+                !ipv4_is_loopback(((struct sockaddr_in *)from)->sin_addr.s_addr)) {
+                if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
+                continue;   /* LAN_ONLY: no wire world beyond the tunnel */
+            }
             return n;
         }
         if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
@@ -3904,15 +3977,37 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
 
 int WSAAPI hk_sendto(SOCKET s, const char *buf, int len, int flags, const struct sockaddr *to, int tolen) {
     if (g_direct && to && to->sa_family == AF_INET && tolen >= (int)sizeof(struct sockaddr_in)) {
-        if (dt_on_sendto((long long)s, (const unsigned char *)buf, (size_t)(len < 0 ? 0 : len),
-                         (const struct sockaddr_in *)to))
-            return len;
+        {
+            int cr = dt_on_sendto((long long)s, (const unsigned char *)buf, (size_t)(len < 0 ? 0 : len),
+                                  (const struct sockaddr_in *)to);
+            if (cr == -1) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
+            if (cr) return len;
+        }
     }
     {
         int r = p_sendto(s, buf, len, flags, to, tolen);
         if (!g_direct && r > 0) dt_obsv("SEND", (long long)s, to, (const unsigned char *)buf, r);
         return r;
     }
+}
+SOCKET WSAAPI hk_accept(SOCKET s, struct sockaddr *addr, int *addrlen) {
+    SOCKET r = p_accept ? p_accept(s, addr, addrlen) : INVALID_SOCKET;
+    /* LAN_ONLY: an isolated NIC has no inbound LAN peers; only loopback
+     * (bridge/proxy traffic) may reach a listening game socket. */
+    if (g_direct && g_lan_only && r != INVALID_SOCKET && addr && addrlen &&
+        *addrlen >= (int)sizeof(struct sockaddr_in) &&
+        !ipv4_is_loopback(((struct sockaddr_in *)addr)->sin_addr.s_addr)) {
+        unsigned long a = 0;
+        char lb[112];
+        memcpy(&a, &((struct sockaddr_in *)addr)->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "lan-only: drop wire accept from %lu.%lu.%lu.%lu",
+                 a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255);
+        dlog(lb);
+        closesocket(r);
+        WSASetLastError(WSAEWOULDBLOCK);
+        return INVALID_SOCKET;
+    }
+    return r;
 }
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
     if (g_direct && dt_is_udp_like((long long)s))
@@ -3940,6 +4035,11 @@ int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flag
                 for (i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
                 int consumed = dt_on_sendto((long long)s, tmp, total, (const struct sockaddr_in *)to);
                 free(tmp);
+                if (consumed == -1) {
+                    WSASetLastError(WSAENETUNREACH);
+                    if (ov->hEvent) WSASetEvent(ov->hEvent);
+                    return SOCKET_ERROR;
+                }
                 if (consumed) {
                     if (sent) *sent = (DWORD)total;
                     if (ov->hEvent) WSASetEvent(ov->hEvent);
@@ -3958,6 +4058,7 @@ int WSAAPI hk_WSASendTo(SOCKET s, LPWSABUF b, DWORD nb, LPDWORD sent, DWORD flag
             for (DWORD i = 0; i < nb; i++) { memcpy(tmp + off, b[i].buf, b[i].len); off += b[i].len; }
             int consumed = dt_on_sendto((long long)s, tmp, total, (const struct sockaddr_in *)to);
             free(tmp);
+            if (consumed == -1) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
             if (consumed) { if (sent) *sent = (DWORD)total; return 0; }
         }
     }
@@ -4052,6 +4153,7 @@ static int dt_connect_wait(long long gsock, int nonblock) {
 int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 3) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
         if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
         if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
@@ -4137,6 +4239,7 @@ int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1,
     (void)b1; (void)b2; (void)q1; (void)q2;
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
+        if (r == 3) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
         if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
         if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
@@ -4649,6 +4752,7 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
         if (isws2 || m == hWS2) {
             if (!strcmp(n,"sendto")) return (FARPROC)hk_sendto;
             if (!strcmp(n,"recvfrom")) return (FARPROC)hk_recvfrom;
+            if (!strcmp(n,"accept")) return (FARPROC)hk_accept;
             if (!strcmp(n,"WSASendTo")) return (FARPROC)hk_WSASendTo;
             if (!strcmp(n,"WSARecvFrom")) return (FARPROC)hk_WSARecvFrom;
             if (!strcmp(n,"connect")) return (FARPROC)hk_connect;
@@ -4966,10 +5070,67 @@ static int g_gaa_logged = 0;
 
 static int dt_vnode_str(char *out, int n) { return dt_src_ip(out, (size_t)n); }
 
+/* Build one pseudo-adapter node at base+off (caller buffer). Strings live
+ * in the DLL's .rdata (loaded for the whole process lifetime), so only the
+ * adapter struct + its unicast node/sockaddr occupy the buffer. */
+#define DT_SL_NAME_A "ShadowLAN Virtual Interface"
+#define DT_SL_NAME_W L"ShadowLAN Virtual Interface"
+static size_t dt_gaa_sizes(size_t *anode, size_t *unode) {
+    *anode = (sizeof(IP_ADAPTER_ADDRESSES) + 15u) & ~(size_t)15;
+    *unode = (sizeof(IP_ADAPTER_UNICAST_ADDRESS) + sizeof(SOCKADDR_IN)
+              + 15u) & ~(size_t)15;
+    return *anode + *unode;
+}
+static void dt_gaa_fill(BYTE *base, size_t off, size_t anode, size_t unode,
+                        const char *ip) {
+    IP_ADAPTER_ADDRESSES *na = (IP_ADAPTER_ADDRESSES *)(base + off);
+    memset(na, 0, anode);
+    na->Length = sizeof(IP_ADAPTER_ADDRESSES);
+    na->IfIndex = DT_SL_IFINDEX;
+    na->IfType = IF_TYPE_ETHERNET_CSMACD;
+    na->OperStatus = IfOperStatusUp;
+    na->Mtu = 1500;
+    na->TransmitLinkSpeed = 1000000000ull;
+    na->ReceiveLinkSpeed = 1000000000ull;
+    /* locally-administered MAC, ASCII "SH" (ShadowLAN) in bytes 2-3 */
+    na->PhysicalAddress[0] = 0x02; na->PhysicalAddress[1] = 0x00;
+    na->PhysicalAddress[2] = 0x53; na->PhysicalAddress[3] = 0x48;
+    na->PhysicalAddress[4] = 0x00; na->PhysicalAddress[5] = 0x01;
+    na->PhysicalAddressLength = 6;
+    na->AdapterName = (PCHAR)DT_SL_NAME_A;
+    na->Description = (PWCHAR)DT_SL_NAME_W;
+    na->FriendlyName = (PWCHAR)DT_SL_NAME_W;
+    {
+        static const wchar_t empty[] = L"";
+        na->DnsSuffix = (PWCHAR)empty;
+    }
+    IP_ADAPTER_UNICAST_ADDRESS *nu =
+        (IP_ADAPTER_UNICAST_ADDRESS *)(base + off + anode);
+    memset(nu, 0, unode);
+    nu->Length = sizeof(IP_ADAPTER_UNICAST_ADDRESS);
+    nu->Next = NULL;
+    nu->Address.lpSockaddr =
+        (PSOCKADDR)(base + off + anode + sizeof(IP_ADAPTER_UNICAST_ADDRESS));
+    nu->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
+    nu->PrefixOrigin = IpPrefixOriginManual;
+    nu->SuffixOrigin = IpSuffixOriginManual;
+    nu->DadState = IpDadStatePreferred;
+    nu->ValidLifetime = 0xFFFFFFFFu;
+    nu->PreferredLifetime = 0xFFFFFFFFu;
+    nu->LeaseLifetime = 0xFFFFFFFFu;
+    nu->OnLinkPrefixLength = 24;
+    SOCKADDR_IN *sa = (SOCKADDR_IN *)nu->Address.lpSockaddr;
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_addr.s_addr = inet_addr(ip);
+    na->FirstUnicastAddress = nu;
+}
+
 ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
                                      PIP_ADAPTER_ADDRESSES AdapterAddresses,
                                      PULONG SizePointer) {
     ULONG r, used, room, at;
+    size_t anode, unode;
     char ip[48];
     if (!p_GetAdaptersAddresses) return ERROR_FUNCTION_FAILED;
     if (g_debug && !g_gaa_logged) { g_gaa_logged = 1;
@@ -4979,6 +5140,25 @@ ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
     if (Family != AF_INET && Family != AF_UNSPEC)
         return p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
     room = SizePointer ? *SizePointer : 0;
+    dt_gaa_sizes(&anode, &unode);
+    if (g_lan_only) {
+        /* Isolated: the pseudo-interface is the ONLY interface this process
+         * has. Synthesize a complete one-adapter answer; never touch the
+         * real adapter list (that would leak the physical LAN's IPs). */
+        ULONG need = (ULONG)(anode + unode);
+        if (Family == AF_INET6) {
+            if (SizePointer) *SizePointer = 0;
+            return ERROR_NO_DATA;
+        }
+        if (!AdapterAddresses || !SizePointer || room < need) {
+            if (SizePointer) *SizePointer = need;
+            return ERROR_BUFFER_OVERFLOW;
+        }
+        dt_gaa_fill((BYTE *)AdapterAddresses, 0, anode, unode, ip);
+        AdapterAddresses->Next = NULL;
+        *SizePointer = need;
+        return NO_ERROR;
+    }
     r = p_GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer);
     if (r == ERROR_BUFFER_OVERFLOW) {
         ULONG need = SizePointer ? *SizePointer : 0;
@@ -4988,72 +5168,31 @@ ULONG WINAPI hk_GetAdaptersAddresses(ULONG Family, ULONG Flags, PVOID Reserved,
     if (r != NO_ERROR || !AdapterAddresses || !SizePointer) return r;
     used = *SizePointer;
     {   /* some implementations report the whole buffer as "used"; trust a
-         * fresh size probe when it's smaller */
+         * fresh size probe (NULL buffer) when it says BUFFER_OVERFLOW */
         ULONG probe = 0;
-        p_GetAdaptersAddresses(Family, Flags, Reserved, NULL, &probe);
-        if (probe && probe < used) used = probe;
+        if (p_GetAdaptersAddresses(Family, Flags, Reserved, NULL, &probe)
+                == ERROR_BUFFER_OVERFLOW && probe && probe < used)
+            used = probe;
     }
     at = (used + 15u) & ~15u;
-    {
-        size_t anode = (sizeof(IP_ADAPTER_ADDRESSES) + 15u) & ~(size_t)15;
-        size_t unode = (sizeof(IP_ADAPTER_UNICAST_ADDRESS) + sizeof(SOCKADDR_IN)
-                        + 15u) & ~(size_t)15;
-        size_t sname = 48;   /* PCHAR AdapterName + padding */
-        size_t sdesc = 64 * 2; /* PWCHAR Description/FriendlyName + padding */
-        if (at + anode + unode + sname + sdesc > room) return r; /* no slack */
-        IP_ADAPTER_ADDRESSES *na =
-            (IP_ADAPTER_ADDRESSES *)((BYTE *)AdapterAddresses + at);
-        memset(na, 0, anode);
-        na->Length = sizeof(IP_ADAPTER_ADDRESSES);
-        na->IfIndex = DT_SL_IFINDEX;
-        na->IfType = IF_TYPE_ETHERNET_CSMACD;
-        na->OperStatus = IfOperStatusUp;
-        na->Mtu = 1500;
-        /* locally-administered MAC, ASCII "SH" (ShadowLAN) in bytes 2-3 */
-        na->PhysicalAddress[0] = 0x02; na->PhysicalAddress[1] = 0x00;
-        na->PhysicalAddress[2] = 0x53; na->PhysicalAddress[3] = 0x48;
-        na->PhysicalAddressLength = 6;
-        {
-            static const char anm[] = "ShadowLAN Virtual Interface";
-            static const wchar_t dnm[] = L"ShadowLAN Virtual Interface";
-            char *pa = (char *)((BYTE *)na + anode + unode);
-            wchar_t *pd = (wchar_t *)(pa + sname);
-            memcpy(pa, anm, sizeof(anm));
-            memcpy(pd, dnm, sizeof(dnm));
-            na->AdapterName = pa;
-            na->Description = pd;
-            na->FriendlyName = pd;
-        }
-        IP_ADAPTER_UNICAST_ADDRESS *nu =
-            (IP_ADAPTER_UNICAST_ADDRESS *)((BYTE *)na + anode);
-        memset(nu, 0, unode);
-        nu->Length = sizeof(IP_ADAPTER_UNICAST_ADDRESS);
-        nu->Next = NULL;
-        nu->Address.lpSockaddr =
-            (PSOCKADDR)((BYTE *)nu + sizeof(IP_ADAPTER_UNICAST_ADDRESS));
-        nu->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-        nu->PrefixOrigin = 0;      /* offset == XP OnLinkPrefixLength */
-        nu->SuffixOrigin = 0;
-        nu->DadState = IpDadStatePreferred;
-        SOCKADDR_IN *sa = (SOCKADDR_IN *)nu->Address.lpSockaddr;
-        sa->sin_family = AF_INET;
-        sa->sin_addr.s_addr = inet_addr(ip);
-        na->FirstUnicastAddress = nu;
-        na->Next = NULL;
+    if (at + anode + unode <= room) {
+        dt_gaa_fill((BYTE *)AdapterAddresses, at, anode, unode, ip);
+        ((IP_ADAPTER_ADDRESSES *)((BYTE *)AdapterAddresses + at))->Next = NULL;
         {   /* append after the real adapters */
             IP_ADAPTER_ADDRESSES *a = AdapterAddresses;
             while (a && a->Next) a = a->Next;
-            if (a) a->Next = na;
+            if (a) a->Next = (IP_ADAPTER_ADDRESSES *)((BYTE *)AdapterAddresses + at);
         }
-        *SizePointer = (ULONG)(at + anode + unode + sname + sdesc);
+        *SizePointer = (ULONG)(at + anode + unode);
     }
     return r;
 }
 
-/* Windows-SDK layout of the legacy GetAdaptersInfo structures. Some
- * compiler SDKs ship a non-ABI-compatible definition, so the surgery
- * below uses its own layout (byte-for-byte the MS one) and treats the
- * caller buffer opaquely. */
+/* Windows-SDK layout of the legacy IP_ADAPTER_INFO (iprtrmib.h). Some
+ * compiler SDKs ship a different or truncated definition (older mingw has
+ * no DnsServerList), so the surgery below walks its own byte-exact layout
+ * and treats the caller buffer opaquely. Lease times are time_t: 8 bytes
+ * on x64; on x86 we slightly over-reserve, which is harmless. */
 typedef struct dt_ms_ipa_str {
     struct dt_ms_ipa_str *Next;
     char IpAddress[16];
@@ -5062,14 +5201,15 @@ typedef struct dt_ms_ipa_str {
 } dt_ms_ipa_str;
 typedef struct dt_ms_ip_adapter_info {
     struct dt_ms_ip_adapter_info *Next;
+    DWORD ComboIndex;
+    char AdapterName[256 + 4];
+    char Description[128 + 4];
+    UINT AddressLength;
+    unsigned char Address[8];
     DWORD Index;
     UINT Type;
-    char Desc[260];
-    char Name[260];
-    UINT WksEnabled;
-    dt_ms_ipa_str *DomainDnsSuffix;
-    dt_ms_ipa_str *HostName;
-    dt_ms_ipa_str *CurrentDnsServer;
+    UINT DhcpEnabled;
+    dt_ms_ipa_str *CurrentIpAddress;
     dt_ms_ipa_str IpAddressList;
     dt_ms_ipa_str GatewayList;
     dt_ms_ipa_str DnsServerList;
@@ -5077,17 +5217,51 @@ typedef struct dt_ms_ip_adapter_info {
     UINT HaveWins;
     dt_ms_ipa_str PrimaryWinsServer;
     dt_ms_ipa_str SecondaryWinsServer;
-    FILETIME LeaseObtained;
-    FILETIME LeaseExpires;
+    long long LeaseObtained;
+    long long LeaseExpires;
 } dt_ms_ip_adapter_info;
+
+static size_t dt_gai_node(void) {
+    return (sizeof(dt_ms_ip_adapter_info) + 15u) & ~(size_t)15;
+}
+static void dt_gai_fill(BYTE *base, size_t off, const char *ip) {
+    dt_ms_ip_adapter_info *na = (dt_ms_ip_adapter_info *)(base + off);
+    memset(na, 0, sizeof(*na));
+    strncpy(na->AdapterName, DT_SL_NAME_A, sizeof(na->AdapterName) - 1);
+    strncpy(na->Description, DT_SL_NAME_A, sizeof(na->Description) - 1);
+    na->AddressLength = 6;
+    na->Address[0] = 0x02; na->Address[1] = 0x00; na->Address[2] = 0x53;
+    na->Address[3] = 0x48; na->Address[4] = 0x00; na->Address[5] = 0x01;
+    na->Index = DT_SL_IFINDEX;
+    na->Type = 6;            /* MIB_IF_TYPE_ETHERNET */
+    na->DhcpEnabled = 0;
+    na->CurrentIpAddress = &na->IpAddressList;
+    strncpy(na->IpAddressList.IpAddress, ip,
+            sizeof(na->IpAddressList.IpAddress) - 1);
+    strncpy(na->IpAddressList.IpMask, "255.255.255.0",
+            sizeof(na->IpAddressList.IpMask) - 1);
+    na->IpAddressList.Next = NULL;
+    na->Next = NULL;
+}
 
 ULONG WINAPI hk_GetAdaptersInfo(PIP_ADAPTER_INFO InfoBuffer, PULONG SizePointer) {
     ULONG r, used, at, room;
     char ip[48];
+    size_t ino;
     if (!p_GetAdaptersInfo) return ERROR_FUNCTION_FAILED;
     if (!g_direct || !dt_vnode_str(ip, sizeof(ip)))
         return p_GetAdaptersInfo(InfoBuffer, SizePointer);
     room = SizePointer ? *SizePointer : 0;
+    ino = dt_gai_node();
+    if (g_lan_only) {   /* isolated: one-adapter answer, real list hidden */
+        if (!InfoBuffer || !SizePointer || room < (ULONG)ino) {
+            if (SizePointer) *SizePointer = (ULONG)ino;
+            return ERROR_BUFFER_OVERFLOW;
+        }
+        dt_gai_fill((BYTE *)InfoBuffer, 0, ip);
+        *SizePointer = (ULONG)ino;
+        return NO_ERROR;
+    }
     r = p_GetAdaptersInfo(InfoBuffer, SizePointer);
     if (r == ERROR_BUFFER_OVERFLOW) {
         ULONG need = SizePointer ? *SizePointer : 0;
@@ -5096,31 +5270,21 @@ ULONG WINAPI hk_GetAdaptersInfo(PIP_ADAPTER_INFO InfoBuffer, PULONG SizePointer)
     }
     if (r != NO_ERROR || !InfoBuffer || !SizePointer) return r;
     used = *SizePointer;
+    {   /* same whole-buffer-as-used quirk as GetAdaptersAddresses: clamp
+         * to a fresh size probe when it reports the true packed size */
+        ULONG probe = 0;
+        if (p_GetAdaptersInfo(NULL, &probe) == ERROR_BUFFER_OVERFLOW
+                && probe && probe < used)
+            used = probe;
+    }
     at = (used + 15u) & ~15u;
-    {
-        size_t ino = (sizeof(dt_ms_ip_adapter_info) + 15u) & ~(size_t)15;
-        if (at + ino > room) return r;   /* no slack: unshimmed */
-        dt_ms_ip_adapter_info *na =
-            (dt_ms_ip_adapter_info *)((BYTE *)InfoBuffer + at);
-        memset(na, 0, ino);
-        na->Index = DT_SL_IFINDEX;
-        na->Type = 6; /* MIB_IF_TYPE_ETHERNET */
-        na->WksEnabled = 1;
-        strncpy(na->Desc, "ShadowLAN Virtual Interface", sizeof(na->Desc) - 1);
-        strncpy(na->Name, "ShadowLAN Virtual Interface", sizeof(na->Name) - 1);
-        /* first (and only) address lives in the inline IpAddressList */
-        strncpy(na->IpAddressList.IpAddress, ip,
-                sizeof(na->IpAddressList.IpAddress) - 1);
-        strncpy(na->IpAddressList.IpMask, "255.255.255.0",
-                sizeof(na->IpAddressList.IpMask) - 1);
-        na->IpAddressList.Context = 0;
-        na->IpAddressList.Next = NULL;
-        na->Next = NULL;
+    if (at + ino <= room) {
+        dt_gai_fill((BYTE *)InfoBuffer, at, ip);
         {   /* append after the real adapters (Next is offset 0 in both
              * SDK spellings, so the walk is safe) */
             dt_ms_ip_adapter_info *a = (dt_ms_ip_adapter_info *)InfoBuffer;
             while (a && a->Next) a = a->Next;
-            if (a) a->Next = na;
+            if (a) a->Next = (dt_ms_ip_adapter_info *)((BYTE *)InfoBuffer + at);
         }
         *SizePointer = (ULONG)(at + ino);
     }
@@ -5209,6 +5373,7 @@ static void patch_iat_inner(HMODULE mod) {
                 if (isws2) {
                     if (!strcmp(fn,"sendto")) rep = (FARPROC)hk_sendto;
                     else if (!strcmp(fn,"recvfrom")) rep = (FARPROC)hk_recvfrom;
+                    else if (!strcmp(fn,"accept")) rep = (FARPROC)hk_accept;
                     else if (!strcmp(fn,"WSASendTo")) rep = (FARPROC)hk_WSASendTo;
                     else if (!strcmp(fn,"WSARecvFrom")) rep = (FARPROC)hk_WSARecvFrom;
                     else if (!strcmp(fn,"connect")) rep = (FARPROC)hk_connect;
@@ -5685,6 +5850,7 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     dbg("lan_hook: resolving imports\n");
     p_sendto = (PFN_sendto)GetProcAddress(hWS2, "sendto");
     p_recvfrom = (PFN_recvfrom)GetProcAddress(hWS2, "recvfrom");
+    p_accept = (PFN_accept)GetProcAddress(hWS2, "accept");
     p_WSASendTo = (PFN_WSASendTo)GetProcAddress(hWS2, "WSASendTo");
     p_WSARecvFrom = (PFN_WSARecvFrom)GetProcAddress(hWS2, "WSARecvFrom");
     p_connect = (PFN_connect)GetProcAddress(hWS2, "connect");

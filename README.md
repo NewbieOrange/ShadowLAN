@@ -27,6 +27,9 @@ Play broadcast-only LAN co-op games online, on Windows **and** Linux. One dedica
 - UDP-over-TCP option (`--udp-over-tcp` / `LAN_HOOK_UDP_OVER_TCP=1`): game datagrams ride
   the control TCP link when a peer sits behind a NAT/firewall that filters inbound UDP.
   Opt-in per peer (costs head-of-line blocking for those datagrams only); mixed rooms interoperate.
+- `LAN_HOOK_LAN_ONLY=1`: hide the physical network from the game entirely
+  (no-route errors for WAN, wire peers dropped, adapters list shows only
+  the ShadowLAN interface) — for clean debugging with zero real-LAN noise
 - Fail-fast startup: no relay link or no address lease aborts the game with a
   visible error (exit `200`/`201`) instead of running broken; the relay never
   echoes a packet back to its sender (loopback is always client-side)

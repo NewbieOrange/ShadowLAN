@@ -43,7 +43,8 @@ never head-of-line-block discovery or other streams.
   ("ShadowLAN Virtual Interface", up, /24) in `GetAdaptersAddresses`/
   `GetAdaptersInfo`, so apps that compute per-interface broadcast ranges
   or sanity-check peers against local subnets see the vnet exactly like a
-  real LAN interface.
+  real LAN interface. With `LAN_HOOK_LAN_ONLY=1` these APIs return the
+  pseudo-adapter *alone* (physical NICs hidden).
 
 ## Covered calls
 
@@ -101,6 +102,15 @@ ports), `LAN_HOOK_DEBUG=1`, `LAN_HOOK_LOGFILE=C:\hook.log` (appended log),
 `LAN_HOOK_MODULES=game.exe,unityplayer.dll` (patch only these),
 `LAN_HOOK_CHILDREN=lobby.exe,game.exe` (inject only these children, empty =
 all), `LAN_HOOK_NOCHILD=1` (never inject children),
+`LAN_HOOK_LAN_ONLY=1` (**ShadowLAN only**: the process behaves like a
+machine whose only network is the tunnel — connects/sendto to any public
+address fail instantly with `WSAENETUNREACH`/`ENETUNREACH` (no route),
+inbound wire datagrams and LAN TCP peers are not delivered (loopback
+stays fully functional for the local bridge), and the IP-Helper adapter
+APIs report the ShadowLAN pseudo-interface as the ONLY interface — no
+physical NIC, no real-LAN IPs or beacons visible. Discovery and mesh
+traffic ride the tunnel exactly as before. Great for clean repros; not
+needed for normal play.),
 `LAN_HOOK_NODE=709102507` (force a node id — the hook sets this in its own
 environment automatically, so children inherit one identity per process
 tree; set it manually to merge separate launches into one virtual host),
