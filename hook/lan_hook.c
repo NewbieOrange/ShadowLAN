@@ -53,7 +53,7 @@
 /* ---------- shared policy ---------- */
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
-#define SHADOWLAN_VERSION "1.1.0"
+#define SHADOWLAN_VERSION "2.0.0"
 static long long dt_now_ms(void);
 static void dt_stamp(char *out, size_t n);
 static void dt_fatal(int code, const char *msg);
