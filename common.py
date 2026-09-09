@@ -21,7 +21,7 @@ VERSION = "1.1.0"
 # a claim without identity would be unroutable, and claims refresh with
 # the keepalives anyway.
 T_NODE = 0x01        # payload: !H tlen + token + !I node_id + !H udp_port + !B flags
-T_ASSIGN = 0x02      # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
+T_ASSIGN = 0x02      # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt) + !B link_id
 T_BCAST = 0x03       # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x04  # relay->peer: !I src_node + !H disc_port + !H src_port + raw
 T_UDP_MODE = 0x05    # declare UDP-over-TCP mode for this link (empty payload)
@@ -192,29 +192,37 @@ def decode_udp_node(data):
     return decode_node(data[4:])
 
 
-def encode_assign(my_virt: int, net: int, bits: int, members) -> bytes:
-    """members: iterable of (node_id, virt_ip_int)."""
+def encode_assign(my_virt: int, net: int, bits: int, members,
+                  link_id: int = 0) -> bytes:
+    """members: iterable of (node_id, virt_ip_int). link_id is the
+    MANDATORY per-LINK slot base index (1..255): hooks number
+    client-socket marks as link_id*256 + slot across the full u16 space,
+    so sibling links of one node never collide in the relay's
+    return-path binding and games may use any port themselves."""
     members = list(members)
     out = [struct.pack("!IIBH", my_virt & 0xFFFFFFFF, net & 0xFFFFFFFF,
                        bits & 0xFF, len(members))]
     for node, virt in members:
         out.append(struct.pack("!II", node & 0xFFFFFFFF, virt & 0xFFFFFFFF))
+    out.append(struct.pack("!B", link_id & 0xFF))
     return b"".join(out)
 
 
 def decode_assign(payload: bytes):
-    """T_ASSIGN payload -> (my_virt, net, bits, [(node, virt)]) or None."""
+    """T_ASSIGN payload -> (my_virt, net, bits, [(node, virt)], link_id)
+    or None. The trailing link_id byte is mandatory."""
     try:
-        if len(payload) < 11:
+        if len(payload) < 12:
             return None
         my_virt, net, bits, n = struct.unpack("!IIBH", payload[:11])
-        if len(payload) != 11 + 8 * n:
+        if len(payload) != 12 + 8 * n:
             return None
+        link_id = payload[11 + 8 * n]
         members = []
         for i in range(n):
             node, virt = struct.unpack("!II", payload[11 + 8 * i:19 + 8 * i])
             members.append((node, virt))
-        return my_virt, net, bits, members
+        return my_virt, net, bits, members, link_id
     except struct.error:
         return None
 

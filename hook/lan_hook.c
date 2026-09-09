@@ -335,6 +335,28 @@ static DTSOCK g_tcp = DTSOCK_BAD, g_udptun = DTSOCK_BAD;
 static int g_tun_conn = 0;
 static void dt_tun_setup(DTSOCK s);
 static unsigned long g_fakeip = 0; /* 192.168.7.1 net order, set at start */
+/* Relay-assigned per-LINK slot base (ASSIGN tail byte, 1..59; 0 = legacy).
+ * Client marks are 50000 + g_link_id*DT_MAXSLOT + slot: unique across
+ * sibling links of one node, so relay return-path bindings for the two
+ * processes can never collide (the cross-machine "UDP triple collision"
+ * failure). Presented ports stay hook-allocated and stable - the relay
+ * rewrites nothing. */
+static int g_link_id = 1;
+/* Mark = the source port peers see for our client socket:
+ * link_id*DT_MAXSLOT + slot, link_id relay-assigned 1..255 in ASSIGN
+ * (mandatory tail; initial value overwritten before the app runs -
+ * the lease barrier gates it). This spans the FULL u16 space, so
+ * games keep every port usable themselves; a mark landing in some
+ * game's service band stays harmless because replies to a mark are
+ * demuxed by exact hosted-session triple (dt_on_sendto), never by
+ * port range. */
+static int dt_mark(int slot) {
+    return g_link_id * DT_MAXSLOT + slot;
+}
+static int dt_unmark(int mp) {
+    int base = g_link_id * DT_MAXSLOT;
+    return (mp >= base && mp < base + DT_MAXSLOT) ? mp - base : -1;
+}
 #ifdef LINUX_BUILD
 static pthread_mutex_t g_dmu = PTHREAD_MUTEX_INITIALIZER;
 #define DLOCK() pthread_mutex_lock(&g_dmu)
@@ -651,8 +673,10 @@ static void dt_apply_assign(const unsigned char *p, size_t n) {
     {
         int bits = p[8];
         int cnt = ((int)p[9] << 8) | p[10];
+        int lid;
         if (bits <= 0 || bits > 32 || cnt < 0 || cnt > DT_MAXMEMB) return;
-        if (n != (size_t)(11 + 8 * cnt)) return;
+        if (n != (size_t)(12 + 8 * cnt)) return;   /* link_id tail is
+                                                     * mandatory */
         DLOCK();
         g_myvirt = dt_ipnum(p);
         memcpy(g_vnetb, p + 4, 4);
@@ -663,15 +687,18 @@ static void dt_apply_assign(const unsigned char *p, size_t n) {
             g_members[g_nmembers].virt = dt_ipnum(p + 15 + 8 * i);
             g_nmembers++;
         }
+        lid = p[11 + 8 * cnt];
+        g_link_id = (lid >= 1 && lid <= 255) ? lid : 1;
         DUNLOCK();
     }
     g_have_assign = 1;
     { char lb[160];
       snprintf(lb, sizeof(lb),
-               "assign pid=%u node=%u self=%u.%u.%u.%u members=%d",
+               "assign pid=%u node=%u self=%u.%u.%u.%u members=%d link=%d",
                (unsigned)current_pid(), g_node,
                (g_myvirt >> 24) & 255, (g_myvirt >> 16) & 255,
-               (g_myvirt >> 8) & 255, g_myvirt & 255, g_nmembers);
+               (g_myvirt >> 8) & 255, g_myvirt & 255, g_nmembers,
+               g_link_id);
       dlog(lb); }
 }
 /* Network-order address -> node id (0 = not a known virtual peer). */
@@ -2202,7 +2229,7 @@ static void dt_udp_ingress(const unsigned char *buf, size_t n) {
         if (8 + il + 2 > (int)n) return;
         mp = dt_get16(buf + 8 + il);
         raw = buf + 10 + il; rl = n - 10 - (size_t)il;
-        slot = mp - 50000;
+        slot = dt_unmark(mp);
         DLOCK();
         if (slot >= 0 && slot < DT_MAXSLOT && g_sl[slot].used && g_sl[slot].game_port == gp) {
             orig = g_sl[slot].orig; gs = g_sl[slot].gsock; ok = 1;
@@ -2951,6 +2978,42 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                                  (int)strlen(myip), buf, len);
             return 1;
         }
+        {   /* reply-to-mark demux: an app unicasting back to the source
+             * (vnode, port) that recvfrom presented hits this path when
+             * that port is one of OUR hosted sessions' marks. Marks now
+             * live anywhere in the u16 space, so decide by the exact
+             * session tuple - never by a port band - and emit a proper
+             * S2C instead of a bogus C2S whose game_port would be a
+             * mark number with no listener on the far side. */
+            int sg = -1; struct sockaddr_in sc;
+            memset(&sc, 0, sizeof(sc));
+            DLOCK();
+            for (int i = 0; i < DT_MAXUSESS; i++)
+                if (g_us[i].used &&
+                    g_us[i].cli.sin_addr.s_addr == dst->sin_addr.s_addr &&
+                    g_us[i].cli.sin_port == dst->sin_port) {
+                    sg = g_us[i].game_port; sc = g_us[i].cli; break;
+                }
+            DUNLOCK();
+            if (sg >= 0) {
+                char cip[32]; unsigned long sa = ntohl(sc.sin_addr.s_addr);
+                int ml = snprintf(cip, sizeof(cip), "%lu.%lu.%lu.%lu",
+                                  (sa >> 24) & 255, (sa >> 16) & 255,
+                                  (sa >> 8) & 255, sa & 255);
+                size_t sn = 4 + 2 + 2 + (size_t)ml + 2 + len;
+                unsigned char *sd = (unsigned char *)malloc(sn);
+                if (!sd) return 1;
+                sd[0] = 'V'; sd[1] = 'N'; sd[2] = DU_VER; sd[3] = DU_S2C;
+                dt_put16(sd + 4, (unsigned)sg);
+                dt_put16(sd + 6, (unsigned)ml);
+                memcpy(sd + 8, cip, (size_t)ml);
+                dt_put16(sd + 8 + ml, (unsigned)ntohs(sc.sin_port));
+                if (len) memcpy(sd + 10 + ml, buf, len);
+                dt_udp_tun_send(sd, sn);
+                free(sd);
+                return 1;
+            }
+        }
         /* addressed P2P datagram: same slot scheme, dest-prefixed frame */
         DLOCK();
         struct dt_slot *sl = dt_slot_get(gsock, game_port, dst);
@@ -2959,7 +3022,7 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         if (slot < 0) return 1;
         char srcip[32]; const char *mip = "127.0.0.1"; int ml = 9;
         if (dt_src_ip(srcip, sizeof(srcip))) { mip = srcip; ml = (int)strlen(srcip); }
-        int mark = 50000 + slot;
+        int mark = dt_mark(slot);
         size_t n = 4 + 4 + 2 + 2 + (size_t)ml + 2 + len;
         unsigned char *d = (unsigned char *)malloc(n);
         if (!d) return 1;
@@ -3035,7 +3098,7 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     /* build U_GAME_C2S: VN 02 01 | H game | H iplen | ip | H mark | raw */
     char srcip2[32]; const char *mip = "127.0.0.1"; int ml = 9;
     if (dt_src_ip(srcip2, sizeof(srcip2))) { mip = srcip2; ml = (int)strlen(srcip2); }
-    int mark = 50000 + slot;
+    int mark = dt_mark(slot);
     size_t n = 4 + 2 + 2 + (size_t)ml + 2 + len;
     unsigned char *d = (unsigned char *)malloc(n);
     if (!d) return 1;

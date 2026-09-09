@@ -85,7 +85,11 @@ class Relay:
         self.beaconers = {}  # writer -> last BCAST seen (TCP-routable fallback)
         # virtual-IP membership: node_id -> dict(virt, seen_tcp, links)
         # where links maps control-writer -> per-link state
-        #   dict(tcp_ip, udp_port, udp_addr, seen_udp, udp_tcp).
+        #   dict(tcp_ip, udp_port, udp_addr, seen_udp, udp_tcp, link_id).
+        # link_id: per-node unique slot base index (1..255) handed to the
+        # hook in ASSIGN; hook marks become link_id*256+slot across the
+        # FULL u16 space (legacy 50000 band only at base 0), so sibling
+        # links never collide AND games may use any port themselves.
         # One node may hold SEVERAL links (processes sharing one identity
         # via the hook's shared state); node-targeted traffic fans out to
         # every live link.
@@ -263,10 +267,11 @@ class Relay:
     async def send_assign(self, writer):
         node = self.writer_node.get(id(writer))
         ent = self.nodes.get(node, {}) if node else {}
+        lid = ent.get("links", {}).get(writer, {}).get("link_id", 0)
         try:
             await self.r_send(writer, T_ASSIGN,
                               encode_assign(ent.get("virt", 0), self.subnet_net,
-                                            24, self.members()))
+                                            24, self.members(), lid))
         except (ConnectionResetError, BrokenPipeError, RuntimeError):
             pass
 
@@ -347,8 +352,15 @@ class Relay:
         ent["seen_tcp"] = now
         link = ent["links"].get(writer)
         if link is None:
+            used = {l.get("link_id") for l in ent["links"].values()}
+            free = [i for i in range(1, 256) if i not in used]
+            if not free:   # >255 concurrent links is pathological;
+                # reuse the top base (collision only with its holder)
+                print(f"[relay] node {node} out of link slot bases; "
+                      "reusing 255", flush=True)
             link = {"tcp_ip": tcp_ip, "udp_port": 0, "udp_addr": None,
-                    "seen_udp": 0.0, "udp_tcp": False}
+                    "seen_udp": 0.0, "udp_tcp": False,
+                    "link_id": free[0] if free else 255}
             ent["links"][writer] = link
             n = len(ent["links"])
             if n > 1:
@@ -806,14 +818,19 @@ class Relay:
                   flush=True)
 
     def link_writer_for_addr(self, nid, addr):
-        """(writer, link dict) of node nid whose udp_addr == addr, or None."""
+        """(writer, link dict) of node nid whose udp_addr == addr, or None.
+        Prefer a LIVE writer when a redial left two links sharing the
+        endpoint - a stale writer would silently swallow the datagram."""
         ent = self.nodes.get(nid)
         if not ent:
             return None
+        first = None
         for lw, l in ent["links"].items():
             if l.get("udp_addr") == addr:
-                return lw, l
-        return None
+                if not lw.is_closing():
+                    return lw, l
+                first = first or (lw, l)
+        return first
 
     def node_by_udp_addr(self, addr):
         """Tunnel addr -> node id owning that endpoint (any link)."""
@@ -834,7 +851,12 @@ class Relay:
         return None
 
     def node_udp_addrs(self, nid):
-        """Fresh UDP endpoints for every live link of node nid."""
+        """Fresh UDP endpoints for every live link of node nid.
+
+        Deduplicated: when a process REDIALS, its old (not yet reaped)
+        link and the new one declare the same udp_addr - delivering to
+        both would show every datagram to the game TWICE (duplicate
+        join/netmessages crash games hard)."""
         ent = self.nodes.get(nid)
         if not ent:
             return []
@@ -843,9 +865,13 @@ class Relay:
         for l in ent["links"].values():
             a = l.get("udp_addr")
             if a and now - l.get("seen_udp", 0) < self.KNOWN_TTL:
-                out.append(a)
+                pass
             elif l.get("udp_port") and l.get("tcp_ip"):
-                out.append((l["tcp_ip"], l["udp_port"]))
+                a = (l["tcp_ip"], l["udp_port"])
+            else:
+                continue
+            if a not in out:
+                out.append(a)
         return out
 
     def udp_targets(self, gport, src_addr):

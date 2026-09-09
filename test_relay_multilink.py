@@ -114,9 +114,15 @@ async def main():
     v_1, v_2 = my_virt(a1), my_virt(a2)
     assert v_1 == v_2 and v_1 != 0, (v_1, v_2)
     assert len(relay.nodes[N1]["links"]) == 2
+    # per-link slot bases: distinct, in range, so sibling marks
+    # (50000 + link_id*256 + slot) can never collide in udp_flows
+    from common import decode_assign
+    lid1, lid2 = decode_assign(a1)[4], decode_assign(a2)[4]
+    assert 1 <= lid1 <= 255 and 1 <= lid2 <= 255 and lid1 != lid2, (lid1, lid2)
     await l3.register(N2, 6003)
     await l4.register(N3, 6004)
-    print(f"PASS[1] one vnode 0x{v_1:08x} for both links", flush=True)
+    print(f"PASS[1] one vnode 0x{v_1:08x} for both links, "
+          f"slot bases {lid1}/{lid2}", flush=True)
 
     # ---- phase 2: beacon from N2 fans to every link of N1 ----
     await l3.send(T_BCAST, struct.pack("!HH", 47584, 47584) + b"BIGBEACON")
