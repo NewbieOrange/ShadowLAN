@@ -44,8 +44,10 @@ TCP control conn (one per hook process, ephemeral, auto-redial):
                    flags bit0 = NODE_F_HOST (designated-host claim).
                    Registration is the ONLY versioned frame: gating it
                    gates everything routed by the node id (streams too).
-    T_ASSIGN=0x02  relay->peer: my_virt, net, bits, members (ALL links
-                   of a node get it; membership is per-NODE, not per-link)
+    T_ASSIGN=0x02  relay->peer: my_virt, net, bits, members + trailing
+                   !B link_id (1..255, MANDATORY, per-LINK; every link of
+                   a node gets its own ASSIGN carrying its own link_id;
+                   membership is per-NODE, not per-link)
     T_BCAST=0x03 / T_BCAST_FROM=0x04   discovery fanout
     T_UDP_MODE=0x05 / T_UDP_TUN=0x06   per-LINK UDP-over-TCP mode
 
@@ -67,6 +69,26 @@ UDP tunnel ops: U_GAME_C2S=1, U_GAME_S2C=2, U_GAME_P2P=3 (dest-node
 prefixed), U_NODE=4 (carries host flag; refreshes link udp_addr AND
 host_udp when flagged), U_ICMP_REQ/REP=5/6 (dest node 0 = relay answers
 at .1; `10.200.0.1` is the relay's pseudo-IP, relay pings are local).
+Marks: a client socket is presented as (vnode, link_id*256 + slot) -
+the FULL u16 port space, nothing reserved away from games. link_id is
+relay-allocated per LINK (1..255) and delivered in the ASSIGN tail
+(hook var `g_link_id`); slot is the per-process client-socket table
+index (DT_MAXSLOT=256). Rationale: slots are per-PROCESS, so sibling
+links of one node used to collide in the relay's return-path binding
+("UDP triple collision, latest sender wins") and S2C replies
+flip-flopped between processes - the cross-machine UDP killer of
+2026-09-09. Two invariants make full-range marks safe: (1) the mark is
+always HOOK-allocated and stable - the relay rewrites nothing, because
+apps unicast-reply to whatever recvfrom presented and the hook
+forwards that value as the frame game_port (relay-internal numbers
+would become phantom game ports: an attempt that way same-boxed a
+regression and never shipped); (2) sendto(vnode, P) is first demuxed
+against the HOSTED-SESSION table by exact (peer-virt, P) tuple - a
+reply to a mark flows as a proper S2C instead of a C2S whose game_port
+is a mark number - so marks landing in some game's service band are
+harmless. Wire is otherwise PVER 2, but the mandatory ASSIGN tail
+means hook+relay ship TOGETHER (mismatched length = fatal 201 fail-
+fast, intended).
 
 Semantics that matter:
 - `connect()` completes ONLY after the destination bridged (real connect
@@ -77,7 +99,11 @@ Semantics that matter:
   (never reorder/drop-old).
 - Relay: per-writer send queues (drain task) — never write a control
   writer outside `r_send`; droppable = beacons/UDP_TUN, ASSIGN/STREQ are
-  not. `NODE_TTL=600` keeps a node+virt for reconnects.
+  not. `NODE_TTL=600` keeps a node+virt for reconnects (stale sibling
+  instances of dead trees linger as members for up to 10 min — before
+  blaming routing, check the relay log for how many NODES each machine
+  registered: multiple per machine means leftover game instances
+  receiving 0-return streams).
 
 ## Process-tree identity
 
@@ -118,6 +144,14 @@ The process sees a machine cabled ONLY to the tunnel:
 - Adapters: GAA/GetAdaptersInfo return the pseudo-adapter ALONE.
 - Broadcast/multicast discovery tunnels as usual — isolation changes
   only what would hit the physical wire.
+- The own-broadcast NIC-style local echo MUST carry the vnode
+  (`dt_src_ip`), never `dt_machine_ip`: apps fold announce sources into
+  own-IP/peer state and stamp them into payload `source_ip` (GBE does),
+  so a physical IP in that echo contradicts the vnode `getpeername`
+  presents and apps silently reject the connection. That leak was the
+  real "lobby invisible under LAN_ONLY" root cause (fixed in 2.0.0); it
+  also poisoned cross-machine runs without LAN_ONLY. `test_lanonly`
+  phase 5 guards it.
 
 ## Interface shim (Windows adapter APIs)
 
@@ -218,7 +252,8 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   `SHADOWLAN_VERSION`; they move together in a dedicated
   `chore: bump version to X` commit.
 - **rc versions are NEVER committed** — local stamp only; keep those two
-  lines dirty in the working tree between releases (current: 2.0.0-rc1).
+  lines dirty in the working tree between releases (current: none —
+  2.0.0 is released; the next local build starts 2.0.1-rc1).
   At release: change to the final number, commit the bump, build, ship.
 - **Every local build/package you hand to the user must increment the rc
   number** (rc1 -> rc2 -> ...) — never rebuild under a stale stamp, or
@@ -234,6 +269,18 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   linux `.tar.gz` (lan_hook.so + py + docs, hook README as
   HOOK_README.md) and windows `.zip` (+ both DLLs + injector). Old rc
   packages are wire-INCOMPATIBLE (ops renumbered) — offer to delete.
+
+## Debugging the test harness itself (meta-lessons)
+
+- A `run_in_executor` lambda that blocks in `recv_udp(3.0)` and whose
+  result is discarded STEALS the next datagram that arrives within its
+  timeout — this produced a phantom "relay drops P2P" bug hunt (tcpdump
+  said delivered, socket said no) that was purely a test leftover. When
+  a packet "vanishes": enumerate every reader of the fd (`strace -f -e
+  trace=network` shows which thread stole it).
+- tcpdump on loopback taps BEFORE checksum validation and UDP socket
+  demux: "captured" != "enqueued". Pair it with `nstat` counters and
+  per-socket strace before concluding kernel drops.
 
 ## Testing discipline & harness knowledge
 
@@ -299,16 +346,37 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 - GBE's uninitialized-`Connection` dial lottery: consider a hook-side
   nudge if it ever blocks a sale (e.g. treat a never-read garbage fd's
   FIONREAD/select on the tool side as retry-worthy) — unverified idea.
-- dist/ cleanup of v1.2.0-rc* packages: offered to user, not yet done.
+- dist/ cleanup of v1.2.0-rc*/v1.0.0/v1.1.1 packages: offered to user,
+  not yet done.
+- `getsockname` is NOT hooked: on a tunneled TCP socket it reports the
+  real local endpoint (own NIC ip + ephemeral port). Games almost never
+  consult their own side (getpeername IS spoofed and that is what they
+  key on), but it is a door LAN_ONLY does not close; hook it (vnode +
+  real port) if an app ever shows it.
 
-## Status snapshot (2026-09-09)
+## Status snapshot (2026-09-09: RELEASED 2.0.0)
 
-Pushed: `a6c5f0b` (=origin/master). Local ahead 4:
-`63cc49f` wire refactor (dense ops, PVER, single registration frame,
-UVER=2), `b6b5948` LAN_ONLY, `501fe68` wine phase C + Makefile rules,
-`9b947f5` docs. Uncommitted (on purpose): the two `2.0.0-rc1` version
-lines. `dist/shadowlan-v2.0.0-rc1-*` packages are current (13:17
-build). Waiting on: user's cross-machine field test (LAN_ONLY on the
-lobby box), then either release 2.0.0 (bump commit + push, force-with-
-lease not needed anymore — history is already synced at a6c5f0b) or the
-next log post-mortem.
+2.0.0 (2026-09-09) additionally ships the
+relay-assigned per-link UDP slot ranges (see Wire section): ASSIGN grew
+a mandatory trailing link_id byte, hooks mark `link_id*256 + slot`
+across the full port space. Relay tests (multilink incl. link-id assertions, topology) + Wine + compiles
+verified; the hook e2e suites were BLOCKED by a SANDBOX KERNEL-UDP
+failure (every loopback sendto EPIPE, /proc/net/udp empty after heavy
+tcpdump/strace - environmental). RERUN `make -C hook test` on a
+healthy box before trusting a field round; if loopback UDP EPIPEs,
+that is the sandbox, not the protocol - switch to TCP-only relay tests.
+
+`2.0.0` RELEASED (pushed to origin). History since `a6c5f0b`:
+refactor(proto) → LAN_ONLY → wine phase C → docs → AGENTS →
+echo-source fix → per-link UDP slot ranges → bump `chore: bump version
+to 2.0.0`. Ship set = `dist/shadowlan-v2.0.0-*` rebuilt with the slot
+ranges (hooks and relay MUST be deployed together: the ASSIGN tail is
+strict for old hooks, fatal 201 fail-fast). Field evidence behind the
+fix chain: same-box LAN_ONLY lobby worked (all grecv sources vnodes,
+zero wire drops, zero self-dials); cross-machine relay.log showed the
+sibling-mark collision that motivated the slot ranges. Known noise
+only: host-claim ping-pong (both trees listen) and shutdown-race
+`fatal 200`. Hook e2e suite was last run BEFORE the slot-range change
+(sandbox kernel UDP died afterwards) — rerun `make -C hook test` on a
+healthy box, then a same-box LAN_ONLY smoke with tool+game, then the
+friend link.
