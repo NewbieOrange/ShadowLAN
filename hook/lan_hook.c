@@ -742,6 +742,9 @@ struct dt_hosted {
     int live;             /* bridge up (STJOINED sent) */
     long long last;       /* last activity (pending sweep) */
     int dead;
+    unsigned ovirt;       /* opener's virtual IP (from DT_STREQ) */
+    int lport;            /* bridge socket's local ephemeral port: the
+                             peer port the game's accept() will see */
 };
 static struct dt_hosted g_hs[DT_MAXHOST];
 struct dt_usess {
@@ -807,11 +810,112 @@ static int dt_host_bridge(unsigned sid, int port) {
     if (s == INVALID_SOCKET) return -1;
     if (connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { closesocket(s); return -1; }
 #endif
+    struct sockaddr_in bn;
+#ifdef LINUX_BUILD
+    socklen_t bl = sizeof(bn);
+#else
+    int bl = sizeof(bn);
+#endif
+    memset(&bn, 0, sizeof(bn));
+    int lp = 0;
+#ifdef LINUX_BUILD
+    if (getsockname((int)s, (struct sockaddr *)&bn, &bl) == 0)
+#else
+    if (getsockname(s, (struct sockaddr *)&bn, &bl) == 0)
+#endif
+        lp = ntohs(bn.sin_port);
     DLOCK();
     struct dt_hosted *h = dt_hs_by_sid(sid);
-    if (h) { h->real = s; h->live = 1; h->last = dt_now_ms(); }
+    if (h) { h->real = s; h->live = 1; h->last = dt_now_ms(); h->lport = lp; }
     DUNLOCK();
+    { char lb[96];
+      snprintf(lb, sizeof(lb), "hosted bridge: fd=%d lport=%d ovirt=%u",
+               (int)(int)s, lp, h ? h->ovirt : 0);
+      dlog(lb); }
     return 0;
+}
+/* ---- accepted-socket peer spoofing -------------------------------------
+ * On a real LAN the game's accept() reports the connector's announced
+ * address; locally the connector is our loopback bridge, so an app that
+ * cross-checks getpeername against the lobby's vnode would reject the
+ * session (observed: full 271KB handshake accepted by GBE yet the game
+ * stalled at menu). Map accepted sockets whose real peer is the bridge
+ * endpoint to the opener's vnode captured at DT_STREQ time. */
+#ifdef LINUX_BUILD
+typedef socklen_t socklen_int_t;
+#else
+typedef int socklen_int_t;
+#endif
+#define DT_MAXACC 64
+struct dt_accfd { int used; long long gsock; unsigned vnode; int lport; };
+static struct dt_accfd g_acc[DT_MAXACC];
+static void dt_acc_learn(long long fd, const struct sockaddr_in *peer) {
+    int lp = (int)ntohs(peer->sin_port);
+    DLOCK();
+    for (int i = 0; i < DT_MAXHOST; i++)
+        if (g_hs[i].used && g_hs[i].live && g_hs[i].lport == lp &&
+            g_hs[i].ovirt) {
+            for (int j = 0; j < DT_MAXACC; j++)
+                if (!g_acc[j].used || g_acc[j].gsock == fd) {
+                    g_acc[j].used = 1; g_acc[j].gsock = fd;
+                    g_acc[j].vnode = g_hs[i].ovirt; g_acc[j].lport = lp;
+                    break;
+                }
+            break;
+        }
+    DUNLOCK();
+}
+/* hit returns 1 and fills *out (vnet view) + *rlport (expected real peer
+ * port, for the caller's fd-reuse verification against the TRUE peer). */
+static int dt_acc_get(long long fd, struct sockaddr_in *out, int *rlport) {
+    int hit = 0, lp = 0; unsigned v = 0;
+    DLOCK();
+    for (int j = 0; j < DT_MAXACC; j++)
+        if (g_acc[j].used && g_acc[j].gsock == fd) {
+            hit = 1; lp = g_acc[j].lport; v = g_acc[j].vnode; break;
+        }
+    DUNLOCK();
+    if (!hit) return 0;
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_addr.s_addr = htonl(v);
+    out->sin_port = htons((unsigned short)lp);
+    if (rlport) *rlport = lp;
+    return 1;
+}
+static void dt_acc_forget(long long fd) {
+    DLOCK();
+    for (int j = 0; j < DT_MAXACC; j++)
+        if (g_acc[j].used && g_acc[j].gsock == fd) { g_acc[j].used = 0; break; }
+    DUNLOCK();
+}
+/* shared post-accept handling: real peer == our bridge -> learn, then
+ * present the opener's vnode to the app (fd/addr are the accept out
+ * params as returned by the OS) */
+static void dt_acc_post_accept(long long fd, struct sockaddr *addr,
+                               socklen_int_t *addrlen,
+                               const struct sockaddr_in *real_peer) {
+    if (real_peer->sin_family != AF_INET ||
+        real_peer->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        char lb[128]; unsigned long a = 0;
+        memcpy(&a, &real_peer->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "acc-hook: fd=%lld REAL peer NOT loopback %lu.%lu.%lu.%lu:%d",
+                 fd, a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255,
+                 (int)ntohs(real_peer->sin_port));
+        dlog(lb);
+        return;
+    }
+    dt_acc_learn(fd, real_peer);
+    { struct sockaddr_in o; int lp = 0;
+      char lb[128];
+      int hit = dt_acc_get(fd, &o, &lp);
+      snprintf(lb, sizeof(lb), "acc-hook: fd=%lld loopback:%d learn=%d",
+               fd, (int)ntohs(real_peer->sin_port), hit);
+      dlog(lb);
+      if (hit && addr && addrlen && *addrlen >= (socklen_int_t)sizeof(struct sockaddr_in)) {
+          memcpy(addr, &o, sizeof(o)); *addrlen = (socklen_int_t)sizeof(o);
+      }
+    }
 }
 static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
                                       size_t rl, const struct sockaddr_in *cli,
@@ -1698,7 +1802,7 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
     return 0;
 }
 /* Joinee side: serve one inbound stream (DT_STREQ from the control link). */
-static void dt_on_streq(unsigned sid, int gport) {
+static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
     DLOCK();
     struct dt_hosted *h = NULL;
     for (int i = 0; i < DT_MAXHOST; i++)
@@ -1706,6 +1810,7 @@ static void dt_on_streq(unsigned sid, int gport) {
             h = &g_hs[i];
             h->used = 1; h->sid = sid; h->real = DTSOCK_BAD; h->fd = DTSOCK_BAD;
             h->live = 0; h->dead = 0; h->last = dt_now_ms();
+            h->ovirt = ovirt; h->lport = 0;
             break;
         }
     DUNLOCK();
@@ -1827,6 +1932,7 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         int sr = select(mx + 1, &rf, NULL, NULL, &tv);
         if (sr <= 0) continue;
         if (FD_ISSET((int)fd, &rf)) {
+            errno = 0;
             ssize_t n = r_recv(fd, buf, sizeof(buf), 0);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -1846,8 +1952,15 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
             }
         }
         if (FD_ISSET((int)real, &rf)) {
+            errno = 0;
             ssize_t n = r_recv(real, buf, sizeof(buf), 0);
-            if (n <= 0) break;
+            if (n <= 0) {
+                char lb[96];
+                snprintf(lb, sizeof(lb), "hosted pipe: game n=%zd err=%d",
+                         n, errno);
+                dlog(lb);
+                break;
+            }
             out0 += (size_t)n;
             const unsigned char *p = buf;
             while ((size_t)n > 0) {
@@ -1886,10 +1999,15 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         }
 #endif
     }
-    { char lb[190];
-      snprintf(lb, sizeof(lb), "hosted eof pid=%u sid=%u in=%llu out=%llu",
+    { char lb[190]; int hx_d;
+      DLOCK();
+      struct dt_hosted *hx = dt_hs_by_sid(sid);
+      hx_d = hx ? hx->dead : -1;
+      DUNLOCK();
+      snprintf(lb, sizeof(lb), "hosted eof pid=%u sid=%u in=%llu out=%llu dead=%d tun=%d",
                (unsigned)current_pid(), sid,
-               (unsigned long long)in0, (unsigned long long)out0);
+               (unsigned long long)in0, (unsigned long long)out0,
+               hx_d, (int)g_tun_run);
       dlog(lb); }
     dt_hs_close(sid);
     return 0;
@@ -2016,7 +2134,8 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                  * stream data never transits this control link. */
                 unsigned sid = dt_get32(pl + 1);
                 int gport = (int)dt_get16(pl + 5);
-                dt_on_streq(sid, gport);
+                unsigned ovirt = (ml >= 11) ? dt_get32(pl + 7) : 0;
+                dt_on_streq(sid, gport, ovirt);
             } else if (t == DT_UDP_TUN && ml >= 2) {
                 /* UDP-over-TCP mode: one decapsulated UDP-tunnel
                  * datagram; same ingress path as the UDP socket */
@@ -3527,6 +3646,16 @@ int getpeername(int s, struct sockaddr *a, socklen_t *l) {
     if (g_direct && a && l && *l >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
+        int lp = 0;
+        if (dt_acc_get((long long)s, &o, &lp)) {
+            struct sockaddr_in rp; socklen_t rl = sizeof(rp);
+            if (real_gp(s, (struct sockaddr *)&rp, &rl) == 0 &&
+                rp.sin_addr.s_addr == htonl(INADDR_LOOPBACK) &&
+                ntohs(rp.sin_port) == lp) {
+                memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0;
+            }
+            dt_acc_forget((long long)s);   /* fd recycled */
+        }
     }
     return real_gp(s, a, l);
 }
@@ -3535,11 +3664,30 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     ensure_init();
     if (!real_accept) real_accept = dlsym(RTLD_NEXT, "accept");
     int fd = real_accept(sockfd, addr, addrlen);
-    /* LAN_ONLY: drop wire LAN peers; loopback (bridge) passes. */
+    /* LAN_ONLY first (on the REAL peer): drop wire LAN peers; loopback
+     * (bridge) passes. Must precede the vnode rewrite below, which
+     * would otherwise make our own bridge look like a wire peer. */
     if (g_direct && g_lan_only && fd >= 0 && addr && addrlen &&
         *addrlen >= sizeof(struct sockaddr_in) &&
         !ipv4_is_loopback(((struct sockaddr_in *)addr)->sin_addr.s_addr)) {
+        unsigned long a = 0; char lb[112];
+        memcpy(&a, &((struct sockaddr_in *)addr)->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "lan-only: drop wire accept from %lu.%lu.%lu.%lu",
+                 a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255);
+        dlog(lb);
         close(fd); errno = EAGAIN; return -1;
+    }
+    if (g_direct && fd >= 0) {
+        if (addr && addrlen && *addrlen >= (socklen_int_t)sizeof(struct sockaddr_in))
+            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen,
+                               (struct sockaddr_in *)addr);
+        else {
+            static int (*rgp)(int, struct sockaddr*, socklen_t*) = 0;
+            struct sockaddr_in rp; socklen_t rl = sizeof(rp);
+            if (!rgp) rgp = dlsym(RTLD_NEXT, "getpeername");
+            if (rgp && rgp(fd, (struct sockaddr *)&rp, &rl) == 0)
+                dt_acc_post_accept(fd, NULL, NULL, &rp);
+        }
     }
     return fd;
 }
@@ -3548,14 +3696,26 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
     ensure_init();
     if (!real_accept4) real_accept4 = dlsym(RTLD_NEXT, "accept4");
     int fd = real_accept4(sockfd, addr, addrlen, flags);
+    /* LAN_ONLY first (real peer), THEN the vnode rewrite - see accept() */
     if (g_direct && g_lan_only && fd >= 0 && addr && addrlen &&
         *addrlen >= sizeof(struct sockaddr_in) &&
         !ipv4_is_loopback(((struct sockaddr_in *)addr)->sin_addr.s_addr)) {
+        unsigned long a = 0; char lb[112];
+        memcpy(&a, &((struct sockaddr_in *)addr)->sin_addr.s_addr, 4);
+        snprintf(lb, sizeof(lb), "lan-only: drop wire accept4 from %lu.%lu.%lu.%lu",
+                 a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255);
+        dlog(lb);
         close(fd); errno = EAGAIN; return -1;
+    }
+    if (g_direct && fd >= 0) {
+        if (addr && addrlen && *addrlen >= (socklen_int_t)sizeof(struct sockaddr_in))
+            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen,
+                               (struct sockaddr_in *)addr);
     }
     return fd;
 }
 int close(int fd) {
+    dt_acc_forget((long long)fd);
     static int (*real_close)(int) = 0;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     if (g_direct) dt_on_close((long long)fd);
@@ -4100,6 +4260,17 @@ SOCKET WSAAPI hk_accept(SOCKET s, struct sockaddr *addr, int *addrlen) {
         WSASetLastError(WSAEWOULDBLOCK);
         return INVALID_SOCKET;
     }
+    if (g_direct && r != INVALID_SOCKET) {
+        if (addr && addrlen && *addrlen >= (int)sizeof(struct sockaddr_in))
+            dt_acc_post_accept((long long)r, addr, (socklen_int_t *)addrlen,
+                               (struct sockaddr_in *)addr);
+        else {
+            struct sockaddr_in rp; int rl = (int)sizeof(rp);
+            if (p_getpeername &&
+                p_getpeername(r, (struct sockaddr *)&rp, &rl) == 0)
+                dt_acc_post_accept((long long)r, NULL, NULL, &rp);
+        }
+    }
     return r;
 }
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
@@ -4342,10 +4513,21 @@ int WSAAPI hk_getpeername(SOCKET s, struct sockaddr *a, int *l) {
     if (g_direct && a && l && *l >= (int)sizeof(struct sockaddr_in)) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
+        int lp = 0;
+        if (dt_acc_get((long long)s, &o, &lp)) {
+            struct sockaddr_in rp; int rl = (int)sizeof(rp);
+            if (p_getpeername(s, (struct sockaddr *)&rp, &rl) == 0 &&
+                rp.sin_addr.s_addr == htonl(INADDR_LOOPBACK) &&
+                ntohs(rp.sin_port) == lp) {
+                memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0;
+            }
+            dt_acc_forget((long long)s);   /* fd-reused */
+        }
     }
     return p_getpeername(s, a, l);
 }
 int WSAAPI hk_closesocket(SOCKET s) {
+    dt_acc_forget((long long)s);
     if (g_direct) dt_on_close((long long)s);
     else dt_ev_unhook_sock((long long)s);
     return p_closesocket(s);

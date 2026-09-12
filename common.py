@@ -40,7 +40,7 @@ NODE_F_HOST = 0x01   # this node hosts a game: claim designated-host
 # The winner bridges to its local game and sends T_STJOINED; the relay
 # then replies T_STOK to the opener and pipes raw bytes both ways.
 T_STOPEN = 0x07   # opener->relay (per-stream TCP): !I node + !I dest_node + !I sid + !H gport
-T_STREQ = 0x08    # relay->dest (control TCP): !I sid + !H gport
+T_STREQ = 0x08    # relay->dest (control TCP): !I sid + !H gport + !I opener_virt
 T_STJOIN = 0x09   # dest->relay (per-stream TCP): !I node + !I sid
 T_STJOINED = 0x0A # dest->relay (per-stream TCP, local bridge up): !I sid
 T_STOK = 0x0B     # relay->opener / relay->joinee (claim): !I sid
@@ -243,15 +243,20 @@ def decode_stopen(payload: bytes):
         return None
 
 
-def encode_streq(sid: int, gport: int) -> bytes:
-    return struct.pack("!IH", sid & 0xFFFFFFFF, gport & 0xFFFF)
+def encode_streq(sid: int, gport: int, ovirt: int = 0) -> bytes:
+    return struct.pack("!IHI", sid & 0xFFFFFFFF, gport & 0xFFFF,
+                       ovirt & 0xFFFFFFFF)
 
 
 def decode_streq(payload: bytes):
+    """-> (sid, gport, opener_virt) or None. 6-byte legacy frames decode
+    with opener_virt=0 (joiner then leaves getpeername uns spoofed)."""
     try:
-        if len(payload) != 6:
+        if len(payload) not in (6, 10):
             return None
-        return struct.unpack("!IH", payload)
+        sid, gport = struct.unpack("!IH", payload[:6])
+        ovirt = struct.unpack("!I", payload[6:10])[0] if len(payload) == 10 else 0
+        return sid, gport, ovirt
     except struct.error:
         return None
 

@@ -487,8 +487,9 @@ class Relay:
         print(f"[stream] open: sid {sid} node {node} -> node {dest_node} "
               f"port {gport} from {peer} ({len(dest_links)} dest links)",
               flush=True)
+        ovirt = self.nodes.get(node, {}).get("virt", 0)
         for w in dest_links:
-            await self.r_send(w, T_STREQ, encode_streq(sid, gport),
+            await self.r_send(w, T_STREQ, encode_streq(sid, gport, ovirt),
                               droppable=False)
         asyncio.create_task(self._stream_join_timeout(sid))
         # keep this connection's transport alive (asyncio closes it when

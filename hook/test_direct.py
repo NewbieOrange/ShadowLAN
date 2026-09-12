@@ -52,6 +52,25 @@ async def main():
     for marker in ("DISC_OK", "TCP_OK", "UDP_OK", "SENDER_DIRECT_OK"):
         assert marker in text_b, marker
     assert proc_a.returncode is None, "host must still be alive"
+    # HOST side: the socket it accepted must present the PLAYER's vnode
+    # as peer (bridge connections arrive from 127.0.0.1; spoofing that
+    # never happened for accepted sockets — games cross-check the
+    # lobby's announced source with getpeername and reject mismatches)
+    peer_line = None
+    while True:
+        try:
+            ln = await asyncio.wait_for(proc_a.stdout.readline(), 3)
+        except asyncio.TimeoutError:
+            break
+        if not ln:
+            break
+        t = ln.decode(errors="replace")
+        print(t, end="", flush=True)
+        if "HOST accept peer=" in t:
+            peer_line = t.strip()
+            break
+    assert peer_line and "peer=10.200." in peer_line, \
+        f"accepted peer not virtualized: {peer_line}"
     print("DIRECT_ALL_PASS", flush=True)
     for p in (proc_a,):
         try:

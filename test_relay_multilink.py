@@ -120,7 +120,8 @@ async def main():
     lid1, lid2 = decode_assign(a1)[4], decode_assign(a2)[4]
     assert 1 <= lid1 <= 255 and 1 <= lid2 <= 255 and lid1 != lid2, (lid1, lid2)
     await l3.register(N2, 6003)
-    await l4.register(N3, 6004)
+    a4 = await l4.register(N3, 6004)
+    v_4 = my_virt(a4)
     print(f"PASS[1] one vnode 0x{v_1:08x} for both links, "
           f"slot bases {lid1}/{lid2}", flush=True)
 
@@ -142,6 +143,9 @@ async def main():
     q2 = await l2.expect(T_STREQ)
     (s1, g1), (s2, g2) = struct.unpack("!IH", q1[:6]), struct.unpack("!IH", q2[:6])
     assert s1 == s2 == SID and g1 == g2 == 47584
+    # opener's virtual address rides along so the joinee can present it
+    # as the accepted socket's peer (getpeername spoofing)
+    assert len(q1) == 10 and struct.unpack("!I", q1[6:10])[0] == v_4, q1.hex()
     j1r, j1w = await stream_dial()            # winning joiner (link L1's proc)
     await stream_frame(j1w, T_STJOIN, struct.pack("!II", N1, SID))
     body = await stream_expect(j1r, T_STOK)   # claim verdict: winner

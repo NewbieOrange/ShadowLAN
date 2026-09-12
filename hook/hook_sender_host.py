@@ -40,14 +40,21 @@ def echo_conn(c):
         c.close()
 
 
+HOST_PEERS = []
+
+
 def accept_loop():
     while time.time() < deadline:
         try:
-            c, _ = ts.accept()
+            c, peer = ts.accept()
         except socket.timeout:
             continue
-        except OSError:
+        except OSError as e:
+            print(f"HOST accept error: {type(e).__name__} {e}", flush=True)
             break
+        p = peer[0] if peer else "?"
+        HOST_PEERS.append(p)
+        print(f"HOST accept peer={p}", flush=True)
         threading.Thread(target=echo_conn, args=(c,), daemon=True).start()
 
 
@@ -82,4 +89,5 @@ while time.time() < deadline:
     except OSError:
         break
     time.sleep(0.3)
+print("HOST_PEERS", ",".join(sorted(set(HOST_PEERS))) or "-", flush=True)
 print("HOST_DONE", flush=True)

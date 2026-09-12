@@ -49,6 +49,11 @@ TCP control conn (one per hook process, ephemeral, auto-redial):
                    !B link_id (1..255, MANDATORY, per-LINK; every link of
                    a node gets its own ASSIGN carrying its own link_id;
                    membership is per-NODE, not per-link)
+    T_STREQ carries the OPENER's vnode; the joinee maps the accepted
+    game socket's peer (accept out-param + getpeername) from the
+    bridge's 127.0.0.1 to that vnode — games cross-check it against
+    the announce source (dt_acc table, keyed by bridge ephemeral port,
+    fd-reuse verified).
     T_BCAST=0x03 / T_BCAST_FROM=0x04   discovery fanout
     T_UDP_MODE=0x05 / T_UDP_TUN=0x06   per-LINK UDP-over-TCP mode
 
