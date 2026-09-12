@@ -273,9 +273,32 @@ static int g_vbits = 24;
 static struct { unsigned node, virt; } g_members[DT_MAXMEMB]; /* virt numeric */
 static int g_nmembers = 0;
 static unsigned dt_rand_state = 0;
+static void dt_rand_seed(void) {
+    /* NEVER leave the state 0: the default fallback would give every
+     * process the SAME random stream, and stream ids (the relay keys
+     * streams room-wide by sid) would collide between the viewer tool
+     * and the game - and between any two nodes whose processes seed in
+     * the same clock tick. Mix pid, ms clock, stack and heap addresses:
+     * uniqueness matters more than entropy. */
+    unsigned long x = (unsigned long)dt_rand_state;
+#ifdef LINUX_BUILD
+    x ^= (unsigned long)getpid() * 0x9e3779b97f4a7c15ull;
+    x ^= (unsigned long)time(NULL) << 17;
+    x ^= (unsigned long)(void *)&x >> 4;      /* stack ASLR */
+    x ^= (unsigned long)(void *)malloc(1);    /* heap ASLR */
+#else
+    x ^= (unsigned long)GetCurrentProcessId() * 0x9e3779b97f4a7c15ull;
+    x ^= (unsigned long)GetTickCount64() << 17;
+    x ^= (unsigned long)(void *)&x >> 4;
+    x ^= (unsigned long)HeapCreate(0, 0, 0);  /* heap layout */
+#endif
+    if (!x) x = 0x9e3779b9u;
+    dt_rand_state = (unsigned)(x ^ (x >> 32));
+    if (!dt_rand_state) dt_rand_state = 0x9e3779b9u;
+}
 static unsigned dt_rand(void) {
     unsigned x = dt_rand_state;
-    if (!x) x = 0x9e3779b9u;
+    if (!x) { dt_rand_seed(); x = dt_rand_state; }
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
     dt_rand_state = x;
     return x ? x : 1;
@@ -666,6 +689,7 @@ static void dt_send_node(void) {
     p[h + 6] = (unsigned char)(g_claimed ? DT_NODE_F_HOST : 0);
     dt_tcp_queue(DT_NODE, p, h + 7);
 }
+static void dt_rand_seed(void);
 static void dt_send_udp_node(void) {
     unsigned char d[4 + 2 + 256 + 8];
     struct sockaddr_in sa;
@@ -876,7 +900,7 @@ static int dt_host_bridge(unsigned sid, int port) {
  * On a real LAN the game's accept() reports the connector's announced
  * address; locally the connector is our loopback bridge, so an app that
  * cross-checks getpeername against the lobby's vnode would reject the
- * session (observed: full 271KB handshake accepted by GBE yet the game
+ * session (observed: full 271KB handshake accepted by the bridge yet the game
  * stalled at menu). Map accepted sockets whose real peer is the bridge
  * endpoint to the opener's vnode captured at DT_STREQ time. */
 #ifdef LINUX_BUILD
@@ -954,12 +978,11 @@ static int dt_acc_get(long long fd, struct sockaddr_in *out, int *rlport) {
     DUNLOCK();
 
     if (!hit) return 0;
-    if (rlport) *rlport = bp;
     memset(out, 0, sizeof(*out));
     out->sin_family = AF_INET;
     out->sin_addr.s_addr = htonl(v);
     out->sin_port = htons((unsigned short)lp);
-    if (rlport) *rlport = lp;
+    if (rlport) *rlport = bp;   /* TRUE bridge port: fd-reuse guard */
     return 1;
 }
 static void dt_acc_forget(long long fd) {
@@ -1716,10 +1739,6 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
             return 0;
         }
         unsigned dest = dt_virt_node(orig.sin_addr.s_addr); /* 0 = implicit host */
-        if (dest == g_node) dest = 0;  /* self-dial of our assigned vnode:
-                                        * route by implicit-host rules
-                                        * (mirrors a NIC hairpin), never
-                                        * fan back to our own process */
         unsigned char p[14];
         dt_put32(p, g_node); dt_put32(p + 4, dest);
         dt_put32(p + 8, sid); dt_put16(p + 12, origport);
@@ -1737,10 +1756,10 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         DUNLOCK();
         unsigned char type = 0, rp[16]; size_t rn = 0;
         /* Verdict wait mirrors the kernel: the app MAY close() us while
-         * the handshake runs (GBE abandons pending dials after ~3 s).
+         * the handshake runs (the bridge abandons pending dials after ~3 s).
          * dt_on_close detaches the app identity but keeps the slot; we
          * keep waiting, record the verdict, and hand it to whatever
-         * stream the app opened for the SAME destination (GBE retries
+         * stream the app opened for the SAME destination (the bridge retries
          * with a fresh socket immediately - a real stack answers that
          * retry from the listener's state, not from scratch). */
         int r, sys_e = 0;
@@ -1773,7 +1792,7 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         int detached = st->used && st->sid == sid && st->gsock == 0;
         int gone = !st->used || st->sid != sid;
         if (detached) {
-            /* the app closed this dial (GBE abandons pending connects);
+            /* the app closed this dial (the bridge abandons pending connects);
              * hand a refusal to a retry for the SAME destination - a
              * real stack answers the retry from listener state, and the
              * only honest verdict for a stream nobody completed is the
@@ -2681,9 +2700,11 @@ static void dt_start(void) {
         } else {
             /* stable-ish random node id (loopback tests fork rarely collide) */
 #ifdef LINUX_BUILD
-            dt_rand_state = (unsigned)dt_now_ms() ^ ((unsigned)getpid() << 16);
+            dt_rand_seed();
+            dt_rand_state ^= (unsigned)dt_now_ms();
 #else
-            dt_rand_state = (unsigned)GetTickCount() ^ (GetCurrentProcessId() << 16);
+            dt_rand_seed();
+            dt_rand_state ^= (unsigned)GetTickCount();
 #endif
             g_node = dt_rand() | 1;
         }
@@ -3256,7 +3277,7 @@ static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
     dt_icmp_deliver(from_virt, id, seq, data, dlen);
 }
 /* The hosted bridge injects from an anonymous 127.0.0.1 socket; the app
- * must NEVER see that - its peer state (GBE: udp_ip_port) keys on the
+ * must NEVER see that - its peer state (the bridge's udp_ip_port) keys on the
  * recvfrom source, and a loopback source there makes the game unicast
  * its lobby JOIN back to itself (silently looping, host never sees it).
  * Map the injection socket's source port back to the session's real
@@ -3503,6 +3524,14 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
  * designated host / newest beaconer). Each becomes its own real TCP
  * connection to the relay. Returns 1 when consumed, 2 when the
  * socket already has a live stream (WSAEALREADY), else 0 (real stack). */
+static int dt_is_dial_local(unsigned vnode) {
+    /* true when dialing vnode means "this very machine": our own lease */
+    int same = 0;
+    DLOCK();
+    same = (vnode == g_myvirt && g_myvirt != 0);
+    DUNLOCK();
+    return same;
+}
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
 #ifdef SL_CONNECT_TRACE
     { char lb[128]; unsigned long a = ntohl(dst->sin_addr.s_addr);
@@ -3519,6 +3548,29 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     DUNLOCK();
     if (ex) return 2;
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
+    if (vnode && dt_is_dial_local(vnode)) {
+        /* dial of our OWN machine's virtual address: on a LAN this never
+         * leaves the host - complete it through the kernel loopback so
+         * the local listen backlog serves it like a NIC hairpin (the
+         * relay excludes the opener's own link from fan-out and would
+         * otherwise strand or misroute this connection) */
+        struct sockaddr_in lo = *dst;
+        int rr;
+        lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef LINUX_BUILD
+        dt_reals();
+        rr = r_connect((int)gsock, (struct sockaddr *)&lo, sizeof(lo));
+        if (rr != 0 && errno != EINPROGRESS && errno != EALREADY
+                && errno != EISCONN && errno != EWOULDBLOCK) return -1;
+        return 4;
+#else
+        rr = connect((SOCKET)gsock, (struct sockaddr *)&lo, sizeof(lo));
+        if (rr != 0 && WSAGetLastError() != WSAEWOULDBLOCK
+                && WSAGetLastError() != WSAEALREADY
+                && WSAGetLastError() != WSAEISCONN) return -1;
+        return 4;
+#endif
+    }
     int is_vnode = vnode != 0;
     if (!is_vnode) {
         int port = 0;
@@ -3666,13 +3718,8 @@ static void dt_on_close(long long gsock) {
     struct dt_stream *st = dt_stream_by_sock(gsock);
     int stream_freed = 0;
     if (st) {
-        st->dead = 1;          /* no new app-side use */
-        if (st->state == ST_CONNECTING) {
-            /* handshake thread still runs on its own relay fd: detach
-             * the app identity but KEEP the slot (the thread reports
-             * the verdict through st->sid ownership and frees it) */
-            st->gsock = 0;
-        } else {
+        st->dead = 1;          /* stream thread finishes + frees the slot */
+        if (st->state != ST_CONNECTING) {
             /* thread already exited (or never started): free now */
             st->used = 0; st->fd = DTSOCK_BAD;
             struct dt_chunk *c = st->h;
@@ -3854,6 +3901,7 @@ int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
     if (g_direct && a && a->sa_family == AF_INET && l >= sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
         if (r == 3) { errno = ENETUNREACH; return -1; }
+        if (r == 4) return 0;   /* machine-internal: looped back already */
         if (r == 1) {
             int nonblock = dt_is_nonblock((long long)s);
             if (nonblock) { errno = EINPROGRESS; return -1; }
@@ -3896,10 +3944,11 @@ int listen(int s, int backlog) {
     }
     return r;
 }
+static int (*real_getpeername_sym(void))(int, struct sockaddr*, socklen_t*);
 int getpeername(int s, struct sockaddr *a, socklen_t *l) {
     static int (*real_gp)(int, struct sockaddr*, socklen_t*) = 0;
     ensure_init();
-    if (!real_gp) real_gp = dlsym(RTLD_NEXT, "getpeername");
+    if (!real_gp) real_gp = real_getpeername_sym();
     if (g_direct && a && l && *l >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
@@ -4562,7 +4611,8 @@ SOCKET WSAAPI hk_accept(SOCKET s, struct sockaddr *addr, int *addrlen) {
  * bytes first, then WSAECONNRESET (hard kill / refusal) or 0 (FIN).
  * Never fall through to the real fd: that IS the relay transport. */
 static int dt_win_stream_recv(SOCKET s, char *buf, int len, int flags) {
-    int nb = dt_is_nonblock((long long)s) || (flags & MSG_DONTWAIT);
+    (void)flags;                       /* Windows has no MSG_DONTWAIT */
+    int nb = dt_is_nonblock((long long)s);
     int tmo = dt_rcvtimeo_ms((long long)s);
     size_t on = 0;
     int r = dt_tcp_wait((long long)s, (unsigned char *)buf,
@@ -4743,6 +4793,7 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
         if (r == 3) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
+        if (r == 4) return 0;   /* machine-internal: looped back already */
         if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
         if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
@@ -4812,6 +4863,7 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     }
     return r;
 }
+static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self);
 int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
     int r = p_getsockname ? p_getsockname(s, a, l) : SOCKET_ERROR;
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
@@ -4831,6 +4883,7 @@ int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1,
     if (g_direct && a && a->sa_family == AF_INET && l >= (int)sizeof(struct sockaddr_in)) {
         int r = dt_on_connect((long long)s, (const struct sockaddr_in *)a);
         if (r == 3) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
+        if (r == 4) return 0;   /* machine-internal: looped back already */
         if (r == 1) return dt_connect_wait((long long)s, dt_is_nonblock((long long)s));
         if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
@@ -4850,7 +4903,7 @@ static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self)
         rp.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
         return;   /* not our bridge: hands off */
     if (want_self) {
-        sa->sin_addr.s_addr = g_virt;           /* our own vnode */
+        sa->sin_addr.s_addr = htonl(g_myvirt);  /* our own vnode */
         /* port already correct (the listen port) */
     } else {
         *sa = o;                                /* opener's vnode + port */
