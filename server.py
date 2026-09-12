@@ -416,7 +416,13 @@ class Relay:
 
     async def _stream_fail(self, st, sid, reason, why):
         opener_w = st.get("opener_w")
-        if opener_w is not None and not opener_w.is_closing():
+        # A framed refusal is only valid while the opener still waits for
+        # its handshake verdict. Once the stream was confirmed (state
+        # ready - STOK went out at CLAIM), the transport carries RAW game
+        # bytes: tearing down by close() is the honest path then, exactly
+        # like a real peer resetting an established connection.
+        if (opener_w is not None and not opener_w.is_closing()
+                and st.get("state") in ("open", "joined")):
             try:
                 await tcp_send(opener_w, T_STFAIL, encode_stfail(sid, reason))
             except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
@@ -566,6 +572,27 @@ class Relay:
             return
         print(f"[stream] join: sid {sid} node {node} {peer} "
               f"(dest for opener node {st['opener_node']})", flush=True)
+        # LAN semantics: a kernel completes connect() on SYN/ACK - the
+        # server APP'S accept() latency is invisible to the client (backlog).
+        # So confirm to the opener NOW (claim = somebody is serving), and
+        # start pumping: bytes queue in the joinee transport/kernel buffers
+        # until its local bridge lands. A bridge failure afterwards tears
+        # the stream down -> the opener sees a post-connect reset, which
+        # real TCP can do too and apps already handle via recv errors.
+        # (The old serialized handshake made connect() latency = claim +
+        # bridge + roundtrips, inverting LAN ordering assumptions and
+        # stalling game reconnects past their timeouts.)
+        st["state"] = "ready"
+        try:
+            await tcp_send(st["opener_w"], T_STOK, encode_stsid(sid))
+        except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
+            await self._stream_fail(st, sid, STF_NO_ROUTE, "opener gone")
+            return
+        print(f"[stream] ok: sid {sid} node {st['opener_node']} <-> "
+              f"node {node} port {st['gport']} (bridge pending)", flush=True)
+        # NOTE: no pump yet - the verdict frame rides this same connection
+        # and must not race a reader. The opener's early bytes buffer in
+        # the transports meanwhile, exactly like a kernel backlog would.
         try:
             mtype, payload2 = await asyncio.wait_for(
                 tcp_read(reader), timeout=ST_TIMEOUT_S)
@@ -575,21 +602,8 @@ class Relay:
                                     "joinee handshake lost")
             return
         if mtype == T_STJOINED:
-            if decode_stsid(payload2) != sid:
-                writer.close()
-                await self._stream_fail(st, sid, STF_BAD_ID, "joined sid")
-                return
-            st["state"] = "ready"
-            try:
-                await tcp_send(st["opener_w"], T_STOK, encode_stsid(sid))
-            except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
-                await self._stream_fail(st, sid, STF_NO_ROUTE,
-                                        "opener gone")
-                return
-            print(f"[stream] ok: sid {sid} node {st['opener_node']} <-> "
-                  f"node {node} port {st['gport']}", flush=True)
+            # opener was confirmed at claim; now the raw pipe may start
             st["task"] = asyncio.create_task(self._stream_pipe(sid))
-            # keep the joiner transport alive for the stream's lifetime
             await st["done"]
         elif mtype == T_STFAIL:
             f = decode_stfail(payload2)
