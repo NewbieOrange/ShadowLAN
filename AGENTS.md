@@ -108,12 +108,6 @@ Semantics that matter:
   reject the session (`g_acc` + `real_getpeername_sym()`; dlsym of
   getpeername can bind OUR OWN export depending on link order - use the
   ELF-introspected real symbol).
-- `connect()` completes when a dest link CLAIMS the stream (STOK at
-  claim; SYN/ACK semantics - the local bridge/accept latency hides in
-  transport buffers like a kernel backlog, per `39ff861`). A bridge
-  failure after confirmation tears down via close() = post-connect
-  reset, which real TCP can do too. Nonblocking: EWOULDBLOCK +
-  FD_CONNECT/writable later.
 - Backpressure: TCP app-send blocks (or EWOULDBLOCK for nonblocking apps)
   when the 4 MB out-queue is full; in-queue (1 MB) pauses relay reads
   until drained (kernel window). UDP hook queues drop the NEW datagram
