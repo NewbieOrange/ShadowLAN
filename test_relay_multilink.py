@@ -26,7 +26,7 @@ from common import (HDR, T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, T_STOPEN,
                     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
                     STF_BUSY, encode_ctl_node, decode_bcast_from, tcp_read)
 
-PUB = 47795
+PUB = 47975
 N1, N2, N3 = 0x11111111, 0x22222222, 0x33333333
 SID = 0xABCD1234
 

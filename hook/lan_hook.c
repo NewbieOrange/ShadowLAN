@@ -298,6 +298,7 @@ struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in o
                    int in_paused;      /* in-queue full: stop reading relay */
                    int connect_signaled; /* FD_CONNECT reported once */
                    DTSOCK fd;          /* per-stream TCP (DTSOCK_BAD = none) */
+                   int fd_live;        /* thread published its relay fd */
                    struct dt_chunk *oh, *ot; size_t ototal;  /* app out-queue */
                    /* field diagnostics: app-facing byte counters + log throttle */
                    unsigned an_rx, an_tx; size_t ab_rx, ab_tx; long long a_log; };
@@ -775,10 +776,17 @@ struct dt_hosted {
     unsigned ovirt;       /* opener's virtual IP (from DT_STREQ) */
     int lport;            /* bridge socket's local ephemeral port: the
                              peer port the game's accept() will see */
+    int accsp;            /* accepted socket's real src port (fd-reuse
+                             guard for the getpeername door) */
 };
 static struct dt_hosted g_hs[DT_MAXHOST];
 struct dt_usess {
     int used; int game_port; struct sockaddr_in cli; int lport;
+    unsigned ovirt;              /* sender vnode seen on the wire: the
+                                  * accept door presents it to the local
+                                  * game as the peer of the bridged
+                                  * socket (UDP bootstrap apps cross-check
+                                  * it against the announce source) */
 #ifdef LINUX_BUILD
     int real;
 #else
@@ -877,18 +885,56 @@ typedef socklen_t socklen_int_t;
 typedef int socklen_int_t;
 #endif
 #define DT_MAXACC 64
-struct dt_accfd { int used; long long gsock; unsigned vnode; int lport; };
+struct dt_accfd { int used; long long gsock; unsigned vnode;
+                  int lport; int bport; };
 static struct dt_accfd g_acc[DT_MAXACC];
-static void dt_acc_learn(long long fd, const struct sockaddr_in *peer) {
-    int lp = (int)ntohs(peer->sin_port);
+/* fd is the ACCEPTED socket. The bridge/real peer lives elsewhere on the
+ * row (accepted fds are NOT the bridge fds), so we match by ports:
+ * peer->sin_port = bridge ephemeral src; the listen port comes in via
+ * *lp_hint (set by post-accept from getsockname) and identifies the
+ * hosted row. We store BOTH ports: sp for the fd-reuse check in
+ * getpeername, gport for bookkeeping. */
+static void dt_acc_learn_fd(long long fd, const struct sockaddr_in *peer,
+                            int listen_port) {
+    int sp = (int)ntohs(peer->sin_port);   /* bridge's ephemeral src port */
+
     DLOCK();
-    for (int i = 0; i < DT_MAXHOST; i++)
-        if (g_hs[i].used && g_hs[i].live && g_hs[i].lport == lp &&
-            g_hs[i].ovirt) {
+    int hitp = -1, hitf = -1;   /* exact-port / first-live */
+    for (int i = 0; i < DT_MAXHOST; i++) {
+        if (!g_hs[i].used || !g_hs[i].live || !g_hs[i].ovirt) continue;
+        if (hitf < 0) hitf = i;
+        if (listen_port && (int)g_hs[i].lport == listen_port) { hitp = i; break; }
+        if (sp && (int)g_hs[i].accsp == sp) { hitp = i; break; }
+    }
+
+    int pick = hitp >= 0 ? hitp : (listen_port ? -1 : hitf);
+    if (pick >= 0) {
+        g_hs[pick].accsp = sp;
+        for (int j = 0; j < DT_MAXACC; j++)
+            if (!g_acc[j].used || g_acc[j].gsock == fd) {
+                g_acc[j].used = 1; g_acc[j].gsock = fd;
+                g_acc[j].vnode = g_hs[pick].ovirt;
+                g_acc[j].lport = (int)g_hs[pick].lport;  /* listen port:
+                    the port the app must see as LOCAL (getpeername door
+                    compares the TRUE peer's bridge port separately) */
+                g_acc[j].bport = sp;
+                break;
+            }
+        DUNLOCK();
+        return;
+    }
+    /* no TCP stream carried this opener: the peer may be bootstrapping
+     * us over UDP (session-bridging libs announce, then connect). The
+     * hosted UDP session saw the sender's vnode on the wire - present
+     * it as the accepted socket's peer. */
+    for (int i = 0; i < DT_MAXUSESS; i++)
+        if (g_us[i].used && g_us[i].ovirt && g_us[i].lport == sp) {
             for (int j = 0; j < DT_MAXACC; j++)
                 if (!g_acc[j].used || g_acc[j].gsock == fd) {
                     g_acc[j].used = 1; g_acc[j].gsock = fd;
-                    g_acc[j].vnode = g_hs[i].ovirt; g_acc[j].lport = lp;
+                    g_acc[j].vnode = g_us[i].ovirt;
+                    g_acc[j].lport = g_us[i].game_port;
+                    g_acc[j].bport = sp;
                     break;
                 }
             break;
@@ -898,14 +944,17 @@ static void dt_acc_learn(long long fd, const struct sockaddr_in *peer) {
 /* hit returns 1 and fills *out (vnet view) + *rlport (expected real peer
  * port, for the caller's fd-reuse verification against the TRUE peer). */
 static int dt_acc_get(long long fd, struct sockaddr_in *out, int *rlport) {
-    int hit = 0, lp = 0; unsigned v = 0;
+    int hit = 0, lp = 0, bp = 0; unsigned v = 0;
     DLOCK();
     for (int j = 0; j < DT_MAXACC; j++)
         if (g_acc[j].used && g_acc[j].gsock == fd) {
-            hit = 1; lp = g_acc[j].lport; v = g_acc[j].vnode; break;
+            hit = 1; lp = g_acc[j].lport; v = g_acc[j].vnode;
+            bp = g_acc[j].bport; break;
         }
     DUNLOCK();
+
     if (!hit) return 0;
+    if (rlport) *rlport = bp;
     memset(out, 0, sizeof(*out));
     out->sin_family = AF_INET;
     out->sin_addr.s_addr = htonl(v);
@@ -927,15 +976,9 @@ static void dt_acc_post_accept(long long fd, struct sockaddr *addr,
                                const struct sockaddr_in *real_peer) {
     if (real_peer->sin_family != AF_INET ||
         real_peer->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
-        char lb[128]; unsigned long a = 0;
-        memcpy(&a, &real_peer->sin_addr.s_addr, 4);
-        snprintf(lb, sizeof(lb), "acc-hook: fd=%lld REAL peer NOT loopback %lu.%lu.%lu.%lu:%d",
-                 fd, a & 255, (a >> 8) & 255, (a >> 16) & 255, (a >> 24) & 255,
-                 (int)ntohs(real_peer->sin_port));
-        dlog(lb);
         return;
     }
-    dt_acc_learn(fd, real_peer);
+    dt_acc_learn_fd(fd, real_peer, 0);
     { struct sockaddr_in o; int lp = 0;
       char lb[128];
       int hit = dt_acc_get(fd, &o, &lp);
@@ -947,16 +990,17 @@ static void dt_acc_post_accept(long long fd, struct sockaddr *addr,
       }
     }
 }
-static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
-                                      size_t rl, const struct sockaddr_in *cli,
+static struct dt_usess *dt_usess_find(int game_port, const unsigned *ovirt,
+                                      const struct sockaddr_in *cli,
                                       int create) {
-    (void)raw; (void)rl;
     long long now = dt_now_ms();
     for (int i = 0; i < DT_MAXUSESS; i++)
         if (g_us[i].used && g_us[i].game_port == game_port &&
             g_us[i].cli.sin_addr.s_addr == cli->sin_addr.s_addr &&
-            g_us[i].cli.sin_port == cli->sin_port)
+            g_us[i].cli.sin_port == cli->sin_port) {
+            if (ovirt && !g_us[i].ovirt) g_us[i].ovirt = *ovirt;
             return &g_us[i];
+        }
     if (!create) return NULL;
     for (int i = 0; i < DT_MAXUSESS; i++)
         if (!g_us[i].used || now - g_us[i].last > 45000) {
@@ -969,6 +1013,8 @@ static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
             }
             g_us[i].used = 1; g_us[i].game_port = game_port;
             g_us[i].cli = *cli; g_us[i].last = now; g_us[i].lport = 0;
+            g_us[i].ovirt = ovirt ? *ovirt : 0;
+            g_us[i].ovirt = 0;
 #ifdef LINUX_BUILD
             dt_reals();
             g_us[i].real = socket(AF_INET, SOCK_DGRAM, 0);
@@ -995,12 +1041,14 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)game_port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    unsigned ovhost = ntohl(cli.sin_addr.s_addr);  /* host-order vnode */
 #ifdef LINUX_BUILD
     dt_reals();
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 1);
+    struct dt_usess *u = dt_usess_find(game_port, &ovhost, &cli, 1);
     int rs = u ? u->real : -1;
-    if (u) u->last = dt_now_ms();
+    if (u) { u->last = dt_now_ms();
+             if (iplen >= 4) memcpy(&u->ovirt, ipb, 4); }  /* host-order vnode */
     DUNLOCK();
     if (!u || rs < 0) return 0;
     if (r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo)) > 0) {
@@ -1009,12 +1057,14 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
         if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
         DLOCK();
         if (lp && u->lport == 0) u->lport = lp;   /* injection source port */
+        if (u && iplen >= 4) { unsigned ov; memcpy(&ov, ipb, 4);
+                               u->ovirt = ntohl(ov); } /* accept door peer */
         DUNLOCK();
     }
     return 1;
 #else
     DLOCK();
-    struct dt_usess *u = dt_usess_find(game_port, raw, rl, &cli, 1);
+    struct dt_usess *u = dt_usess_find(game_port, &ovhost, &cli, 1);
     SOCKET rs = u ? u->real : INVALID_SOCKET;
     if (u) u->last = dt_now_ms();
     DUNLOCK();
@@ -1026,6 +1076,8 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
         if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
         DLOCK();
         if (lp && u->lport == 0) u->lport = lp;   /* injection source port */
+        if (u && iplen >= 4) { unsigned ov; memcpy(&ov, ipb, 4);
+                               u->ovirt = ntohl(ov); } /* accept door peer */
         DUNLOCK();
     }
     return 1;
@@ -1120,6 +1172,14 @@ static struct dt_stream *dt_stream_by_sock(long long s) {
         if (g_st[i].used && g_st[i].gsock == s) return &g_st[i];
     return NULL;
 }
+static struct dt_stream *dt_stream_by_sock_peeked(struct sockaddr_in dst) {
+    for (int i = 0; i < DT_MAXSTREAM; i++)
+        if (g_st[i].used && g_st[i].gsock &&
+            g_st[i].orig.sin_addr.s_addr == dst.sin_addr.s_addr &&
+            g_st[i].orig.sin_port == dst.sin_port)
+            return &g_st[i];
+    return NULL;
+}
 static struct dt_stream *dt_stream_by_sid(unsigned sid) {
     for (int i = 0; i < DT_MAXSTREAM; i++)
         if (g_st[i].used && g_st[i].sid == sid) return &g_st[i];
@@ -1151,7 +1211,13 @@ static void dt_sock_state_locked(long long gsock, int *data, int *dead,
     for (i = 0; i < DT_MAXSTREAM; i++)
         if (g_st[i].used && g_st[i].gsock == gsock) {
             if (g_st[i].h) *data = 1;
-            if (g_st[i].dead || g_st[i].state == ST_DEAD) *dead = 1;
+            if (g_st[i].dead || g_st[i].state == ST_DEAD) {
+                *dead = 1;
+                /* a socket that received RST/error is readable AND
+                 * writable in the kernel: the verdict must be reapable
+                 * through select/poll by apps that never call recv */
+                *data = 1; *writable = 1;
+            }
             if (g_st[i].state == ST_OPEN && !g_st[i].dead) {
                 *writable = 1;
                 if (!g_st[i].connect_signaled) *connect = 1;
@@ -1220,6 +1286,15 @@ static void dt_udp_push(long long gsock, const unsigned char *p, size_t n,
     DUNLOCK();
 }
 /* nonblocking pop; 1 = got data, 0 = empty, -1 = closed */
+static size_t dt_inq_locked(struct dt_stream *st) {
+    return st ? st->total : 0;
+}
+static int dt_stream_by_sock_peek(long long gsock) {
+    DLOCK();
+    int has = dt_stream_by_sock(gsock) != NULL;
+    DUNLOCK();
+    return has;
+}
 static int dt_udp_pop(long long gsock, unsigned char *buf, size_t blen,
                       struct sockaddr_in *from, size_t *outn) {
     int r = 0; DLOCK();
@@ -1279,12 +1354,16 @@ static int dt_resolve(struct sockaddr_in *out) {
 #ifdef LINUX_BUILD
 /* real libc symbols for tunnel use (avoid recursing into our hooks) */
 static int (*r_connect)(int, const struct sockaddr *, socklen_t) = 0;
+static int (*real_select)(int, fd_set *, fd_set *, fd_set *, struct timeval *) = 0;
+static int (*real_getsockopt)(int, int, int, void *, socklen_t *) = 0;
 static ssize_t (*r_send)(int, const void *, size_t, int) = 0;
 static ssize_t (*r_recv)(int, void *, size_t, int) = 0;
 static ssize_t (*r_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = 0;
 static int (*r_close)(int) = 0;
 static void dt_reals(void) {
     if (!r_connect) r_connect = dlsym(RTLD_NEXT, "connect");
+    if (!real_select) real_select = dlsym(RTLD_NEXT, "select");
+    if (!real_getsockopt) real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
     if (!r_send) r_send = dlsym(RTLD_NEXT, "send");
     if (!r_recv) r_recv = dlsym(RTLD_NEXT, "recv");
     if (!r_sendto) r_sendto = dlsym(RTLD_NEXT, "sendto");
@@ -1391,11 +1470,26 @@ static DTSOCK dt_st_dial_relay(void) {
     if (r != 0 && errno != EINPROGRESS) { r_close(s); return DTSOCK_BAD; }
     if (r == 0) return s;
     fd_set wf; FD_ZERO(&wf); FD_SET((int)s, &wf);
-    struct timeval tv = { DT_ST_TIMEOUT_MS / 1000,
-                          (DT_ST_TIMEOUT_MS % 1000) * 1000 };
-    if (select((int)s + 1, NULL, &wf, NULL, &tv) <= 0) { r_close(s); return DTSOCK_BAD; }
-    int err = 0; socklen_t el = sizeof(err);
-    getsockopt((int)s, SOL_SOCKET, SO_ERROR, &err, &el);
+    /* kernel-style completion wait: writable, exception (RST -> the
+     * caller's getsockopt still reports ECONNREFUSED), or budget. The
+     * select HOOKS must not answer for this transport fd: poll the
+     * socket directly. */
+    long long t0 = dt_now_ms();
+    int err = -1;
+    for (;;) {
+        fd_set wf, xf;
+        FD_ZERO(&wf); FD_ZERO(&xf);
+        FD_SET((int)s, &wf); FD_SET((int)s, &xf);
+        struct timeval tv = { 0, 20000 };
+        int sr = real_select ? real_select((int)s + 1, NULL, &wf, &xf, &tv) : -1;
+        if (sr > 0 && (FD_ISSET((int)s, &wf) || FD_ISSET((int)s, &xf))) {
+            socklen_t el = sizeof(err);
+            real_getsockopt((int)s, SOL_SOCKET, SO_ERROR, &err, &el);
+            break;
+        }
+        if (!g_tun_run) { err = ECANCELED; break; }
+        if (dt_now_ms() - t0 > DT_ST_TIMEOUT_MS) { err = ETIMEDOUT; break; }
+    }
     if (err) { r_close(s); return DTSOCK_BAD; }
     return s;
 #else
@@ -1472,6 +1566,7 @@ static int dt_st_recv_frame(DTSOCK fd, unsigned char *type, unsigned char *p,
 #ifdef LINUX_BUILD
         ssize_t k = r_recv(fd, hdr + got, 4 - got, 0);
         if (k > 0) { got += (size_t)k; continue; }
+        if (k == 0 && got == 0) { errno = EPIPE; return -1; }
         { int e = errno;
           if (e != EAGAIN && e != EWOULDBLOCK) {
               char lb[96];
@@ -1481,6 +1576,7 @@ static int dt_st_recv_frame(DTSOCK fd, unsigned char *type, unsigned char *p,
 #else
         int k = recv(fd, (char *)hdr + got, (int)(4 - got), 0);
         if (k > 0) { got += (size_t)k; continue; }
+        if (k == 0 && got == 0) { WSASetLastError(WSA_E_CANCELLED); return -1; }
         { int e = WSAGetLastError();
           if (e != WSAEWOULDBLOCK) {
               char lb[96];
@@ -1505,7 +1601,14 @@ static int dt_st_recv_frame(DTSOCK fd, unsigned char *type, unsigned char *p,
         int sr = select(0, &rf, NULL, NULL, &tv);
         if (sr < 0) { if (WSAGetLastError() == WSAEINTR) continue; return -1; }
 #endif
-        if (dt_now_ms() - t0 > tmo_ms) return -1;
+        if (dt_now_ms() - t0 > tmo_ms) {
+#ifdef LINUX_BUILD
+            errno = EAGAIN;
+#else
+            WSASetLastError(WSAEWOULDBLOCK);
+#endif
+            return -1;
+        }
     }
     unsigned ml = dt_get32(hdr);
     if (ml < 1 || ml > 65536) return -1;
@@ -1613,6 +1716,10 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
             return 0;
         }
         unsigned dest = dt_virt_node(orig.sin_addr.s_addr); /* 0 = implicit host */
+        if (dest == g_node) dest = 0;  /* self-dial of our assigned vnode:
+                                        * route by implicit-host rules
+                                        * (mirrors a NIC hairpin), never
+                                        * fan back to our own process */
         unsigned char p[14];
         dt_put32(p, g_node); dt_put32(p + 4, dest);
         dt_put32(p + 8, sid); dt_put16(p + 12, origport);
@@ -1626,12 +1733,75 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
             return 0;
         }
         DLOCK();
-        if (st->used && st->sid == sid) st->fd = fd;
+        if (st->used && st->sid == sid) { st->fd = fd; st->fd_live = 1; }
         DUNLOCK();
         unsigned char type = 0, rp[16]; size_t rn = 0;
-        int r = dt_st_recv_frame(fd, &type, rp, sizeof(rp), &rn, DT_ST_TIMEOUT_MS);
+        /* Verdict wait mirrors the kernel: the app MAY close() us while
+         * the handshake runs (GBE abandons pending dials after ~3 s).
+         * dt_on_close detaches the app identity but keeps the slot; we
+         * keep waiting, record the verdict, and hand it to whatever
+         * stream the app opened for the SAME destination (GBE retries
+         * with a fresh socket immediately - a real stack answers that
+         * retry from the listener's state, not from scratch). */
+        int r, sys_e = 0;
+        for (;;) {                           /* pending -1 (EAGAIN): the
+                                              * handshake budget spans
+                                              * claim+bridge; retry */
+            r = dt_st_recv_frame(fd, &type, rp, sizeof(rp), &rn,
+                                 DT_ST_TIMEOUT_MS);
+            sys_e = errno;
+            if (r == -1 && (sys_e == EAGAIN || sys_e == EWOULDBLOCK))
+                continue;
+            { char lb[96]; snprintf(lb, sizeof(lb),
+                "st verdict r=%d errno=%d t=%lld", r, sys_e,
+                (long long)(dt_now_ms())); dlog(lb); }
+            break;                           /* 0 verdict | -1 death */
+        }
+        if (r == -1) {                       /* transport died pre-verdict
+                                              * (EOF or budget exhausted):
+                                              * kernel says ECONNREFUSED */
+            DLOCK();
+            if (st->used && st->sid == sid) {
+                st->state = ST_DEAD; st->fail = STF_NO_ROUTE;
+                if (st->gsock) dt_sig_locked(st->gsock);
+            }
+            DUNLOCK();
+            dt_st_close_fd(fd);
+            return 0;
+        }
         DLOCK();
-        int gone = !st->used || st->sid != sid || st->dead;
+        int detached = st->used && st->sid == sid && st->gsock == 0;
+        int gone = !st->used || st->sid != sid;
+        if (detached) {
+            /* the app closed this dial (GBE abandons pending connects);
+             * hand a refusal to a retry for the SAME destination - a
+             * real stack answers the retry from listener state, and the
+             * only honest verdict for a stream nobody completed is the
+             * one the app's select() would reap - then free the slot. */
+            unsigned vfail = STF_NO_ROUTE;
+            if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid)
+                vfail = 0;                  /* we DID connect: orphaned */
+            else if (r == 0 && type == DT_STFAIL && rn >= 5 &&
+                     dt_get32(rp) == sid)
+                vfail = rp[4];
+            if (vfail) {
+                struct dt_stream *cur = dt_stream_by_sock_peeked(st->orig);
+                if (cur && cur->state == ST_CONNECTING) {
+                    cur->state = ST_DEAD; cur->fail = vfail;
+                    dt_sig_locked(cur->gsock);
+                }
+            }
+            st->used = 0; st->state = ST_DEAD; st->fd = DTSOCK_BAD;
+            struct dt_chunk *c = st->h;
+            while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+            c = st->oh;
+            while (c) { struct dt_chunk *nx = c->next; free(c->p); free(c); c = nx; }
+            st->h = st->t = st->oh = st->ot = NULL;
+            st->total = st->ototal = 0;
+            DUNLOCK();
+            dt_st_close_fd(fd);
+            return 0;
+        }
         if (!gone) {
             if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid) {
                 st->state = ST_OPEN;
@@ -3496,8 +3666,13 @@ static void dt_on_close(long long gsock) {
     struct dt_stream *st = dt_stream_by_sock(gsock);
     int stream_freed = 0;
     if (st) {
-        st->dead = 1;          /* stream thread finishes + frees the slot */
-        if (st->state != ST_CONNECTING) {
+        st->dead = 1;          /* no new app-side use */
+        if (st->state == ST_CONNECTING) {
+            /* handshake thread still runs on its own relay fd: detach
+             * the app identity but KEEP the slot (the thread reports
+             * the verdict through st->sid ownership and frees it) */
+            st->gsock = 0;
+        } else {
             /* thread already exited (or never started): free now */
             st->used = 0; st->fd = DTSOCK_BAD;
             struct dt_chunk *c = st->h;
@@ -3520,10 +3695,6 @@ static void dt_on_close(long long gsock) {
         if (g_evmap[i].used && g_evmap[i].sock == gsock) g_evmap[i].used = 0;
 #endif
     DUNLOCK();
-    if (!stream_freed && st && st->state == ST_CONNECTING) {
-        /* wake the (starting) stream thread so it aborts the handshake */
-        dt_st_fail_local(st, STF_HOST_FAILED);
-    }
 #ifndef LINUX_BUILD
     DLOCK();
     for (int i = 0; i < (int)(sizeof(g_nbt) / sizeof(g_nbt[0])); i++)
@@ -3732,18 +3903,36 @@ int getpeername(int s, struct sockaddr *a, socklen_t *l) {
     if (g_direct && a && l && *l >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in o;
         if (dt_getpeer((long long)s, &o)) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
-        int lp = 0;
-        if (dt_acc_get((long long)s, &o, &lp)) {
+        int bp = 0;
+        if (dt_acc_get((long long)s, &o, &bp)) {
             struct sockaddr_in rp; socklen_t rl = sizeof(rp);
-            if (real_gp(s, (struct sockaddr *)&rp, &rl) == 0 &&
-                rp.sin_addr.s_addr == htonl(INADDR_LOOPBACK) &&
-                ntohs(rp.sin_port) == lp) {
-                memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0;
+            int gpr = real_gp(s, (struct sockaddr *)&rp, &rl);
+            if (gpr != 0) { memcpy(a, &o, sizeof(o)); *l = sizeof(o); return 0; }
+            if (rp.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+                if ((int)ntohs(rp.sin_port) == bp) {
+                    memcpy(a, &o, sizeof(o)); *l = sizeof(o);
+                    return 0;
+                }
+                dt_acc_forget((long long)s);   /* fd recycled */
             }
-            dt_acc_forget((long long)s);   /* fd recycled */
         }
     }
     return real_gp(s, a, l);
+}
+/* the TRUE libc getpeername: dlsym(RTLD_NEXT) is unreliable here - our
+ * exported getpeername may sit first in the lookup scope depending on
+ * link order, so resolve via ELF introspection with a fallback. */
+static int (*real_getpeername_sym(void))(int, struct sockaddr*, socklen_t*) {
+    static int (*fp)(int, struct sockaddr*, socklen_t*);
+    if (fp) return fp;
+    fp = (int (*)(int, struct sockaddr*, socklen_t*))
+         dlsym(RTLD_NEXT, "getpeername");
+    if (!fp) {
+        void *h = dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY);
+        if (h) fp = (int (*)(int, struct sockaddr*, socklen_t*))
+                    dlsym(h, "getpeername");
+    }
+    return fp;
 }
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     static int (*real_accept)(int, struct sockaddr*, socklen_t*) = 0;
@@ -3764,16 +3953,15 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
         close(fd); errno = EAGAIN; return -1;
     }
     if (g_direct && fd >= 0) {
-        if (addr && addrlen && *addrlen >= (socklen_int_t)sizeof(struct sockaddr_in))
-            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen,
-                               (struct sockaddr_in *)addr);
-        else {
-            static int (*rgp)(int, struct sockaddr*, socklen_t*) = 0;
-            struct sockaddr_in rp; socklen_t rl = sizeof(rp);
-            if (!rgp) rgp = dlsym(RTLD_NEXT, "getpeername");
-            if (rgp && rgp(fd, (struct sockaddr *)&rp, &rl) == 0)
-                dt_acc_post_accept(fd, NULL, NULL, &rp);
-        }
+        struct sockaddr_in rp; socklen_t rl = sizeof(rp);
+        static int (*rgp)(int, struct sockaddr*, socklen_t*) = 0;
+        if (!rgp) rgp = dlsym(RTLD_NEXT, "getpeername");
+        /* ALWAYS take the REAL peer first (the out-param may hold it, but
+         * getpeername is the single source of truth), then learn/spoof:
+         * post_accept must not be fed the out-param as 'real' or the
+         * second read of it (when already rewritten) misses loopback. */
+        if (rgp && rgp(fd, (struct sockaddr *)&rp, &rl) == 0)
+            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen, &rp);
     }
     return fd;
 }
@@ -3794,9 +3982,11 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
         close(fd); errno = EAGAIN; return -1;
     }
     if (g_direct && fd >= 0) {
-        if (addr && addrlen && *addrlen >= (socklen_int_t)sizeof(struct sockaddr_in))
-            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen,
-                               (struct sockaddr_in *)addr);
+        struct sockaddr_in rp; socklen_t rl = sizeof(rp);
+        static int (*rgp)(int, struct sockaddr*, socklen_t*) = 0;
+        if (!rgp) rgp = real_getpeername_sym();
+        if (rgp && rgp(fd, (struct sockaddr *)&rp, &rl) == 0)
+            dt_acc_post_accept(fd, addr, (socklen_int_t *)addrlen, &rp);
     }
     return fd;
 }
@@ -3849,6 +4039,11 @@ static int dt_poll_scan(struct pollfd *fds, nfds_t nfds) {
 }
 /* tunneled writable set: streams that are open (or just connected) and
  * udp sockets; like a real select would report for those */
+static int dt_fd_readable_peek(long long fd) {
+    int data, dead, wr, cn;
+    dt_sock_state_full(fd, &data, &dead, &wr, &cn);
+    return data || dead;
+}
 static int dt_wscan(int nfds, fd_set *w0, fd_set *wout) {
     int n = 0;
     if (!w0 || !wout) return 0;
@@ -4361,9 +4556,51 @@ SOCKET WSAAPI hk_accept(SOCKET s, struct sockaddr *addr, int *addrlen) {
     }
     return r;
 }
+/* Tunneled-stream receive for every door (recv/recvfrom/WSARecv/
+ * WSARecvFrom): serve from the hook queue, present peer-vnode sources,
+ * and drain-before-error on peer death exactly like the kernel: queued
+ * bytes first, then WSAECONNRESET (hard kill / refusal) or 0 (FIN).
+ * Never fall through to the real fd: that IS the relay transport. */
+static int dt_win_stream_recv(SOCKET s, char *buf, int len, int flags) {
+    int nb = dt_is_nonblock((long long)s) || (flags & MSG_DONTWAIT);
+    int tmo = dt_rcvtimeo_ms((long long)s);
+    size_t on = 0;
+    int r = dt_tcp_wait((long long)s, (unsigned char *)buf,
+                        (size_t)(len < 0 ? 0 : len), &on, nb ? 0 : tmo, nb);
+    if (r == 1) return (int)on;
+    if (r == -1) {
+        /* kernel drains the receive buffer before reporting a reset */
+        size_t q = 0; int dead = 0;
+        DLOCK();
+        struct dt_stream *s2 = dt_stream_by_sock((long long)s);
+        if (s2) { q = dt_inq_locked(s2); dead = s2->dead; }
+        DUNLOCK();
+        if (q) {
+            int r2 = dt_tcp_wait((long long)s, (unsigned char *)buf,
+                                 (size_t)(len < 0 ? 0 : len), &on, 0, 1);
+            if (r2 == 1) return (int)on;
+        }
+        if (dead) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+        return 0;
+    }
+    WSASetLastError(nb ? WSAEWOULDBLOCK : WSAETIMEDOUT);
+    return SOCKET_ERROR;
+}
+
 int WSAAPI hk_recvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen) {
     if (g_direct && dt_is_udp_like((long long)s))
         return dt_win_udp_recv(s, buf, len, flags, from, fromlen);
+    if (g_direct && dt_stream_by_sock_peek((long long)s)) {
+        int n = dt_win_stream_recv(s, buf, len, flags);
+        if (n > 0 && from && fromlen) {
+            struct sockaddr_in o;
+            if (dt_getpeer((long long)s, &o) &&
+                *fromlen >= (int)sizeof(o)) {
+                memcpy(from, &o, sizeof(o)); *fromlen = sizeof(o);
+            }
+        }
+        return n;
+    }
     {
         int r = p_recvfrom(s, buf, len, flags, from, fromlen);
         if (!g_direct && r > 0) dt_obsv("RECV", (long long)s, from, (const unsigned char *)buf, r);
@@ -4578,12 +4815,14 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
 int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
     int r = p_getsockname ? p_getsockname(s, a, l) : SOCKET_ERROR;
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
+        struct sockaddr_in *sa = (struct sockaddr_in *)a;
         int vp = 0;
         DLOCK();
         struct dt_udp *e = dt_udp_entry((long long)s, 0);
         if (e) vp = e->vport;
         DUNLOCK();
-        if (vp) ((struct sockaddr_in *)a)->sin_port = htons((unsigned short)vp);
+        if (vp) sa->sin_port = htons((unsigned short)vp);
+        dt_gp_spoof(s, sa, l ? *l : 0, 1);
     }
     return r;
 }
@@ -4596,6 +4835,26 @@ int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1,
         if (r == 2) { WSASetLastError(WSAEALREADY); return SOCKET_ERROR; }
     }
     return p_WSAConnect ? p_WSAConnect(s, a, l, b1, b2, q1, q2) : SOCKET_ERROR;
+}
+/* shared spoof door for getpeername (want=0) and getsockname (want=1).
+ * For accepted (bridged) sockets only: presents the vnode view the
+ * kernel would give on a real LAN - peer = opener's vnode, local = own
+ * vnode; the listen port stays real either way. */
+static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self) {
+    if (l < (int)sizeof(struct sockaddr_in) || !g_direct) return;
+    struct sockaddr_in o; int lp = 0;
+    if (!dt_acc_get((long long)fd, &o, &lp)) return;
+    struct sockaddr_in rp; int rl = (int)sizeof(rp);
+    if (!p_getpeername ||
+        p_getpeername(fd, (struct sockaddr *)&rp, &rl) != 0 ||
+        rp.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
+        return;   /* not our bridge: hands off */
+    if (want_self) {
+        sa->sin_addr.s_addr = g_virt;           /* our own vnode */
+        /* port already correct (the listen port) */
+    } else {
+        *sa = o;                                /* opener's vnode + port */
+    }
 }
 int WSAAPI hk_getpeername(SOCKET s, struct sockaddr *a, int *l) {
     if (g_direct && a && l && *l >= (int)sizeof(struct sockaddr_in)) {
@@ -4645,21 +4904,9 @@ int WSAAPI hk_send(SOCKET s, const char *buf, int len, int flags) {
     return p_send(s, buf, len, flags);
 }
 int WSAAPI hk_recv(SOCKET s, char *buf, int len, int flags) {
-    (void)flags;
-    if (g_direct) {
-        DLOCK();
-        struct dt_stream *st = dt_stream_by_sock((long long)s);
-        DUNLOCK();
-        if (st) {
-            int nb = dt_is_nonblock((long long)s);
-            int tmo = dt_rcvtimeo_ms((long long)s);
-            size_t on = 0;
-            int r = dt_tcp_wait((long long)s, (unsigned char *)buf, (size_t)(len < 0 ? 0 : len), &on, tmo, nb);
-            if (r == 1) return (int)on;
-            if (r == -1) return 0;
-            WSASetLastError(nb ? WSAEWOULDBLOCK : WSAETIMEDOUT);
-            return SOCKET_ERROR;
-        }
+    if (g_direct && !dt_is_udp_like((long long)s)) {
+        if (dt_stream_by_sock_peek((long long)s))
+            return dt_win_stream_recv(s, buf, len, flags);
     }
     return p_recv(s, buf, len, flags);
 }

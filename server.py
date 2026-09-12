@@ -405,6 +405,9 @@ class Relay:
                 s.discard(sid)
         if st.get("done") is not None and not st["done"].done():
             st["done"].set_result(None)
+        t = st.get("task")
+        if t is not None and not t.done():
+            t.cancel()
         for r, w in ((st.get("opener_r"), st.get("opener_w")),
                      (st.get("joiner_r"), st.get("joiner_w"))):
             if w is not None:
@@ -440,6 +443,7 @@ class Relay:
             writer.close()
             return
         node, dest_node, sid, gport = dec
+        st_deadline = time.monotonic() + ST_TIMEOUT_S
         if self.allowed_tcp and gport not in self.allowed_tcp:
             await self._stream_fail_standalone(writer, sid, STF_NO_ROUTE,
                                                "port not allowed")
@@ -485,6 +489,8 @@ class Relay:
               "dest_node": dest_node, "gport": gport, "state": "open",
               "created": time.monotonic(), "joiner_r": None,
               "joiner_w": None, "task": None,
+              "pending": set(dest_links),
+              "deadline": st_deadline,
               "done": asyncio.get_running_loop().create_future()}
         self.streams[sid] = st
         self.node_streams.setdefault(node, set()).add(sid)
@@ -494,10 +500,11 @@ class Relay:
               f"port {gport} from {peer} ({len(dest_links)} dest links)",
               flush=True)
         ovirt = self.nodes.get(node, {}).get("virt", 0)
+        st["task"] = asyncio.create_task(
+            self._stream_join_timeout(sid, st_deadline))
         for w in dest_links:
             await self.r_send(w, T_STREQ, encode_streq(sid, gport, ovirt),
                               droppable=False)
-        asyncio.create_task(self._stream_join_timeout(sid))
         # keep this connection's transport alive (asyncio closes it when
         # the accept coroutine returns); the stream outlives the handshake
         await st["done"]
@@ -514,12 +521,29 @@ class Relay:
         except Exception:
             pass
 
-    async def _stream_join_timeout(self, sid):
-        await asyncio.sleep(ST_TIMEOUT_S)
+    async def _stream_join_timeout(self, sid, deadline=None):
+        # The budget is a LAST-RESORT fuse (a wedged joinee). Two real
+        # verdicts land sooner, exactly like kernel events on LAN:
+        #   - the joinee transport closes without STJOINED (its process
+        #     died / stood down)  -> handled inline ("handshake lost").
+        # `deadline` (absolute monotonic) spans the WHOLE handshake:
+        # STOPEN->claim (fanout, sibling races, the joinee's own dial
+        # budget) and claim->bridge. The opener therefore gets its
+        # verdict within 10 s of starting connect - never a surprise
+        # reset after the app already gave up at its own timeout.
+        if deadline is None:
+            await asyncio.sleep(ST_TIMEOUT_S)
+        else:
+            await asyncio.sleep(max(0.0, deadline - time.monotonic()))
         st = self.streams.get(sid)
-        if st is None or st["state"] != "open":
+        if st is None or st["state"] not in ("open", "joined"):
             return
-        await self._stream_fail(st, sid, STF_JOIN_TIMEOUT,
+        # Nobody claimed this port within the budget. On a real stack the
+        # connect got RST (no listener) - report refusal, not a generic
+        # timeout, so apps fail fast on dead ports like they do on LAN
+        # (field: the viewer's accept-loop BLOCKS ~7 s waiting for a
+        # refused connect; JOIN_TIMEOUT made it wait the whole budget).
+        await self._stream_fail(st, sid, STF_NO_ROUTE,
                                 "dest never joined in time")
 
     async def handle_stream_join(self, reader, writer, payload):
@@ -547,6 +571,15 @@ class Relay:
                 pass
             print(f"[stream] join: sid {sid} already claimed (state "
                   f"{st['state']}); dup node {node} -> BUSY", flush=True)
+            st["busy"].add(writer)
+            if st["pending"] and st["busy"] >= st["pending"]:
+                # every live dest link answered "nobody here listens" -
+                # LAN would have RST'd this connect by now; refuse fast
+                # instead of burning the handshake budget (the app's
+                # accept-loop blocks on every dial to a dead port).
+                await self._stream_fail(st, sid, STF_NO_ROUTE,
+                                        "every dest link: no listener")
+                return
             writer.close()
             return
         if node != st["dest_node"]:
@@ -561,13 +594,13 @@ class Relay:
             await self._stream_fail(st, sid, STF_BAD_ID, "joinee identity")
             return
         st["joiner_r"], st["joiner_w"] = reader, writer
-        st["state"] = "joined"   # claim: further joiners -> BUSY
+        st["state"] = "joined"   # claim: further joiners get BUSY
         # immediate claim verdict on the joiner's own connection: losers
         # stand down before bridging, the winner proceeds knowingly
         try:
             await tcp_send(writer, T_STOK, encode_stsid(sid))
         except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
-            await self._stream_fail(st, sid, STF_JOIN_TIMEOUT,
+            await self._stream_fail(st, sid, STF_NO_ROUTE,
                                     "joinee gone at claim")
             return
         print(f"[stream] join: sid {sid} node {node} {peer} "
@@ -590,19 +623,44 @@ class Relay:
             return
         print(f"[stream] ok: sid {sid} node {st['opener_node']} <-> "
               f"node {node} port {st['gport']} (bridge pending)", flush=True)
+        # Drain frames the joinee queued DURING its handshake (e.g. a
+        # refusal aimed at a second opener while it was still claiming
+        # this stream): they ride this same connection ahead of raw
+        # bytes and must be consumed, not piped as game data.
+        while st["joiner_w"] is not None:
+            try:
+                t2, p2 = await asyncio.wait_for(tcp_read(reader), timeout=0)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    ValueError):
+                break
+            if t2 == T_STFAIL:
+                await self.r_send(st["opener_w"], T_STFAIL, p2,
+                                  droppable=False)
+            else:  # unknown pre-pipe frame: do not lose sync - close
+                writer.close()
+                await self._stream_fail(st, sid, STF_HOST_FAILED,
+                                        "stray joinee frame")
+                return
         # NOTE: no pump yet - the verdict frame rides this same connection
         # and must not race a reader. The opener's early bytes buffer in
         # the transports meanwhile, exactly like a kernel backlog would.
+        rem = st["deadline"] - time.monotonic()
         try:
             mtype, payload2 = await asyncio.wait_for(
-                tcp_read(reader), timeout=ST_TIMEOUT_S)
+                tcp_read(reader), timeout=max(0.001, rem))
         except (asyncio.TimeoutError, asyncio.IncompleteReadError,
                 ConnectionResetError, ValueError):
-            await self._stream_fail(st, sid, STF_JOIN_TIMEOUT,
+            # transport died mid-handshake: kernel analogue is an RST
+            # during connect -> ECONNREFUSED, not a silent-ish timeout
+            await self._stream_fail(st, sid, STF_NO_ROUTE,
                                     "joinee handshake lost")
             return
         if mtype == T_STJOINED:
-            # opener was confirmed at claim; now the raw pipe may start
+            # bridge is up: the handshake watchdog's job ends here (the
+            # pipe has its own liveness via TCP); raw pipe starts.
+            old_t = st.get("task")
+            if old_t is not None and not old_t.done():
+                old_t.cancel()
             st["task"] = asyncio.create_task(self._stream_pipe(sid))
             await st["done"]
         elif mtype == T_STFAIL:
