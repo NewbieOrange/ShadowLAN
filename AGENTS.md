@@ -99,6 +99,17 @@ fast, intended).
 Semantics that matter:
 - `connect()` completes when a dest link CLAIMS the stream (STOK at
   claim; SYN/ACK semantics - the local bridge/accept latency hides in
+  transport buffers like a kernel backlog). A bridge failure after
+  confirmation tears down via close() = post-connect reset, which real
+  TCP can do too. Nonblocking: EWOULDBLOCK + FD_CONNECT/writable later.
+- Accept door: the game's accepted socket (peer == our bridge loopback)
+  presents the OPENER's vnode via accept out-param AND
+  getpeername/getsockname - all three agree, or apps that cross-check
+  reject the session (`g_acc` + `real_getpeername_sym()`; dlsym of
+  getpeername can bind OUR OWN export depending on link order - use the
+  ELF-introspected real symbol).
+- `connect()` completes when a dest link CLAIMS the stream (STOK at
+  claim; SYN/ACK semantics - the local bridge/accept latency hides in
   transport buffers like a kernel backlog, per `39ff861`). A bridge
   failure after confirmation tears down via close() = post-connect
   reset, which real TCP can do too. Nonblocking: EWOULDBLOCK +
@@ -376,6 +387,16 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   consult their own side (getpeername IS spoofed and that is what they
   key on), but it is a door LAN_ONLY does not close; hook it (vnode +
   real port) if an app ever shows it.
+
+## Status snapshot (2026-09-13)
+
+2.0.0 RELEASED + post-release field fixes on master (pushed): early-STOK
+`39ff861`, relay verdict/fuse + accept-door spoof + dial/select fixes
+(`3d30c2d`) with test_socket_doors / test_stfail_semantics /
+test_burst_connect; LAN e2e + Wine IF_* suites green. The field game
+session flow now blocks INSIDE the bridge library's `CreateSteam2Server`
+assert (reproduced on a pure LAN pair with no tunnel involved) - the
+lobby layer is end-to-end healthy.
 
 ## Status snapshot (2026-09-09: RELEASED 2.0.0)
 
