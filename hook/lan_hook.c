@@ -748,7 +748,7 @@ struct dt_hosted {
 };
 static struct dt_hosted g_hs[DT_MAXHOST];
 struct dt_usess {
-    int used; int game_port; struct sockaddr_in cli;
+    int used; int game_port; struct sockaddr_in cli; int lport;
 #ifdef LINUX_BUILD
     int real;
 #else
@@ -938,7 +938,7 @@ static struct dt_usess *dt_usess_find(int game_port, const unsigned char *raw,
 #endif
             }
             g_us[i].used = 1; g_us[i].game_port = game_port;
-            g_us[i].cli = *cli; g_us[i].last = now;
+            g_us[i].cli = *cli; g_us[i].last = now; g_us[i].lport = 0;
 #ifdef LINUX_BUILD
             dt_reals();
             g_us[i].real = socket(AF_INET, SOCK_DGRAM, 0);
@@ -973,7 +973,14 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     if (u) u->last = dt_now_ms();
     DUNLOCK();
     if (!u || rs < 0) return 0;
-    r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+    if (r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo)) > 0) {
+        struct sockaddr_in sn; socklen_t sl = sizeof(sn);
+        int lp = 0;
+        if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
+        DLOCK();
+        if (lp && u->lport == 0) u->lport = lp;   /* injection source port */
+        DUNLOCK();
+    }
     return 1;
 #else
     DLOCK();
@@ -982,7 +989,15 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     if (u) u->last = dt_now_ms();
     DUNLOCK();
     if (!u || rs == INVALID_SOCKET) return 0;
-    sendto(rs, (const char *)raw, (int)rl, 0, (struct sockaddr *)&lo, sizeof(lo));
+    if (sendto(rs, (const char *)raw, (int)rl, 0, (struct sockaddr *)&lo,
+               sizeof(lo)) > 0) {
+        struct sockaddr_in sn; int sl = (int)sizeof(sn);
+        int lp = 0;
+        if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
+        DLOCK();
+        if (lp && u->lport == 0) u->lport = lp;   /* injection source port */
+        DUNLOCK();
+    }
     return 1;
 #endif
 }
@@ -3031,6 +3046,28 @@ static void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest,
 #endif
     dt_icmp_deliver(from_virt, id, seq, data, dlen);
 }
+/* The hosted bridge injects from an anonymous 127.0.0.1 socket; the app
+ * must NEVER see that - its peer state (GBE: udp_ip_port) keys on the
+ * recvfrom source, and a loopback source there makes the game unicast
+ * its lobby JOIN back to itself (silently looping, host never sees it).
+ * Map the injection socket's source port back to the session's real
+ * peer (virtual ip + presented mark port), like the direct path does. */
+static void dt_hosted_unsource(struct sockaddr *sa, socklen_int_t *len) {
+    if (!sa || !len || *len < (socklen_int_t)sizeof(struct sockaddr_in)) return;
+    struct sockaddr_in *in = (struct sockaddr_in *)sa;
+    if (in->sin_family != AF_INET ||
+        in->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) return;
+    int port = ntohs(in->sin_port), hit = 0;
+    struct sockaddr_in cli;
+    memset(&cli, 0, sizeof(cli));
+    DLOCK();
+    for (int i = 0; i < DT_MAXUSESS; i++)
+        if (g_us[i].used && g_us[i].lport == port) {
+            cli = g_us[i].cli; hit = 1; break;
+        }
+    DUNLOCK();
+    if (hit) { in->sin_addr = cli.sin_addr; in->sin_port = cli.sin_port; }
+}
 /* LAN_ONLY verdict for an outbound v4 destination: loopback, mesh vnodes
  * and (broadcast/lan) targets the tunnel itself serves are allowed;
  * everything that would reach the physical NIC is a "no route" error. */
@@ -3258,6 +3295,13 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
  * connection to the relay. Returns 1 when consumed, 2 when the
  * socket already has a live stream (WSAEALREADY), else 0 (real stack). */
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
+#ifdef SL_CONNECT_TRACE
+    { char lb[128]; unsigned long a = ntohl(dst->sin_addr.s_addr);
+      snprintf(lb, sizeof(lb), "on_connect gsock=%lld -> %lu.%lu.%lu.%lu:%d type=%d",
+               gsock, (a >> 24) & 255, (a >> 16) & 255, (a >> 8) & 255, a & 255,
+               (int)ntohs(dst->sin_port), dt_sock_type(gsock));
+      dlog(lb); }
+#endif
     if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */
     if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
     if (dt_reject_wire4(dst)) return 3;  /* LAN_ONLY: no route to host */
@@ -3546,6 +3590,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                     if (nb) { errno = EAGAIN; return -1; }
                     continue;  /* LAN_ONLY: no wire world beyond the tunnel */
                 }
+                if (rn > 0 && g_direct) dt_hosted_unsource(sp, (socklen_int_t *)lp);
                 return rn;
             }
             if (nb) { errno = EAGAIN; return -1; }
@@ -4219,6 +4264,8 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags,
                 if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
                 continue;   /* LAN_ONLY: no wire world beyond the tunnel */
             }
+            if (n > 0 && g_direct)
+                dt_hosted_unsource(from, (socklen_int_t *)fromlen);
             return n;
         }
         if (nb) { WSASetLastError(WSAEWOULDBLOCK); return SOCKET_ERROR; }
