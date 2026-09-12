@@ -507,6 +507,36 @@ static int dt_icmp_pend_complete(unsigned id, unsigned seq,
                                  const unsigned char *data, size_t dlen,
                                  unsigned from_virt);
 #endif
+/* TCP ports this process actually listens on. A DT_STREQ must only be
+ * served by the process that owns the game's listener: any sibling that
+ * bridges blindly gets its loopback connection ACCEPTED by the owner's
+ * socket - across processes, so the accepted-socket vnode rewrite (g_hs
+ * lives in the bridging process) is invisible and the game sees the
+ * joiner as 127.0.0.1 again (observed in the field: host read the JOIN,
+ * answered 271KB, still never opened the session). Non-owners now stay
+ * silent; the owner serves; nobody owns -> opener gets the normal
+ * handshake timeout (nothing listens, faithful). */
+#define DT_MAXLISTEN 32
+static int g_lports[DT_MAXLISTEN];
+static void dt_record_listen(int port) {
+    int i, free_i = -1;
+    if (port <= 0) return;
+    DLOCK();
+    for (i = 0; i < DT_MAXLISTEN; i++) {
+        if (g_lports[i] == port) { DUNLOCK(); return; }
+        if (free_i < 0 && g_lports[i] == 0) free_i = i;
+    }
+    if (free_i >= 0) g_lports[free_i] = port;
+    DUNLOCK();
+}
+static int dt_owns_listen(int port) {
+    int i, own = 0;
+    DLOCK();
+    for (i = 0; i < DT_MAXLISTEN; i++)
+        if (g_lports[i] == port) { own = 1; break; }
+    DUNLOCK();
+    return own;
+}
 static int dt_bound_port(long long gsock) {
     struct sockaddr_in a;
 #ifdef LINUX_BUILD
@@ -1818,6 +1848,15 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
 }
 /* Joinee side: serve one inbound stream (DT_STREQ from the control link). */
 static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
+    if (!dt_owns_listen(gport)) {
+        /* this process has no listener on the game port: leave the
+         * stream to the sibling that does (or to timeout if none) */
+        char lb[128];
+        snprintf(lb, sizeof(lb), "hosted req no-listener pid=%u sid=%u port=%d",
+                 (unsigned)current_pid(), sid, gport);
+        dlog(lb);
+        return;
+    }
     DLOCK();
     struct dt_hosted *h = NULL;
     for (int i = 0; i < DT_MAXHOST; i++)
@@ -3679,8 +3718,10 @@ int listen(int s, int backlog) {
     /* game serves a TCP port -> claim designated-host on the relay */
     if (r == 0 && g_direct && dt_sock_type((long long)s) == SOCK_STREAM) {
         struct sockaddr_in a; socklen_t l = sizeof(a);
-        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET)
+        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET) {
+            dt_record_listen(ntohs(a.sin_port));
             dt_claim();
+        }
     }
     return r;
 }
@@ -4584,8 +4625,10 @@ int WSAAPI hk_listen(SOCKET s, int backlog) {
     /* game serves a TCP port -> claim designated-host on the relay */
     if (r == 0 && g_direct && dt_sock_type((long long)s) == SOCK_STREAM) {
         struct sockaddr_in a; int l = sizeof(a);
-        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET)
+        if (getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_family == AF_INET) {
+            dt_record_listen(ntohs(a.sin_port));
             dt_claim();
+        }
     }
     return r;
 }
