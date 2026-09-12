@@ -3525,10 +3525,15 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
  * connection to the relay. Returns 1 when consumed, 2 when the
  * socket already has a live stream (WSAEALREADY), else 0 (real stack). */
 static int dt_is_dial_local(unsigned vnode) {
-    /* true when dialing vnode means "this very machine": our own lease */
+    /* true when the resolved dest NODE is this machine: the dial target
+     * is our own lease, or a sibling process' vnode inside our own
+     * process tree (one node, many links). Either way a LAN stack would
+     * never put this on the wire - complete it through loopback instead
+     * (vnode arrives here as the NODE id from dt_virt_node, so compare
+     * against g_node, NOT the virtual-IP number). */
     int same = 0;
     DLOCK();
-    same = (vnode == g_myvirt && g_myvirt != 0);
+    same = (vnode != 0 && vnode == g_node);
     DUNLOCK();
     return same;
 }
@@ -3549,11 +3554,12 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
     if (ex) return 2;
     unsigned vnode = dt_virt_node(dst->sin_addr.s_addr);
     if (vnode && dt_is_dial_local(vnode)) {
-        /* dial of our OWN machine's virtual address: on a LAN this never
-         * leaves the host - complete it through the kernel loopback so
-         * the local listen backlog serves it like a NIC hairpin (the
-         * relay excludes the opener's own link from fan-out and would
-         * otherwise strand or misroute this connection) */
+        /* dial of our OWN machine (own vnode, or a sibling process'
+         * vnode in the same tree): on a LAN this never leaves the host -
+         * complete it through the kernel loopback so the local listen
+         * backlog serves it like a NIC hairpin. Going through the relay
+         * instead turns it into a ghost self-connection the app then
+         * heartbeats/timeouts against forever. */
         struct sockaddr_in lo = *dst;
         int rr;
         lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
