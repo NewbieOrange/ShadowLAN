@@ -263,6 +263,16 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   (`g_slp_sec`): Wine drops the shared pages of a handle-closed section
   despite live views (Windows docs keep it via views — do not gamble).
   Cross-process `Local\` sections themselves share fine under Wine.
+- `WSASetLastError` is thread state that ANY logging side-effect can
+  overwrite: `dlog` (file/time APIs) between setting an error and
+  returning SOCKET_ERROR handed the app err=2 instead of 10048. hk_bind
+  now has ONE exit label that snapshots the error before logging and
+  re-sets it after. Same idea applies to `errno` around dlog on Linux.
+- UDP port sharing in the ledger is kernel-faithful: `SO_REUSEADDR`
+  must be set on BOTH the holder and the newcomer or the bind collides
+  (Windows and Linux agree here); TCP never shares. The Wine shared-port
+  fixture asserts both halves (reuse+reuse coexists and both receive
+  fan-out; a plain bind against holders gets WSAEADDRINUSE).
 - Test suites must REAP children they kill (`p.kill(); p.wait()`): an
   unreaped SIGKILL'd holder is still "alive" to the ledger and to the
   kernel, so the very next trial legitimately collides with it — this
@@ -350,7 +360,9 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 - Full suite: `make -C hook test` runs the Linux suites IN PARALLEL via
   `runtests.py` (`-j` auto = CPU count; override `make -C hook test J=4`
-  or `SHADOWLAN_TEST_JOBS`). Hard-coded REAL ports and shared /tmp files
+  or `SHADOWLAN_TEST_JOBS`). `make -C hook test-all` is the same
+  parallel pool PLUS the Wine suite (`runtests.py --wine`; test_late
+  overlaps the Linux suites, gets a 900s watchdog). Hard-coded REAL ports and shared /tmp files
   are banned in tests: take them from `testutil.free_port()` /
   `free_ports(n)` / `tmp_path(name)`. Virtual LAN vports (47584-style,
   10.200.x) are per-relay and may stay fixed; wclient proxy binds and
@@ -437,6 +449,16 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   claimed vports. test_bindfidelity guards the whole matrix.
 
 ## Status snapshot (UNRELEASED)
+
+Shared-port fidelity final cut: the ledger's UDP rule is now exactly
+the kernel's (SO_REUSEADDR on both sides), the Wine clash fixture was
+corrected to test the faithful matrix instead of the old alias-around
+behavior (a fixture asserting non-kernel semantics was the blocker, not
+the hook), and hk_bind's single-exit path both restores the debug
+`bind pid=` line the harnesses watch and stops dlog from clobbering
+WSAGetLastError (field-visible class of bug: apps saw err 2 for a
+refused bind). test-all now runs everything - 19 Linux suites + Wine -
+as ONE parallel set: 20/20.
 
 Ledger rc-fixes (field crash cut): rc10 AV'd the game at startup -
 GetProcessTimes faulted writing its create-time out-param (reproducible
