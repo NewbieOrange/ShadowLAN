@@ -53,6 +53,11 @@ class Relay:
     reader from stalling the room's control traffic.
     """
 
+    IMPLICIT_GRACE_S = 0.12  # preferential-claim window for unaddressed
+                             # (ARP-style) streams: bridge-host migration
+                             # must resolve deterministically to the
+                             # freshest host, like ARP resolving a name to
+                             # ONE owner on a real LAN
     BEACON_TTL = 30        # beaconer fallback freshness
     KNOWN_TTL = 120        # known UDP endpoint freshness
     LEARN_TTL = 60         # (src, game_port) -> replier freshness (per-sender sticky)
@@ -453,7 +458,14 @@ class Relay:
             # migration) resolves to the freshest host, and a game's
             # accidental self-port dial still reaches the sibling link
             # that serves it.
-            dest_links = [w for w in self.all_links() if w is not writer]
+            # The opener's whole NODE is excluded: an unaddressed probe
+            # is answered by the other machines (own-machine processes
+            # are reached by dialing their vnode, which resolves to an
+            # EXPLICIT dest above). Without this the caller's own second
+            # link claims its own stream (migration-scenario self-grab).
+            dest_links = [w for w in self.all_links()
+                          if w is not writer
+                          and self.writer_node.get(id(w), -1) != node]
 
             def _pref(w):
                 nid = self.writer_node.get(id(w))
@@ -471,6 +483,7 @@ class Relay:
             dest_node = self.writer_node.get(id(target), 0)
         st = {"opener_node": node, "opener_r": reader, "opener_w": writer,
               "dest_node": dest_node, "gport": gport, "state": "open",
+              "implicit": not dest_node,
               "created": time.monotonic(), "joiner_r": None,
               "joiner_w": None, "task": None,
               "pending": set(dest_links),
@@ -557,6 +570,52 @@ class Relay:
                   f"{st['state']}); dup node {node} -> BUSY", flush=True)
             writer.close()
             return
+        if st.get("implicit"):
+            # preferential-claim grace: multiple bridge hosts may answer
+            # one unaddressed probe; grant to the freshest host-claim
+            # after a short window, BUSY the rest. (Explicit game dials
+            # never wait: dest-vnode claims stay first-come as before.)
+            st.setdefault("claims", []).append((reader, writer, node))
+            if st.get("grant_task") is None:
+                st["grant_task"] = asyncio.create_task(
+                    self._implicit_grant(sid))
+            return
+        await self._grant_claim(st, sid, node, reader, writer)
+
+    async def _implicit_grant(self, sid):
+        st = self.streams.get(sid)
+        if st is None:
+            return
+        try:
+            await asyncio.sleep(self.IMPLICIT_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        st = self.streams.get(sid)
+        if st is None or st["state"] != "open":
+            return
+        claims = st.pop("claims", [])
+        st["grant_task"] = None
+        if not claims:
+            return
+
+        def score(cr):
+            _r, _w, nid = cr
+            ent = self.nodes.get(nid) or {}
+            links = ent.get("links", {})
+            return max([l.get("host_claim", 0.0) for l in links.values()]
+                       or [0.0])
+        claims.sort(key=score, reverse=True)
+        win = claims[0]
+        for _r, w, _n in claims[1:]:
+            try:
+                await tcp_send(w, T_STFAIL, encode_stfail(sid, STF_BUSY))
+            except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
+                pass
+            w.close()
+        await self._grant_claim(st, sid, win[2], win[0], win[1])
+
+    async def _grant_claim(self, st, sid, node, reader, writer):
+        peer = writer.get_extra_info("peername")
         if st["dest_node"] and node != st["dest_node"]:
             try:
                 await tcp_send(writer, T_STFAIL,

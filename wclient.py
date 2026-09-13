@@ -62,6 +62,8 @@ class WinClient:
                  rebroadcast_ip="255.255.255.255", rebroadcast_to=None,
                  disc_bind="0.0.0.0", tcp_remote=None, udp_remote=None,
                  host_mode=False, token=""):
+        # strong refs: fire-and-forget tasks are GC-eligible otherwise
+        self._bg = set()
         self.server_ip = server_ip
         self.port = port
         self.disc_ports = disc_ports
@@ -217,7 +219,7 @@ class WinClient:
                     if len(payload) < 6:
                         continue
                     sid, gport = struct.unpack("!IH", payload[:6])
-                    asyncio.create_task(self.stream_join(sid, gport))
+                    self._spawn(self.stream_join(sid, gport))
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
 
@@ -233,8 +235,8 @@ class WinClient:
                     await dst.drain()
             except (ConnectionResetError, BrokenPipeError, RuntimeError):
                 pass
-        t1 = asyncio.create_task(pump(ra, wb))
-        t2 = asyncio.create_task(pump(rb, wa))
+        t1 = self._spawn(pump(ra, wb))
+        t2 = self._spawn(pump(rb, wa))
         try:
             await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -248,6 +250,14 @@ class WinClient:
                 except Exception:
                     pass
             print(f"[stream] {tag} closed", flush=True)
+
+    def _spawn(self, coro):
+        """create_task + keep a strong ref until done (loop holds only a
+        weak ref; an unreferenced task can be GC'd and die mid-flight)."""
+        t = asyncio.ensure_future(coro)
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+        return t
 
     async def stream_join(self, sid, gport):
         """Joinee side: per-stream TCP to the relay, join, bridge to the
@@ -359,7 +369,7 @@ class WinClient:
         self.udp_tun_proto = QueueProto()
         self.udp_tun, _ = await loop.create_datagram_endpoint(
             lambda: self.udp_tun_proto, sock=tsock)
-        asyncio.create_task(self.udp_tun_read())
+        self._spawn(self.udp_tun_read())
         # local game listeners
         for gport in self.udp_ports:
             try:
@@ -370,7 +380,7 @@ class WinClient:
             proto = QueueProto()
             transport, _ = await loop.create_datagram_endpoint(lambda: proto, sock=lsock)
             self.udp_local[gport] = (transport, proto)
-            asyncio.create_task(self.udp_local_read(gport, transport, proto))
+            self._spawn(self.udp_local_read(gport, transport, proto))
             print(f"[udp] proxy 0.0.0.0:{gport} -> {self.server_ip}:{self.port}", flush=True)
 
     async def udp_local_read(self, gport, _transport, proto):
@@ -440,7 +450,7 @@ class WinClient:
             s.setblocking(False)
             s.bind(("0.0.0.0", 0))
             self.udp_host_socks[key] = s
-            asyncio.create_task(self.udp_host_readloop(key, s, local, loop))
+            self._spawn(self.udp_host_readloop(key, s, local, loop))
         try:
             await loop.sock_sendto(s, raw, ("127.0.0.1", local))
         except OSError:
