@@ -450,6 +450,13 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+rc17 = the A/B outcome: bridge dial reverted to any-proto first-match
+(field-validated rc11/ab2 behavior, deliberate policy now), self-view
+and proto-scoped helpers KEPT. A/B binaries: rc11-abtest and rc16-ab2
+both joined same-box; rc15/16 did not -> single call site was the axis.
+Deploy rc17 for field: identical semantics to rc11-era joins plus all
+crash fixes and the ledger.
+
 rc15 field round (same-box): alias bridge fix verified working end to
 end (271KB lobby + heartbeats crossed byte-exact), but the host game's
 ACCEPTED sockets still leaked the listener's alias real port via
@@ -459,12 +466,22 @@ vport) on both platforms (test_aliasbridge R6b guards the triple).
 The WAN topology can never hit this (no aliasing); only one-machine
 double-node runs do.
 
-Field join fix (same-box): dt_alias_real was vport-first-match, so with
-a node hosting BOTH games on one OS (every bind aliased) the TCP stream
-bridge dialed the UDP alias row (refused -> reason=3, hosted open fail,
-no gbe log). Reverse-maps are proto-scoped (bridge=STREAM, hosted-UDP
-inbound=DGRAM); test_aliasbridge guards the topology, negative-checked.
-Cross-machine runs never exercised it because they never alias.
+Channel policy (settled by A/B after three field rounds): when one OS
+hosts two of our nodes, the HOST game must NOT receive the joiner's
+forward lobby-query on a bridged accept socket - its session library
+then splits per-peer state across the forward channel and its own
+outbound session dial (observed rc15/16: full 271KB served on the
+forward channel, 6B retransmits, host closes, retries RST, no session).
+rc11 'worked' because the proto-blind bridge resolver dialed the datagram
+alias row: the forward channel died bounded (reason=3 / connect-then-EOF
+in ~1s) and the join completed on the host's own outbound dial. ab2
+(rc16 minus the proto-scoped bridge call) reproduced rc11 success; rc17
+ships that as POLICY with the reasoning in code (hk_sess dt_host_bridge)
+and a field-faithful guard (test_aliasbridge: owner node + aliasing node,
+forward must stay dataless+bounded, reverse must echo with the correct
+accept-door triple). dt_alias_real keeps its proto parameter - hosted-UDP
+inbound and every future consumer use it; ONLY the bridge dials -1.
+Cross-machine runs have no alias rows and are untouched either way.
 
 TU refactor (post-split sweep): hk_util.c (clock/log/stamp/sleep/pid/rng),
 hk_alias.c (vport<->real table; slp_release_sock became dt_alias_release_all
