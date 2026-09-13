@@ -302,10 +302,14 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 - Commits split by layer where the history allows (protocol/relay, hook,
   tests, docs). Don't push unless explicitly told; history rewrites of
   pushed commits need `--force-with-lease` (done once, on request).
-- `dist/` holds release/rc packages + user-dropped field logs. Packages:
-  linux `.tar.gz` (lan_hook.so + py + docs, hook README as
-  HOOK_README.md) and windows `.zip` (+ both DLLs + injector). Old rc
-  packages are wire-INCOMPATIBLE (ops renumbered) — offer to delete.
+- `dist/` holds release/rc packages + user-dropped field logs. Build
+  them ONLY with `./pack.sh` (stamp both versions, rebuild the three
+  hook binaries, then run it): explicit per-package file lists + a
+  leakage guard stop the Windows `.zip` ever carrying `lan_hook.so` or
+  the linux `.tar.gz` the DLLs. Packages: linux `.tar.gz` (lan_hook.so
+  + py + docs, hook README as HOOK_README.md) and windows `.zip` (+
+  both DLLs + injector). Old rc packages are wire-INCOMPATIBLE (ops
+  renumbered) — offer to delete.
 
 ## Debugging the test harness itself (meta-lessons)
 
