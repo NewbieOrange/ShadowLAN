@@ -44,7 +44,10 @@ T_STREQ = 0x08    # relay->dest (control TCP): !I sid + !H gport + !I opener_vir
 T_STJOIN = 0x09   # dest->relay (per-stream TCP): !I node + !I sid
 T_STJOINED = 0x0A # dest->relay (per-stream TCP, local bridge up): !I sid
 T_STOK = 0x0B     # relay->opener / relay->joinee (claim): !I sid
-T_STFAIL = 0x0C   # relay->opener/joinee or dest->relay: !I sid + !B reason
+T_STFAIL = 0x0C
+T_STSHUT = 0x0D   # half-close: sender flushed, its write side is done
+                    # (relay: write_eof the peer's transport; both
+                    # halves EOF -> the stream retires)   # relay->opener/joinee or dest->relay: !I sid + !B reason
 STF_NO_ROUTE = 1  # destination node unknown / not connected / no host for port
 STF_JOIN_TIMEOUT = 2  # destination never joined in time
 STF_HOST_FAILED = 3  # destination could not reach its local game

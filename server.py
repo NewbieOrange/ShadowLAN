@@ -41,7 +41,7 @@ from common import (
     encode_stjoin, decode_stjoin, encode_stsid, decode_stsid,
     encode_stfail, decode_stfail,
     ip_to_int, int_to_ip, parse_ports, tcp_read, tcp_send,
-    ST_TIMEOUT_S,
+    ST_TIMEOUT_S, T_STSHUT,
 )
 
 
@@ -570,6 +570,12 @@ class Relay:
             return
         st["joiner_r"], st["joiner_w"] = reader, writer
         st["state"] = "joined"   # claim: further joiners get BUSY
+        if st.get("shut_from") == "opener":
+            st["shut_from"] = None
+            try:
+                writer.write_eof()
+            except Exception:
+                pass
         # immediate claim verdict on the joiner's own connection: losers
         # stand down before bridging, the winner proceeds knowingly
         try:
@@ -766,6 +772,28 @@ class Relay:
                             self.tcp_fallback.setdefault(
                                 ("tcp", owner), writer)
                         await self.handle_udp_payload(payload, addr)
+                elif mtype == T_STSHUT:
+                    # one endpoint half-closed its writes (kernel FIN on
+                    # shutdown(SHUT_WR) / after flush-close): EOF the
+                    # peer's read side, keep the reverse direction alive
+                    if len(payload) >= 4:
+                        sid2 = struct.unpack("!I", payload[:4])[0]
+                        st2 = self.streams.get(sid2)
+                        if st2 is not None:
+                            snode = self.writer_node.get(owner)
+                            if snode == st2.get("opener_node"):
+                                if st2.get("joiner_w") is None:
+                                    st2["shut_from"] = "opener"
+                                else:
+                                    try:
+                                        st2["joiner_w"].write_eof()
+                                    except Exception:
+                                        pass
+                            elif st2.get("dest_node") and snode == st2.get("dest_node"):
+                                try:
+                                    st2["opener_w"].write_eof()
+                                except Exception:
+                                    pass
                 elif mtype == T_BCAST:
                     if len(payload) >= 4:
                         (dport, sport) = struct.unpack("!HH", payload[:4])
