@@ -15,6 +15,7 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from testutil import free_port as _free_port, tmp_path as _tmp_path, relay_up as _relay_up
 PUB = _free_port()
+_NODE0 = 100000 + (os.getpid() * 31 + sum(map(ord, os.path.basename(__file__)))) % 700000
 HOOK = "/root/my_vnet/hook/lan_hook.so"
 
 SHELL_A = r'''
@@ -152,11 +153,16 @@ def run(mode, nA, nB):
         pass
     relay.kill()
     pa.kill(); pb.kill()
+    for q in (pa, pb, relay):
+        try:
+            q.wait(timeout=5)
+        except Exception:
+            pass
     time.sleep(0.3)   # let the reader threads drain final flushed lines
     return oa, ob
 
 ok = True
-oa, ob = run("stall", 440101, 440102)
+oa, ob = run("stall", _NODE0 + 1, _NODE0 + 2)
 b_rx = next((l for l in ob if l.startswith("B_RX_DONE")), "")
 a_read = next((l for l in oa if l.startswith("A_READS_START")), "t=999")
 bt = float(b_rx.split("t=")[1].split()[0]) if "t=" in b_rx else 999
@@ -165,12 +171,12 @@ s1 = "A_MARKER_OK" in " ".join(oa) and "total=262144" in b_rx and bt < at
 print(f"[1 stall-independence] B_done={bt:.2f} < A_reads={at:.2f}: {'OK' if s1 else 'FAIL'} {oa} {ob}")
 ok &= s1
 
-oa, ob = run("closeflush", 440103, 440104)
+oa, ob = run("closeflush", _NODE0 + 3, _NODE0 + 4)
 s2 = "A_GOT 200000" in " ".join(oa)
 print(f"[2 close-flush] {'OK' if s2 else 'FAIL'} {oa}")
 ok &= s2
 
-oa, ob = run("halfclose", 440105, 440106)
+oa, ob = run("halfclose", _NODE0 + 5, _NODE0 + 6)
 s3 = ("A_BACK_OK" in " ".join(oa)) and ("B_SAW_EOF" in " ".join(ob))
 print(f"[3 half-close] {'OK' if s3 else 'FAIL'} {oa} {ob}")
 ok &= s3

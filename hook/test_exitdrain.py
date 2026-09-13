@@ -8,6 +8,7 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from testutil import free_port as _free_port, tmp_path as _tmp_path
 PUB = _free_port()
+_NODE0 = 100000 + (os.getpid() * 31 + sum(map(ord, os.path.basename(__file__)))) % 700000
 HOOK = "/root/my_vnet/hook/lan_hook.so"
 N = 200000
 
@@ -59,12 +60,12 @@ def env(node):
 
 results = []
 for trial in range(5):
-    pa = subprocess.Popen([sys.executable, "-c", server_py], env=env(550001),
+    pa = subprocess.Popen([sys.executable, "-c", server_py], env=env(_NODE0 + 1),
                           stdout=subprocess.PIPE, text=True)
     assert pa.stdout.readline().startswith("LISTENING")
     time.sleep(0.4)
     pb = subprocess.Popen([sys.executable, "-c", client_py, str(N)],
-                          env=env(550002), stdout=subprocess.DEVNULL)
+                          env=env(_NODE0 + 2), stdout=subprocess.DEVNULL)
     got = None
     t0 = time.time()
     while time.time() - t0 < 25:
@@ -74,6 +75,8 @@ for trial in range(5):
             got = int(l.split()[1]); break
     pb.wait(timeout=5)
     pa.kill()
+    pa.wait()          # REAP: the next trial's ledger takeover needs
+                       # the holder gone, not merely signalled
     results.append(got)
     print(f"trial {trial}: server got {got}/{N}", flush=True)
 relay.kill()

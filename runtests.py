@@ -46,10 +46,16 @@ def main():
     def _once(path):
         try:
             p = subprocess.run([sys.executable, path], cwd=os.path.dirname(path),
-                               capture_output=True, text=True, timeout=400)
+                               capture_output=True, text=True, timeout=400,
+                               start_new_session=True)
             out = p.stdout + p.stderr
             return bool(MARK.search(out)) and p.returncode == 0, out
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as te:
+            try:  # kill the suite AND its hooked children (orphaned
+                  # holders poison later runs' node ledgers)
+                os.killpg(os.getpgid(te.process.pid), 9)
+            except Exception:
+                pass
             return False, "TIMEOUT"
 
     def run(path):
