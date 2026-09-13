@@ -415,8 +415,7 @@ LAN differs only in per-hop timing), not tunnel stalls. If a field run
 still starves a JOIN budget, the new unthrottled logs show exactly
 which hop paced.
 
-Relay `986b711` + `3a9e95c`, hook `6993b15` + `b8ffbf3` (unpushed at cut
-time): designated-host election RETIRED (ARP-style implicit fan-out,
+Unpushed relay + hook layer commits: designated-host election RETIRED (ARP-style implicit fan-out,
 claim resolves; NODE_F_HOST = ordering stamp only); UDP-over-TCP links
 addressable via ("tcp",writer) identity in node_udp_addrs/udp_targets/
 udp_sendto (fixes the field `pdat drop (no-udp-endpoint)` = "lobby
