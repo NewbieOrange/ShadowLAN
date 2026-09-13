@@ -2250,6 +2250,14 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
      * sends so a slow local game backpressures the relay like a kernel
      * would, and vice versa). */
     unsigned char buf[65536];
+    /* game->relay hold slot: the relay conn is nonblocking, so bytes it
+     * cannot take right now must be kept and retried, and the game
+     * socket left unread until they are gone - the same order and
+     * backpressure a kernel send buffer gives on a real LAN. Dropping
+     * them on WSAEWOULDBLOCK corrupts the stream mid-message, which
+     * strands the peer's parser until some later write pushes the
+     * remainder out. */
+    size_t pend_n = 0, pend_o = 0;
     size_t in0 = 0, out0 = 0;
     DTSOCK real = DTSOCK_BAD;
     DLOCK();
@@ -2264,15 +2272,51 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         int dead = h ? h->dead : 1;
         DUNLOCK();
         if (dead) break;
-        fd_set rf;
-        FD_ZERO(&rf);
+        fd_set rf, wf;
+        FD_ZERO(&rf); FD_ZERO(&wf);
 #ifdef LINUX_BUILD
         FD_SET((int)fd, &rf);
         FD_SET((int)real, &rf);
+        if (pend_n > pend_o) FD_SET((int)fd, &wf);
         int mx = (int)fd > (int)real ? (int)fd : (int)real;
         struct timeval tv = { 0, 25000 };
-        int sr = select(mx + 1, &rf, NULL, NULL, &tv);
+        int sr = select(mx + 1, &rf, pend_n > pend_o ? &wf : NULL, NULL, &tv);
         if (sr <= 0) continue;
+#else
+        FD_SET(fd, &rf);
+        FD_SET(real, &rf);
+        if (pend_n > pend_o) FD_SET(fd, &wf);
+        struct timeval tv = { 0, 25000 };
+        int sr = select(0, &rf, pend_n > pend_o ? &wf : NULL, NULL, &tv);
+        if (sr <= 0) continue;
+#endif
+        /* drain pending first (and only then read more from the game) */
+#ifdef LINUX_BUILD
+        if (pend_n > pend_o && FD_ISSET((int)fd, &wf)) {
+            errno = 0;
+            ssize_t k = r_send(fd, buf + pend_o, pend_n - pend_o, 0);
+            if (k > 0) { pend_o += (size_t)k;
+                if (pend_o >= pend_n) pend_n = pend_o = 0; }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+        }
+        if (FD_ISSET((int)real, &rf) && pend_n == pend_o) {
+            errno = 0;
+            ssize_t n = r_recv(real, (char *)buf, (int)sizeof(buf), 0);
+            if (n <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                char lb[96];
+                snprintf(lb, sizeof(lb), "hosted pipe: game n=%zd err=%d",
+                         n, errno);
+                dlog(lb);
+                break;
+            }
+            out0 += (size_t)n;
+            { char lb[112];
+              snprintf(lb, sizeof(lb), "hs out sid=%u n=%zd tot=%llu",
+                       sid, n, (unsigned long long)out0); dlog(lb); }
+            pend_n = (size_t)n; pend_o = 0;
+            continue;   /* select() will report writability to flush it */
+        }
         if (FD_ISSET((int)fd, &rf)) {
             errno = 0;
             ssize_t n = r_recv(fd, buf, sizeof(buf), 0);
@@ -2286,9 +2330,9 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                 break;
             }
             in0 += (size_t)n;
-            if (n >= 4096) { char lb[112];
-                snprintf(lb, sizeof(lb), "hs in sid=%u n=%zd tot=%llu",
-                         sid, n, (unsigned long long)in0); dlog(lb); }
+            { char lb[112];
+              snprintf(lb, sizeof(lb), "hs in sid=%u n=%zd tot=%llu",
+                       sid, n, (unsigned long long)in0); dlog(lb); }
             const unsigned char *p = buf;
             while ((size_t)n > 0) {
                 ssize_t k = r_send(real, p, (size_t)n, 0);
@@ -2296,54 +2340,39 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                 p += (size_t)k; n -= (size_t)k;
             }
         }
-        if (FD_ISSET((int)real, &rf)) {
-            errno = 0;
-            ssize_t n = r_recv(real, buf, sizeof(buf), 0);
+#else
+        if (pend_n > pend_o && FD_ISSET(fd, &wf)) {
+            int k = send(fd, (const char *)buf + pend_o, (int)(pend_n - pend_o), 0);
+            if (k > 0) { pend_o += (size_t)k;
+                if (pend_o >= pend_n) pend_n = pend_o = 0; }
+            else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+        }
+        if (FD_ISSET(real, &rf) && pend_n == pend_o) {
+            int n = recv(real, (char *)buf, (int)sizeof(buf), 0);
             if (n <= 0) {
                 char lb[96];
-                snprintf(lb, sizeof(lb), "hosted pipe: game n=%zd err=%d",
-                         n, errno);
+                snprintf(lb, sizeof(lb), "hosted pipe: game n=%d err=%d",
+                         n, WSAGetLastError());
                 dlog(lb);
                 break;
             }
             out0 += (size_t)n;
-            if (n >= 4096) { char lb[112];
-                snprintf(lb, sizeof(lb), "hs out sid=%u n=%zd tot=%llu",
-                         sid, n, (unsigned long long)out0); dlog(lb); }
-            const unsigned char *p = buf;
-            while ((size_t)n > 0) {
-                ssize_t k = r_send(fd, p, (size_t)n, 0);
-                if (k <= 0) { if (errno == EINTR) continue; break; }
-                p += (size_t)k; n -= (size_t)k;
-            }
+            { char lb[112];
+              snprintf(lb, sizeof(lb), "hs out sid=%u n=%d tot=%llu",
+                       sid, n, (unsigned long long)out0); dlog(lb); }
+            pend_n = (size_t)n; pend_o = 0;
+            continue;
         }
-#else
-        FD_SET(fd, &rf);
-        FD_SET(real, &rf);
-        struct timeval tv = { 0, 25000 };
-        int sr = select(0, &rf, NULL, NULL, &tv);
-        if (sr <= 0) continue;
         if (FD_ISSET(fd, &rf)) {
             int n = recv(fd, (char *)buf, (int)sizeof(buf), 0);
             if (n <= 0) break;
             in0 += (size_t)n;
+            { char lb[112];
+              snprintf(lb, sizeof(lb), "hs in sid=%u n=%d tot=%llu",
+                       sid, n, (unsigned long long)in0); dlog(lb); }
             const char *p = (const char *)buf;
             while (n > 0) {
                 int k = send(real, p, n, 0);
-                if (k <= 0) break;
-                p += k; n -= k;
-            }
-        }
-        if (FD_ISSET(real, &rf)) {
-            int n = recv(real, (char *)buf, (int)sizeof(buf), 0);
-            if (n <= 0) break;
-            out0 += (size_t)n;
-            if (n >= 4096) { char lb[112];
-                snprintf(lb, sizeof(lb), "hs out sid=%u n=%d tot=%llu",
-                         sid, n, (unsigned long long)out0); dlog(lb); }
-            const char *p = (const char *)buf;
-            while (n > 0) {
-                int k = send(fd, p, n, 0);
                 if (k <= 0) break;
                 p += k; n -= k;
             }
