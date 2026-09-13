@@ -681,6 +681,16 @@ class Relay:
     # ---- control connection -------------------------------------------------
     async def accept_conn(self, reader, writer):
         peer = writer.get_extra_info("peername")
+        # Match the hooks' enlarged, Nagle-free tunnels: big buffers on
+        # both ends keep bulk transfers flowing without window stalls.
+        try:
+            _ts = writer.get_extra_info("socket")
+            if _ts is not None:
+                _ts.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                _ts.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
+                _ts.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        except OSError:
+            pass
         try:
             mtype, payload = await asyncio.wait_for(
                 tcp_read(reader), timeout=ST_TIMEOUT_S)
