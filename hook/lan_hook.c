@@ -33,6 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/file.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #else
@@ -564,13 +567,20 @@ static int g_lports[DT_MAXLISTEN];
  * loopback bridges all keep speaking the app's virtual port. Kernel
  * fidelity, not a trick: two real LAN hosts never see each other's
  * EADDRINUSE. */
-static struct { long long sock; int vport; int real; } g_ta[64];
-static void dt_alias_add(long long sock, int vport, int real) {
+static struct { long long sock; int vport; int real;
+                  unsigned char proto; unsigned char bindv; } g_ta[64];
+static void dt_alias_add(long long sock, int vport, int real, int proto) {
     int i;
     for (i = 0; i < 64; i++)
-        if (g_ta[i].sock == sock) { g_ta[i].vport = vport; g_ta[i].real = real; return; }
+        if (g_ta[i].sock == sock) {
+            g_ta[i].vport = vport; g_ta[i].real = real;
+            g_ta[i].proto = (unsigned char)proto; return;
+        }
     for (i = 0; i < 64; i++)
-        if (!g_ta[i].sock) { g_ta[i].sock = sock; g_ta[i].vport = vport; g_ta[i].real = real; return; }
+        if (!g_ta[i].sock) {
+            g_ta[i].sock = sock; g_ta[i].vport = vport; g_ta[i].real = real;
+            g_ta[i].proto = (unsigned char)proto; return;
+        }
 }
 /* -1 when the socket binds its port for real */
 static int dt_alias_vport(long long sock) {
@@ -586,10 +596,233 @@ static int dt_alias_real(int vport) {
         if (g_ta[i].vport == vport && g_ta[i].real > 0) return g_ta[i].real;
     return 0;
 }
+static void dt_alias_bindv(long long sock) {
+    int i;
+    for (i = 0; i < 64; i++)
+        if (g_ta[i].sock == sock) { g_ta[i].bindv = 1; return; }
+}
+static int dt_alias_is_bindv(long long sock) {
+    int i;
+    for (i = 0; i < 64; i++)
+        if (g_ta[i].sock == sock) return g_ta[i].bindv;
+    return 0;
+}
 static void dt_alias_drop(long long sock) {
     int i;
     for (i = 0; i < 64; i++)
         if (g_ta[i].sock == sock) { g_ta[i].sock = 0; g_ta[i].vport = g_ta[i].real = 0; }
+}
+/* ---- node-scoped shared port ledger ----
+ * A NODE (process tree) is ONE emulated machine: its processes share a
+ * real kernel, which already arbitrates REAL ports - but the aliasing
+ * above lets two same-node processes each claim the same VIRTUAL port,
+ * something no real machine allows. The ledger records each node's
+ * vport claims in shared memory so same-node binds collide exactly
+ * like the kernel would collide them, while other nodes on this OS
+ * (separate emulated machines) stay invisible to each other.
+ * Windows: Local\ pagefile-backed CreateFileMapping (kernel holds it
+ * until the last process closes it); Linux: shm_open + flock. Any
+ * failure degrades silently to the previous per-process behavior. */
+#define SLP_MAGIC 0x534c5032u
+#define SLP_MAX 192
+typedef struct { unsigned int pid; unsigned int _pad0;
+                 unsigned long long start;
+                 int vport; int real;
+                 unsigned char proto; unsigned char reuse;
+                 unsigned char used; unsigned char pad; } slp_ent;
+typedef struct { unsigned int magic; unsigned int gen; slp_ent e[SLP_MAX]; } slp_t;
+
+#ifdef LINUX_BUILD
+static int g_slp_fd = -1;
+static slp_t *g_slp = 0;
+static int slp_attach(void) {
+    char nm[64];
+    if (g_slp) return 1;
+    if (!g_node) return 0;
+    snprintf(nm, sizeof nm, "/slp-%08x", (unsigned)g_node);
+    int fd = shm_open(nm, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return 0;
+    if (ftruncate(fd, (off_t)sizeof(slp_t)) != 0) { close(fd); return 0; }
+    void *p = mmap(0, sizeof(slp_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return 0; }
+    g_slp_fd = fd; g_slp = (slp_t *)p;
+    if (g_slp->magic != SLP_MAGIC) {
+        g_slp->magic = SLP_MAGIC; g_slp->gen = 0;
+        memset(g_slp->e, 0, sizeof g_slp->e);
+    }
+    return 1;
+}
+#define SLP_LOCK()   do { if (g_slp_fd >= 0) flock(g_slp_fd, LOCK_EX); } while (0)
+#define SLP_UNLOCK() do { if (g_slp_fd >= 0) flock(g_slp_fd, LOCK_UN); } while (0)
+#else
+static HANDLE g_slp_mx = 0;
+static slp_t *g_slp = 0;
+static int slp_attach(void) {
+    char nm[96], mx[96];
+    if (g_slp) return 1;
+    if (!g_node) return 0;
+    snprintf(nm, sizeof nm, "Local\\ShadowLAN-ports-%08x", (unsigned)g_node);
+    snprintf(mx, sizeof mx, "Local\\ShadowLAN-portlk-%08x", (unsigned)g_node);
+    HANDLE m = CreateMutexA(NULL, FALSE, mx);
+    if (!m) return 0;
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                  0, sizeof(slp_t), nm);
+    if (!h) { CloseHandle(m); return 0; }
+    int fresh = (GetLastError() != ERROR_ALREADY_EXISTS);
+    void *p = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, sizeof(slp_t));
+    CloseHandle(h);   /* mapping lives as long as any process holds it */
+    if (!p) { CloseHandle(m); return 0; }
+    g_slp_mx = m; g_slp = (slp_t *)p;
+    WaitForSingleObject(g_slp_mx, INFINITE);
+    if (fresh || g_slp->magic != SLP_MAGIC) {
+        g_slp->magic = SLP_MAGIC; g_slp->gen = 0;
+        memset(g_slp->e, 0, sizeof g_slp->e);
+    }
+    ReleaseMutex(g_slp_mx);
+    return 1;
+}
+#define SLP_LOCK()   do { if (g_slp_mx) WaitForSingleObject(g_slp_mx, INFINITE); } while (0)
+#define SLP_UNLOCK() do { if (g_slp_mx) ReleaseMutex(g_slp_mx); } while (0)
+#endif
+
+/* pid alone cannot prove identity (reuse): stamp the holder's process
+ * start time beside it. */
+#ifdef LINUX_BUILD
+static unsigned long long slp_starttime(unsigned pid) {
+    char path[64], buf[2048];
+    FILE *f;
+    char *p, *tok;
+    unsigned long long v = 0;
+    int idx = 0;
+    snprintf(path, sizeof path, "/proc/%u/stat", pid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(buf, sizeof buf, f)) { fclose(f); return 0; }
+    fclose(f);
+    p = strrchr(buf, ')');
+    if (!p) return 0;
+    p++;
+    /* field 22 overall; after the ')' we are at field 3 -> +20 tokens */
+    tok = strtok(p, " ");
+    while (tok && ++idx < 20) tok = strtok(NULL, " ");
+    if (tok) v = strtoull(tok, 0, 10);
+    return v;
+}
+static int slp_alive(unsigned pid, unsigned long long start) {
+    unsigned long long now;
+    if (!pid) return 0;
+    if (kill(pid, 0) != 0 && errno != EPERM) return 0;
+    if (!start) return 1;
+    now = slp_starttime(pid);
+    return now != 0 && now == start;
+}
+static unsigned long long slp_self_start(void) {
+    return slp_starttime((unsigned)current_pid());
+}
+#else
+static unsigned long long slp_starttime(unsigned pid) {
+    HANDLE h; FILETIME ct; unsigned long long v = 0;
+    if (!pid) return 0;
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    if (GetProcessTimes(h, &ct, 0, 0, 0))
+        v = ((unsigned long long)ct.dwHighDateTime << 32) | ct.dwLowDateTime;
+    CloseHandle(h);
+    return v;
+}
+static int slp_alive(unsigned pid, unsigned long long start) {
+    unsigned long long now;
+    if (!pid) return 0;
+    now = slp_starttime(pid);
+    if (!now) return 0;              /* gone or unqueryable: reap-able */
+    return !start || now == start;
+}
+static unsigned long long slp_self_start(void) {
+    return slp_starttime((unsigned)GetCurrentProcessId());
+}
+#endif
+/* claim vport for THIS process. 0/1 = ok (1 = shared), -1 = conflict,
+ * -2 = no ledger available. Dead holders' claims are taken over. */
+static int slp_claim(int vport, int proto, int reuse, int real) {
+    int rc;
+    if (!slp_attach()) return -2;      /* no ledger: caller decides */
+    SLP_LOCK();
+    rc = -2;
+    {
+        int i, found = -1;
+        for (i = 0; i < SLP_MAX; i++) {
+            slp_ent *x = &g_slp->e[i];
+            if (x->used && x->vport == vport && x->proto == (unsigned char)proto) {
+                found = i; break;
+            }
+        }
+        if (found >= 0) {
+            slp_ent *x = &g_slp->e[found];
+            if (!slp_alive(x->pid, x->start)) { /* stale claim: take over */
+                x->pid = (unsigned)current_pid(); x->real = real;
+                x->start = slp_self_start();
+                x->reuse = (unsigned char)reuse; rc = 0;
+            } else if (proto == SOCK_DGRAM && x->reuse && reuse) { rc = 1; }
+            else rc = -1;                       /* kernel would collide */
+        } else {
+            for (i = 0; i < SLP_MAX; i++)
+                if (!g_slp->e[i].used) break;
+            if (i < SLP_MAX) {
+                slp_ent *x = &g_slp->e[i];
+                x->used = 1; x->pid = (unsigned)current_pid();
+                x->start = slp_self_start();
+                x->vport = vport; x->real = real;
+                x->proto = (unsigned char)proto; x->reuse = (unsigned char)reuse;
+                g_slp->gen++;
+                rc = 0;
+            }
+        }
+    }
+    SLP_UNLOCK();
+    return rc;
+}
+static void slp_release(int vport, int proto) {
+    if (!g_slp) return;
+    SLP_LOCK();
+    {
+        int i;
+        for (i = 0; i < SLP_MAX; i++) {
+            slp_ent *x = &g_slp->e[i];
+            if (x->used && x->vport == vport && x->proto == (unsigned char)proto
+                && x->pid == (unsigned)current_pid()) {
+                x->used = 0; g_slp->gen++;
+            }
+        }
+    }
+    SLP_UNLOCK();
+}
+/* any-proto claim check for bind(0) port selection */
+static int slp_used(void) {
+    int n = 0;
+    if (!g_slp) return 0;
+    SLP_LOCK();
+    { int i; for (i = 0; i < SLP_MAX; i++) if (g_slp->e[i].used) n++; }
+    SLP_UNLOCK();
+    return n;
+}
+static int slp_taken(int vport) {
+    int t = 0;
+    if (!g_slp) return 0;
+    SLP_LOCK();
+    {
+        int i;
+        for (i = 0; i < SLP_MAX; i++)
+            if (g_slp->e[i].used && g_slp->e[i].vport == vport) { t = 1; break; }
+    }
+    SLP_UNLOCK();
+    return t;
+}
+/* release whatever this socket claimed (called from close) */
+static void slp_release_sock(long long sock) {
+    int i;
+    for (i = 0; i < 64; i++)
+        if (g_ta[i].sock == sock && g_ta[i].vport > 0)
+            slp_release(g_ta[i].vport, g_ta[i].proto);
 }
 static void dt_record_listen(int port) {
     int i, free_i = -1;
@@ -680,6 +913,7 @@ static ssize_t (*r_send)(int, const void *, size_t, int);
 static ssize_t (*r_recv)(int, void *, size_t, int);
 static ssize_t (*r_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
 static int (*r_close)(int);
+static int (*r_bind)(int, const struct sockaddr *, socklen_t);
 static int (*r_connect)(int, const struct sockaddr *, socklen_t);
 #endif
 
@@ -1013,7 +1247,7 @@ static int dt_bind_alias(long long s, const struct sockaddr_in *want,
         if (getsockname((SOCKET)s, (struct sockaddr *)&got, &gl) == 0) rp = ntohs(got.sin_port);
 #endif
         DLOCK();
-        dt_alias_add(s, wp, rp);
+        dt_alias_add(s, wp, rp, is_dgram ? SOCK_DGRAM : SOCK_STREAM);
         if (is_dgram) {
             struct dt_udp *e = dt_udp_entry(s, 1);
             if (e) e->vport = wp;
@@ -1566,6 +1800,7 @@ static void dt_reals(void) {
     if (!r_recv) r_recv = dlsym(RTLD_NEXT, "recv");
     if (!r_sendto) r_sendto = dlsym(RTLD_NEXT, "sendto");
     if (!r_close) r_close = dlsym(RTLD_NEXT, "close");
+    if (!r_bind) r_bind = dlsym(RTLD_NEXT, "bind");
 }
 static int dt_send_all(int s, const unsigned char *b, size_t n) {
     dt_reals();
@@ -3201,12 +3436,13 @@ static void dt_start(void) {
      * within microseconds of the first intercepted call, before a
      * background thread would get scheduled. */
 #ifdef LINUX_BUILD
+    dt_reals();
     {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         if (s >= 0) {
             struct sockaddr_in b; memset(&b, 0, sizeof(b));
             b.sin_family = AF_INET; b.sin_addr.s_addr = htonl(INADDR_ANY); b.sin_port = 0;
-            if (bind(s, (struct sockaddr *)&b, sizeof(b)) != 0) { close(s); }
+            if (r_bind(s, (struct sockaddr *)&b, sizeof(b)) != 0) { close(s); }
             else {
                 g_udptun = s;
                 g_tun_conn = 0;
@@ -4249,6 +4485,7 @@ static void dt_on_close(long long gsock) {
         struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
+    slp_release_sock(gsock);
     dt_alias_drop(gsock);
     dt_sig_locked(gsock); /* wake event waiters with CLOSE (noop on Linux) */
 #ifndef LINUX_BUILD
@@ -4452,30 +4689,129 @@ int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
 }
 int bind(int s, const struct sockaddr *a, socklen_t l) {
     static int (*real_bind)(int, const struct sockaddr *, socklen_t) = 0;
+    static int (*real_gsn)(int, struct sockaddr *, socklen_t *) = 0;
     ensure_init();
     if (!real_bind) real_bind = (int (*)(int, const struct sockaddr *, socklen_t))
         dlsym(RTLD_NEXT, "bind");
-    if (g_direct && a && a->sa_family == AF_INET) {
+    if (!real_gsn) real_gsn = (int (*)(int, struct sockaddr *, socklen_t *))
+        dlsym(RTLD_NEXT, "getsockname");
+    if (g_direct && a && a->sa_family == AF_INET &&
+        l >= (socklen_t)sizeof(struct sockaddr_in)) {
         struct sockaddr_in in = *(const struct sockaddr_in *)a;
         unsigned myv = 0;
         DLOCK(); myv = g_myvirt; DUNLOCK();
-        if (myv && in.sin_addr.s_addr == htonl(myv))
-            in.sin_addr.s_addr = htonl(INADDR_ANY);  /* vnode bind -> ANY */
-        int r = real_bind(s, (struct sockaddr *)&in, l);
-        if (r != 0 && errno == EADDRINUSE && in.sin_port != 0) {
-            int dg = dt_sock_type((long long)s) == SOCK_DGRAM;
-            if (dt_bind_alias((long long)s, &in, dg, real_bind) == 0) return 0;
-            errno = EADDRINUSE;
-        } else if (r == 0 && in.sin_addr.s_addr == htonl(INADDR_ANY)
-                   && ((const struct sockaddr_in *)a)->sin_addr.s_addr
-                          == htonl(myv) && myv) {
-            DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
+        int bindv = (myv && in.sin_addr.s_addr == htonl(myv));
+        int proto = dt_sock_type((long long)s);
+        if (proto < 0) proto = SOCK_STREAM;
+        int reuse = 0;
+        { int ra = 0; socklen_t rl = sizeof(ra);
+          if (getsockopt(s, SOL_SOCKET, SO_REUSEADDR, &ra, &rl) == 0) reuse = ra; }
+        if (bindv) in.sin_addr.s_addr = htonl(INADDR_ANY);
+        int want = ntohs(in.sin_port);
+        int r;
+        if (want != 0) {
+            /* vnet (node-scoped) space first: a sibling process of THIS
+             * machine may not take a port another of its processes
+             * serves - kernel rule, enforced across the aliasing */
+            int rv = slp_claim(want, proto, reuse, want);
+            if (rv == -1) { errno = EADDRINUSE; return -1; }
+            r = real_bind(s, (struct sockaddr *)&in, l);
+            if (r != 0 && errno == EADDRINUSE) {
+                /* the REAL port belongs to another NODE here: two LAN
+                 * machines on one OS - alias beneath, vport stays ours */
+                if (dt_bind_alias((long long)s, &in, proto == SOCK_DGRAM,
+                                  real_bind) == 0) {
+                    if (bindv) dt_alias_bindv((long long)s);
+                    if (proto == SOCK_DGRAM) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+                    return 0;
+                }
+                slp_release(want, proto);
+                errno = EADDRINUSE;
+                return -1;
+            }
+            if (r == 0) {
+                DLOCK();
+                dt_alias_add((long long)s, want, want, proto);
+                if (bindv && proto == SOCK_DGRAM) dt_udp_entry((long long)s, 1);
+                DUNLOCK();
+                if (bindv) dt_alias_bindv((long long)s);
+            } else {
+                slp_release(want, proto);
+            }
+            return r;
+        }
+        /* bind(0): with the NIC gone the virtual port is the machine's
+         * port - pick one free in the node ledger (and, for LAN_ONLY=0,
+         * acceptable to the real stack too). */
+        if (g_lan_only || slp_used() > 0) {
+            int i, base = 49152 + (int)(current_pid() % 4096);
+            for (i = 0; i < 4096; i++) {
+                int p0 = 49152 + ((base - 49152 + i) % 16383);
+                if (slp_taken(p0)) continue;
+                if (slp_claim(p0, proto, 1, 0) == -1) continue;
+                struct sockaddr_in trya = in;
+                trya.sin_port = htons((unsigned short)p0);
+                r = real_bind(s, (struct sockaddr *)&trya, l);
+                if (r == 0) {
+                    DLOCK();
+                    dt_alias_add((long long)s, p0, p0, proto);
+                    if (proto == SOCK_DGRAM) {
+                        struct dt_udp *e = dt_udp_entry((long long)s, 1);
+                        if (e) e->vport = p0;
+                    }
+                    DUNLOCK();
+                    if (bindv) dt_alias_bindv((long long)s);
+                    return 0;
+                }
+                slp_release(p0, proto);
+                if (errno != EADDRINUSE) break;
+            }
+            in.sin_port = 0;   /* fall through to the plain path */
+        }
+        in.sin_port = 0;
+        r = real_bind(s, (struct sockaddr *)&in, l);
+        if (r == 0) {
+            struct sockaddr_in got; socklen_t gl = sizeof(got);
+            if (real_gsn(s, (struct sockaddr *)&got, &gl) == 0) {
+                int p0 = ntohs(got.sin_port);
+                slp_claim(p0, proto, reuse, p0);
+                DLOCK();
+                dt_alias_add((long long)s, p0, p0, proto);
+                if (bindv && proto == SOCK_DGRAM) dt_udp_entry((long long)s, 1);
+                DUNLOCK();
+                if (bindv) dt_alias_bindv((long long)s);
+            }
         }
         return r;
     }
     return real_bind(s, a, l);
 }
 int connect(int s, const struct sockaddr *a, socklen_t l) { return my_connect_hook(s, a, l); }
+/* present the machine's own view: aliased/virtual ports and the vnode
+ * the app bound (a bound socket never leaks the ephemeral real number
+ * or the wildcard identity it was shimmed to). */
+int getsockname(int s, struct sockaddr *a, socklen_t *l) {
+    static int (*real_gsn)(int, struct sockaddr *, socklen_t *) = 0;
+    ensure_init();
+    if (!real_gsn) real_gsn = (int (*)(int, struct sockaddr *, socklen_t *))
+        dlsym(RTLD_NEXT, "getsockname");
+    int r = real_gsn(s, a, l);
+    if (r == 0 && g_direct && a && l && *l >= (socklen_t)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *sa = (struct sockaddr_in *)a;
+        if (sa->sin_family == AF_INET) {
+            int vp = dt_alias_vport((long long)s);
+            if (vp > 0) {
+                sa->sin_port = htons((unsigned short)vp);
+                if (dt_alias_is_bindv((long long)s)) {
+                    DLOCK(); unsigned myv = g_myvirt; DUNLOCK();
+                    if (myv && sa->sin_addr.s_addr == htonl(INADDR_ANY))
+                        sa->sin_addr.s_addr = htonl(myv);
+                }
+            }
+        }
+    }
+    return r;
+}
 int listen(int s, int backlog) {
     static int (*real_listen)(int, int) = 0;
     ensure_init();
@@ -5464,18 +5800,80 @@ int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
 int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     int r;
     unsigned myv = 0;
-    if (g_direct && a && a->sa_family == AF_INET) {
+    if (g_direct && a && a->sa_family == AF_INET &&
+        l >= (int)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in in = *(const struct sockaddr_in *)a;
+        int proto = dt_sock_type((long long)s);
+        int reuse = 0;
+        { int ra = 0; int rl = (int)sizeof(ra);
+          if (getsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&ra, &rl) == 0) reuse = ra; }
         DLOCK(); myv = g_myvirt; DUNLOCK();
-        if (myv && ((const struct sockaddr_in *)a)->sin_addr.s_addr == htonl(myv)) {
-            /* binding to our advertised virtual interface: give the real
-             * stack a wildcard bind; the shim made the app believe in it */
-            struct sockaddr_in mod = *(const struct sockaddr_in *)a;
-            mod.sin_addr.s_addr = htonl(INADDR_ANY);
-            dlog("bind vnode->ANY");
-            r = p_bind ? p_bind(s, (struct sockaddr *)&mod, l) : SOCKET_ERROR;
-            if (r == 0) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+        int bindv = (myv && in.sin_addr.s_addr == htonl(myv));
+        if (bindv) in.sin_addr.s_addr = htonl(INADDR_ANY);
+        int want = ntohs(in.sin_port);
+        if (want != 0) {
+            int rv = slp_claim(want, proto, reuse, want);
+            if (rv == -1) { WSASetLastError(WSAEADDRINUSE); return SOCKET_ERROR; }
+            r = p_bind ? p_bind(s, (struct sockaddr *)&in, l) : SOCKET_ERROR;
+            if (r != 0 && (WSAGetLastError() == WSAEADDRINUSE ||
+                           WSAGetLastError() == WSAEACCES)) {
+                if (dt_bind_alias((long long)s, &in, proto == SOCK_DGRAM,
+                        (int (*)(int, const struct sockaddr *, socklen_t))p_bind) == 0) {
+                    if (bindv) dt_alias_bindv((long long)s);
+                    if (proto == SOCK_DGRAM) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
+                    return 0;
+                }
+                slp_release(want, proto);
+            } else if (r == 0) {
+                DLOCK();
+                dt_alias_add((long long)s, want, want, proto);
+                if (bindv && proto == SOCK_DGRAM) dt_udp_entry((long long)s, 1);
+                DUNLOCK();
+                if (bindv) dt_alias_bindv((long long)s);
+            } else {
+                slp_release(want, proto);
+            }
             return r;
         }
+        if (g_lan_only || slp_used() > 0) {
+            int i, base = 49152 + (int)(current_pid() % 4096);
+            for (i = 0; i < 4096; i++) {
+                int p0 = 49152 + ((base - 49152 + i) % 16383);
+                if (slp_taken(p0)) continue;
+                if (slp_claim(p0, proto, 1, 0) == -1) continue;
+                struct sockaddr_in trya = in;
+                trya.sin_port = htons((unsigned short)p0);
+                r = p_bind ? p_bind(s, (struct sockaddr *)&trya, l) : SOCKET_ERROR;
+                if (r == 0) {
+                    DLOCK();
+                    dt_alias_add((long long)s, p0, p0, proto);
+                    if (proto == SOCK_DGRAM) {
+                        struct dt_udp *e = dt_udp_entry((long long)s, 1);
+                        if (e) e->vport = p0;
+                    }
+                    DUNLOCK();
+                    if (bindv) dt_alias_bindv((long long)s);
+                    return 0;
+                }
+                slp_release(p0, proto);
+                if (WSAGetLastError() != WSAEADDRINUSE) break;
+            }
+        }
+        in.sin_port = 0;
+        r = p_bind ? p_bind(s, (struct sockaddr *)&in, l) : SOCKET_ERROR;
+        if (r == 0) {
+            struct sockaddr_in got; int gl = (int)sizeof(got);
+            if (getsockname(s, (struct sockaddr *)&got, &gl) == 0) {
+                int p0 = ntohs(got.sin_port);
+                slp_claim(p0, proto, reuse, p0);
+                DLOCK();
+                dt_alias_add((long long)s, p0, p0, proto);
+                if (bindv && proto == SOCK_DGRAM) dt_udp_entry((long long)s, 1);
+                DUNLOCK();
+                if (bindv) dt_alias_bindv((long long)s);
+            }
+        }
+        return r;
     }
     r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
     /* Shared discovery ports: several game processes bind one UDP port
@@ -5485,14 +5883,6 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
      * getsockname still present it as bound there. Without this, the
      * second binder goes deaf: inbound traffic for the shared port no
      * longer matches its (fallback) bound port. */
-    if (r != 0 && g_direct && a && a->sa_family == AF_INET &&
-        ((const struct sockaddr_in *)a)->sin_port != 0 &&
-        (WSAGetLastError() == WSAEADDRINUSE || WSAGetLastError() == WSAEACCES)) {
-        int dg = dt_sock_type((long long)s) == SOCK_DGRAM;
-        if (dt_bind_alias((long long)s, (const struct sockaddr_in *)a, dg,
-                          (int (*)(int, const struct sockaddr *, socklen_t))p_bind) == 0)
-            r = 0;
-    }
     if (g_debug && g_direct && a && a->sa_family == AF_INET) {
         const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
         unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
@@ -5578,7 +5968,15 @@ int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
         struct dt_udp *e = dt_udp_entry((long long)s, 0);
         if (e) vp = e->vport;
         DUNLOCK();
-        if (vp) sa->sin_port = htons((unsigned short)vp);
+        if (vp <= 0) vp = dt_alias_vport((long long)s);
+        if (vp > 0) {
+            sa->sin_port = htons((unsigned short)vp);
+            if (dt_alias_is_bindv((long long)s)) {
+                DLOCK(); unsigned myv = g_myvirt; DUNLOCK();
+                if (myv && sa->sin_addr.s_addr == htonl(INADDR_ANY))
+                    sa->sin_addr.s_addr = htonl(myv);
+            }
+        }
         dt_gp_spoof(s, sa, l ? *l : 0, 1);
     }
     return r;
