@@ -399,6 +399,20 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Exit semantics + membership truth (this cut): (1) the kernel flushes a
+socket's queued bytes when a process exits — our stream out-queue did
+not, so a game's parting frames died with it and peers waited out the
+app-level timeout instead of seeing a clean close (field: stale player
+after quit). dt_flush_streams() now drains queued stream bytes + the
+control-frame queue on exit (cooperative flushing/sending handshake
+with the pumps, bounded budget, fds left open so teardown FINs after
+the bytes). Hooked doors: Windows ExitProcess/TerminateProcess (self),
+Linux exit/_exit + atexit. test_exitdrain proves 200KB queued +
+os._exit still lands byte-exact. (2) members() only lists nodes with a
+LIVE link — a fully dark node keeps its virtual IP reserved for
+reconnect, but is no longer advertised in ASSIGN, so peer member
+tables drop a departed machine immediately (was: up to NODE_TTL).
+
 Transport tuning + visibility (this cut): every tunnel TCP dial
 (per-stream + control) requests TCP_NODELAY and 4MB SO_SNDBUF/RCVBUF
 BEFORE connect (window scaling rides the SYN); relay accepted sockets
