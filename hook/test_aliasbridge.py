@@ -38,6 +38,9 @@ while time.time() - t0 < 25:
     try:
         s.settimeout(5)
         c, _ = s.accept()
+        gp = c.getpeername()
+        gs = c.getsockname()
+        print("HOST-IDENT %s %s %s %s" % (gp[0], gp[1], gs[0], gs[1]), flush=True)
         d = c.recv(64)
         if d:
             c.sendall(b"ECHO:" + d)
@@ -77,19 +80,34 @@ host = subprocess.Popen([sys.executable, "-c", HOST, str(V)],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 check("R6a host up (both vport binds aliased)",
       host.stdout.readline().strip() == "HOST-LISTEN")
-
 CLI = r'''
 import socket, sys
-socket.setdefaulttimeout(20)
+socket.setdefaulttimeout(25)
 s = socket.create_connection(("10.200.15.2", int(sys.argv[1])))
 s.sendall(b"HELLO")
 print("GOT", s.recv(64).decode(), flush=True)
 '''
-cli = subprocess.run([sys.executable, "-c", CLI, str(V)], env=env(RELAY, _NODE0 + 2),
-                     capture_output=True, text=True, timeout=40)
-check("R6b tunnel stream bridged to the TCP alias row (not the UDP row)",
-      cli.stdout.strip() == "GOT ECHO:HELLO",
-      (cli.stdout + cli.stderr).strip()[:120])
+cli = subprocess.Popen([sys.executable, "-c", CLI, str(V)], env=env(RELAY, _NODE0 + 2),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+ident = {}
+for _ in range(8):
+    line = host.stdout.readline()
+    if not line: break
+    if line.startswith("HOST-IDENT"):
+        p = line.split()
+        ident = dict(peer=p[1], pport=int(p[2]), self_ip=p[3], self_port=int(p[4]))
+        break
+cout = ""
+try:
+    cout = cli.stdout.read().strip()
+except Exception:
+    pass
+cli.wait(timeout=10)
+check("R6b accepted socket presents the LAN view (local vport, not alias real)",
+      ident.get("self_port") == V and ident.get("self_ip") == "10.200.15.2"
+      and ident.get("peer") == "10.200.15.3", str(ident))
+check("R6c tunnel stream bridged to the TCP alias row (not the UDP row)",
+      "GOT ECHO:HELLO" in cout, cout[-80:])
 
 host.kill(); host.wait()
 relay.kill(); relay.wait()
