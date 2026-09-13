@@ -761,6 +761,24 @@ static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
             return;
         }
     }
+    {   /* replacement atomicity: a session arriving for the SAME
+         * (peer, game port) pair means the peer already closed the old
+         * socket - on a real network that truth reaches us with or
+         * before the new SYN; our multi-hop relay path can lag it.
+         * Retire any live predecessor BEFORE claiming, so the game's
+         * socket-replacement sees the LAN invariant: old gone, new in.
+         * Harmless cross-machine (usually a no-op; when it fires, the
+         * old stream is genuinely dead anyway). */
+        unsigned old_sids[4]; int n_old = 0;
+        DLOCK();
+        for (int i = 0; i < DT_MAXHOST; i++)
+            if (g_hs[i].used && g_hs[i].ovirt == ovirt &&
+                g_hs[i].gport == gport && g_hs[i].sid != sid && n_old < 4)
+                old_sids[n_old++] = g_hs[i].sid;
+        DUNLOCK();
+        for (int k = 0; k < n_old; k++)
+            dt_hs_close(old_sids[k]);
+    }
     if (!dt_owns_listen(gport)) {
         /* this process has no listener on the game port: leave the
          * stream to the sibling that does (or to timeout if none) */
@@ -777,7 +795,7 @@ static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
             h = &g_hs[i];
             h->used = 1; h->sid = sid; h->real = DTSOCK_BAD; h->fd = DTSOCK_BAD;
             h->live = 0; h->dead = 0; h->last = dt_now_ms();
-            h->ovirt = ovirt; h->lport = 0;
+            h->ovirt = ovirt; h->gport = gport; h->lport = 0;
             break;
         }
     DUNLOCK();

@@ -11,6 +11,7 @@ struct dt_hosted {
     long long last;       /* last activity (pending sweep) */
     int dead;
     unsigned ovirt;       /* opener's virtual IP (from DT_STREQ) */
+    int gport;            /* hosted game port (replacement detection) */
     int lport;            /* bridge socket's local ephemeral port: the
                              peer port the game's accept() will see */
     int accsp;            /* accepted socket's real src port (fd-reuse
