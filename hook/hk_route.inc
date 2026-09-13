@@ -1,5 +1,26 @@
 /* hk_route.inc - connect routing / dial (shared)
  * Part of lan_hook.c; see the note there before editing. */
+
+/* Connecting-side presentation for a NIC-style hairpin (own-vnode
+ * dial completed through loopback). getpeername must keep speaking
+ * the vnode:vport the app dialed, not 127.0.0.1:alias-real. */
+#define DT_MAXHP 32
+static struct { long long sock; struct sockaddr_in dest; } g_hp[DT_MAXHP];
+static void dt_hairpin_remember(long long sock, const struct sockaddr_in *dest) {
+    int i;
+    DLOCK();
+    for (i = 0; i < DT_MAXHP; i++)
+        if (!g_hp[i].sock || g_hp[i].sock == sock) {
+            g_hp[i].sock = sock; g_hp[i].dest = *dest; break;
+        }
+    DUNLOCK();
+}
+static void dt_hairpin_forget_locked(long long sock) {
+    int i;
+    for (i = 0; i < DT_MAXHP; i++)
+        if (g_hp[i].sock == sock) { g_hp[i].sock = 0; break; }
+}
+
 static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
 #ifdef SL_CONNECT_TRACE
     { char lb[128]; unsigned long a = ntohl(dst->sin_addr.s_addr);
@@ -22,23 +43,40 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
          * complete it through the kernel loopback so the local listen
          * backlog serves it like a NIC hairpin. Going through the relay
          * instead turns it into a ghost self-connection the app then
-         * heartbeats/timeouts against forever. */
+         * heartbeats/timeouts against forever.
+         *
+         * The dest PORT must be THIS process's real listen port. When
+         * another of our nodes owns the kernel vport (same-box two
+         * vnodes), we are aliased underneath: connect(127.0.0.1:vport)
+         * would hit the OTHER node's listener, which a real LAN / a
+         * Tailscale interface can never do (each machine has its own
+         * listen port). Field: the joiner's self-dial landed on the
+         * host, the session library replaced the tunneled peer socket,
+         * and JoinLobby died pending. dt_host_bridge already rewrites
+         * this way. */
         struct sockaddr_in lo = *dst;
-        int rr;
+        int rr, vp = (int)ntohs(dst->sin_port);
+        int real = dt_alias_real(vp, SOCK_STREAM);
         lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (real > 0) lo.sin_port = htons((unsigned short)real);
 #ifdef LINUX_BUILD
         dt_reals();
         rr = r_connect((int)gsock, (struct sockaddr *)&lo, sizeof(lo));
         if (rr != 0 && errno != EINPROGRESS && errno != EALREADY
                 && errno != EISCONN && errno != EWOULDBLOCK) return -1;
-        return 4;
 #else
         rr = connect((SOCKET)gsock, (struct sockaddr *)&lo, sizeof(lo));
         if (rr != 0 && WSAGetLastError() != WSAEWOULDBLOCK
                 && WSAGetLastError() != WSAEALREADY
                 && WSAGetLastError() != WSAEISCONN) return -1;
-        return 4;
 #endif
+        dt_hairpin_remember(gsock, dst);
+        { char lb[160];
+          snprintf(lb, sizeof(lb),
+                   "hairpin pid=%u sock=%lld -> 127.0.0.1:%d (vport=%d)",
+                   (unsigned)current_pid(), gsock, real > 0 ? real : vp, vp);
+          dlog(lb); }
+        return 4;
     }
     int is_vnode = vnode != 0;
     if (!is_vnode) {
@@ -127,25 +165,34 @@ static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len
         }
     }
 }
-/* pop stream bytes; 1 got (>0), 0 empty, -1 dead */
+/* pop stream bytes; 1 got (>0), 0 empty, -1 dead.
+ * Gather across in-queue chunks up to blen: a kernel TCP recv() of N
+ * when N bytes are already queued returns N, not the first skb. FIONREAD
+ * reports st->total; apps that ioctl then recv(exactly that) (the
+ * reference lobby stack does, and never shrinks a short read) treat a
+ * first-chunk-only pop as a torn length prefix and never parse again. */
 static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_t *outn) {
     int r = 0; size_t ln = 0; unsigned lsid = 0; int dolog = 0; size_t tot = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st && st->h) {
-        size_t n = st->h->n - st->h->off;
-        if (n > blen) n = blen;
-        memcpy(buf, st->h->p + st->h->off, n);
-        st->h->off += n; st->total -= n; *outn = n; r = 1;
-        if (st->h->off >= st->h->n) {
-            struct dt_chunk *o = st->h; st->h = o->next; if (!st->h) st->t = NULL;
-            free(o->p); free(o);
+        size_t got = 0;
+        while (st->h && got < blen) {
+            size_t n = st->h->n - st->h->off;
+            if (n > blen - got) n = blen - got;
+            memcpy(buf + got, st->h->p + st->h->off, n);
+            st->h->off += n; st->total -= n; got += n;
+            if (st->h->off >= st->h->n) {
+                struct dt_chunk *o = st->h; st->h = o->next; if (!st->h) st->t = NULL;
+                free(o->p); free(o);
+            }
         }
+        *outn = got; r = 1;
         if (st->in_paused && st->total < DT_ST_MAXIN / 2) {
             st->in_paused = 0;
             dt_wake_write(st->wake_w);   /* window reopened: read again now */
         }
-        ln = n; lsid = st->sid; st->ab_rx += n; st->an_rx++; tot = st->ab_rx;
+        ln = got; lsid = st->sid; st->ab_rx += got; st->an_rx++; tot = st->ab_rx;
         long long now = dt_now_ms();
         if (ln >= 4096 || st->an_rx <= 3 || now - st->a_log > 1000) {
             st->a_log = now; dolog = 1; }
@@ -164,6 +211,11 @@ static int dt_getpeer(long long gsock, struct sockaddr_in *out) {
     int ok = 0; DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st) { *out = st->orig; ok = 1; }
+    else {
+        int i;
+        for (i = 0; i < DT_MAXHP; i++)
+            if (g_hp[i].sock == gsock) { *out = g_hp[i].dest; ok = 1; break; }
+    }
     DUNLOCK(); return ok;
 }
 /* peek for poll/select hooks: tunnel data pending? (no consume) */
@@ -232,6 +284,7 @@ static void dt_on_close(long long gsock) {
         struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
+    dt_hairpin_forget_locked(gsock);
     dt_alias_release_all(gsock);
     dt_alias_drop(gsock);
     dt_sig_locked(gsock); /* wake event waiters with CLOSE (noop on Linux) */

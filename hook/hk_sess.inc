@@ -190,15 +190,19 @@ static void dt_acc_learn_fd(long long fd, const struct sockaddr_in *peer,
     int sp = (int)ntohs(peer->sin_port);   /* bridge's ephemeral src port */
 
     DLOCK();
-    int hitp = -1, hitf = -1;   /* exact-port / first-live */
+    int hitp = -1;
     for (int i = 0; i < DT_MAXHOST; i++) {
         if (!g_hs[i].used || !g_hs[i].live || !g_hs[i].ovirt) continue;
-        if (hitf < 0) hitf = i;
-        if (listen_port && (int)g_hs[i].lport == listen_port) { hitp = i; break; }
+        /* lport is the bridge ephemeral accept() reports as the peer.
+         * Match that (or a later rematch on accsp). Never "first live
+         * hosted row": a same-box self-dial is also loopback and would
+         * steal the opener's vnode (field: hairpin accept learn=1). */
+        if (sp && (int)g_hs[i].lport == sp) { hitp = i; break; }
         if (sp && (int)g_hs[i].accsp == sp) { hitp = i; break; }
+        if (listen_port && (int)g_hs[i].lport == listen_port) { hitp = i; break; }
     }
 
-    int pick = hitp >= 0 ? hitp : (listen_port ? -1 : hitf);
+    int pick = hitp;
     if (pick >= 0) {
         g_hs[pick].accsp = sp;
         for (int j = 0; j < DT_MAXACC; j++)
