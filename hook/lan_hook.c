@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1479,6 +1480,18 @@ static void dt_dispatch_bcast(int port, int sport, const unsigned char *raw, siz
 #define DT_ST_MAXIN  (1024 * 1024)    /* app-read backpressure cap */
 #define DT_ST_MAXOUT (4 * 1024 * 1024)
 
+/* Give the relay tunnels generous TCP capacity: large send/receive
+ * buffers requested BEFORE connect so window scaling rides the SYN
+ * negotiation, and Nagle off so small handshake frames stay prompt.
+ * The app still sees plain TCP semantics end to end; this only raises
+ * throughput on long-fat or high-hop paths. */
+static void dt_sock_tune(DTSOCK s) {
+    int v = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&v, sizeof(v));
+    v = 4 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&v, sizeof(v));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&v, sizeof(v));
+}
 static DTSOCK dt_st_dial_relay(void) {
     struct sockaddr_in sa;
     if (dt_resolve(&sa) != 0) return DTSOCK_BAD;
@@ -1487,6 +1500,7 @@ static DTSOCK dt_st_dial_relay(void) {
     dt_reals();
     s = (DTSOCK)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return DTSOCK_BAD;
+    dt_sock_tune(s);
     int fl = fcntl((int)s, F_GETFL, 0);
     fcntl((int)s, F_SETFL, fl | O_NONBLOCK);
     int r = r_connect(s, (struct sockaddr *)&sa, sizeof(sa));
@@ -1518,6 +1532,7 @@ static DTSOCK dt_st_dial_relay(void) {
 #else
     s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return DTSOCK_BAD;
+    dt_sock_tune(s);
     u_long on = 1;
     ioctlsocket(s, FIONBIO, &on); /* stays nonblocking (select-driven) */
     int r = connect(s, (struct sockaddr *)&sa, sizeof(sa));
@@ -2187,6 +2202,9 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                 break;
             }
             in0 += (size_t)n;
+            if (n >= 4096) { char lb[112];
+                snprintf(lb, sizeof(lb), "hs in sid=%u n=%zd tot=%llu",
+                         sid, n, (unsigned long long)in0); dlog(lb); }
             const unsigned char *p = buf;
             while ((size_t)n > 0) {
                 ssize_t k = r_send(real, p, (size_t)n, 0);
@@ -2205,6 +2223,9 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                 break;
             }
             out0 += (size_t)n;
+            if (n >= 4096) { char lb[112];
+                snprintf(lb, sizeof(lb), "hs out sid=%u n=%zd tot=%llu",
+                         sid, n, (unsigned long long)out0); dlog(lb); }
             const unsigned char *p = buf;
             while ((size_t)n > 0) {
                 ssize_t k = r_send(fd, p, (size_t)n, 0);
@@ -2233,6 +2254,9 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
             int n = recv(real, (char *)buf, (int)sizeof(buf), 0);
             if (n <= 0) break;
             out0 += (size_t)n;
+            if (n >= 4096) { char lb[112];
+                snprintf(lb, sizeof(lb), "hs out sid=%u n=%d tot=%llu",
+                         sid, n, (unsigned long long)out0); dlog(lb); }
             const char *p = (const char *)buf;
             while (n > 0) {
                 int k = send(fd, p, n, 0);
@@ -2279,6 +2303,7 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
 #else
         if (s == INVALID_SOCKET) { dt_msleep(g_init_done ? 1000 : 250); continue; }
 #endif
+        dt_sock_tune(s);
         struct sockaddr_in sa;
         if (dt_resolve(&sa) != 0) {
 #ifdef LINUX_BUILD
@@ -3610,7 +3635,8 @@ static int dt_stream_send(long long gsock, const unsigned char *buf, size_t len)
         st->ab_tx += len; st->an_tx++;
         tot = st->ab_tx; lsid = st->sid; ln = len;
         long long now = dt_now_ms();
-        if (st->an_tx <= 3 || now - st->a_log > 1000) { st->a_log = now; dolog = 1; }
+        if (ln >= 4096 || st->an_tx <= 3 || now - st->a_log > 1000) {
+            st->a_log = now; dolog = 1; }
     }
     DUNLOCK();
     if (dolog) {
@@ -3666,7 +3692,8 @@ static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_
         if (st->in_paused && st->total < DT_ST_MAXIN / 2) st->in_paused = 0;
         ln = n; lsid = st->sid; st->ab_rx += n; st->an_rx++; tot = st->ab_rx;
         long long now = dt_now_ms();
-        if (st->an_rx <= 3 || now - st->a_log > 1000) { st->a_log = now; dolog = 1; }
+        if (ln >= 4096 || st->an_rx <= 3 || now - st->a_log > 1000) {
+            st->a_log = now; dolog = 1; }
     } else if (st && (st->dead || st->state == ST_DEAD)) r = -1;
     DUNLOCK();
     if (dolog) {
