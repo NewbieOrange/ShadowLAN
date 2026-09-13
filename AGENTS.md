@@ -327,7 +327,14 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Testing discipline & harness knowledge
 
-- Full suite: `make -C hook test` (Linux, ~45 s total) + `test-all` adds
+- Full suite: `make -C hook test` runs the Linux suites IN PARALLEL via
+  `runtests.py` (`-j` auto = CPU count; override `make -C hook test J=4`
+  or `SHADOWLAN_TEST_JOBS`). Hard-coded REAL ports and shared /tmp files
+  are banned in tests: take them from `testutil.free_port()` /
+  `free_ports(n)` / `tmp_path(name)`. Virtual LAN vports (47584-style,
+  10.200.x) are per-relay and may stay fixed; wclient proxy binds and
+  relay ports are REAL and must be allocated. `test_late.py` (Wine)
+  honors `SHADOWLAN_LATE_PORT`, auto-picked otherwise. + `test-all` adds
   Wine (`SHADOWLAN_WINEPREFIX=~/.wine`, prefix already prepared; wine is
   slow to start — budget minutes, run in background). Root needed for
   ICMP tests. Verdict markers are `*_ALL_PASS` / `ALL PASS` — grep with
@@ -404,6 +411,43 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   real port) if an app ever shows it.
 
 ## Status snapshot (UNRELEASED)
+
+Parallel-haul fixes (this cut, beyond the harness work): (1) ARP
+fan-out for implicit streams now excludes the OPENER'S WHOLE NODE and
+grants claims on a short preferential window (IMPLICIT_GRACE_S: all
+claims collected, freshest host_claim wins, rest get BUSY) - with
+pure first-come claims a bridge host could claim its own stream and
+host-migration was nondeterministic (perdest/tcp-survive caught it).
+(2) wclient fire-and-forget `create_task` calls had no strong refs -
+the loop holds only weak references, so live stream pumps could be
+GC'd mid-flight (the exact "Task was destroyed but it is pending"
++ peer-EOP pattern perdest hit under parallel load); all spawn sites
+now go through WinClient._spawn() (same pattern the relay's
+_conn_tasks uses).
+
+Parallel test harness (this cut): `make -C hook test` now runs every
+suite concurrently via runtests.py (-j auto = cpu_count; `J=n` or
+SHADOWLAN_TEST_JOBS to override; name substrings filter). All 18 suites
+self-allocate REAL ports via testutil.free_port()/free_ports()/free_trio()
+and pid-unique tmp paths; test_socket_doors is now fully self-contained
+(both child scripts embedded instead of the old /tmp/opencode files, with
+an explicit client-dead mode instead of a hard-coded port-number sniff).
+Hook-internal vports may stay fixed (aliasing covers same-port siblings).
+
+Event-driven internal IO (this cut): every tunnel wait is now an event,
+not a poll cadence. Control link + per-stream pumps select on kernel
+readiness PLUS self-wake datagram pairs (socketpair on Linux, connected
+loopback UDP pair on Windows) so a cross-thread enqueue (app send,
+control-frame queue, in-window reopen, close handoff) wakes the sleeper
+immediately; poll slices remain only as idle backstops (100ms control,
+100ms pumps, 2ms handshake frames). Wake paths MUST call real libc/ws2
+symbols (r_send/r_recv, GetProcAddress'd send/recv): the hooked entry
+points re-enter the non-recursive DLOCK and deadlock - caught by
+test_direct/virtual_p2p/lanonly when the first cut used plain calls.
+Wake-only select wakeups must skip the frame reader (EAGAIN there means
+redial: the first cut tore the control link down on every app send).
+Measured locally: claim round trip open->ok <1ms (was 44ms in field
+logs), 271KB relay->app in 77ms pre-fix; suites + fullduplex gate it.
 
 Field join timeline closed (rc7 logs): joiner received the host's full
 270,986B lobby reply 77ms after the bridge (per-chunk hs out proves the
