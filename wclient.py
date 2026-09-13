@@ -7,8 +7,9 @@ Connects to ONE specific IP:port on the relay:
 
 Each game TCP stream is its own TCP connection to the
 relay (both ends dial out, NAT-safe); the relay pipes raw bytes once the
-destination has bridged to its local game (T_STOPEN -> T_STREQ -> T_STJOIN
--> T_STJOINED -> T_STOK). connect() only completes after that handshake.
+destination has claimed the stream (T_STOPEN -> T_STREQ -> T_STJOIN ->
+T_STOK at claim; T_STJOINED starts the raw pipe). connect() completes
+when the claim lands.
 
 Player mode (default) per game (ports from CLI):
 - Snoops local discovery broadcasts with SO_REUSEADDR (gets a copy
@@ -51,7 +52,7 @@ from common import (
     QueueProto,
     decode_udp_game, encode_udp_game,
     encode_ctl_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
-    encode_stjoin, encode_stsid, encode_stfail, encode_stopen,
+    decode_streq, encode_stjoin, encode_stsid, encode_stfail, encode_stopen,
     make_reuse_udp, parse_ports, tcp_read, tcp_send, ST_TIMEOUT_S,
 )
 
@@ -215,9 +216,10 @@ class WinClient:
                     self.rebroadcast(dport, raw)
                 elif mtype == T_STREQ:
                     # another player is joining a port we serve
-                    if len(payload) < 6:
+                    dec = decode_streq(payload)
+                    if not dec:
                         continue
-                    sid, gport = struct.unpack("!IH", payload[:6])
+                    sid, gport, _ovirt = dec
                     self._spawn(self.stream_join(sid, gport))
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass

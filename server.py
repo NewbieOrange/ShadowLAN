@@ -11,7 +11,7 @@ connection to the relay (both peers dial OUT, NAT-safe). The relay pipes
 raw bytes between the two per-stream connections, so a stalled stream
 never head-of-line-blocks beacons or other streams. connect() only
 succeeds for the opener after the destination has confirmed its local
-game bridge (T_STJOIN -> T_STJOINED -> T_STOK).
+game (T_STJOIN -> T_STOK at claim; T_STJOINED starts the raw pipe).
 
 Any peer can host: the relay routes addressed (virtual-IP) and implicit
 (unaddressed) streams, and assigns each node a virtual LAN IP
@@ -476,7 +476,6 @@ class Relay:
                                                f"dest node {dest_node} "
                                                "has no other link")
             return
-            dest_node = self.writer_node.get(id(target), 0)
         st = {"opener_node": node, "opener_r": reader, "opener_w": writer,
               "dest_node": dest_node, "gport": gport, "state": "open",
               "implicit": not dest_node,
@@ -625,6 +624,11 @@ class Relay:
             return
         st["joiner_r"], st["joiner_w"] = reader, writer
         st["state"] = "joined"   # claim: further joiners get BUSY
+        if not st.get("dest_node"):
+            # implicit fan-out had dest_node=0; remember the winner so
+            # T_STSHUT / node-death teardown reach this stream
+            st["dest_node"] = node
+            self.node_streams.setdefault(node, set()).add(sid)
         if st.get("shut_from") == "opener":
             st["shut_from"] = None
             try:
