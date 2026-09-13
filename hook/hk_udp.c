@@ -331,7 +331,7 @@ void dt_icmp_in(unsigned is_rep, unsigned src, unsigned dest, unsigned id, unsig
  * recvfrom source, and a loopback source there makes the game unicast
  * its lobby JOIN back to itself (silently looping, host never sees it).
  * Map the injection socket's source port back to the session's real
- * peer (virtual ip + presented mark port), like the direct path does. */
+ * peer (virtual IP + the sender's bound vport), like the direct path. */
 void dt_hosted_unsource(struct sockaddr *sa, socklen_int_t *len) {
     if (!sa || !len || *len < (socklen_int_t)sizeof(struct sockaddr_in)) return;
     struct sockaddr_in *in = (struct sockaddr_in *)sa;
@@ -472,13 +472,11 @@ int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                                  len);
             return 1;
         }
-        { /* reply-to-mark demux: an app unicasting back to the source
-             * (vnode, port) that recvfrom presented hits this path when
-             * that port is one of OUR hosted sessions' marks. Marks now
-             * live anywhere in the u16 space, so decide by the exact
-             * session tuple - never by a port band - and emit a proper
-             * S2C instead of a bogus C2S whose game_port would be a
-             * mark number with no listener on the far side. */
+        { /* reply-to-session demux: an app unicasting back to the
+             * (vnode, vport) that recvfrom presented hits this path
+             * when that tuple is one of OUR hosted UDP sessions.
+             * Match the exact session - never a port band - and emit
+             * S2C so the far side sees its own game_port. */
             int sg = -1;
             struct sockaddr_in sc;
             memset(&sc, 0, sizeof(sc));

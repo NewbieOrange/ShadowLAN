@@ -95,9 +95,9 @@ int dt_host_bridge(unsigned sid, int port) {
     /* Resolve the hosted listener's REAL port (it may be aliased when
      * another of our nodes owns the vport number on this kernel).
      * Proto-scoped: the datagram alias row must never capture a TCP
-     * bridge (field rc14: dialing the UDP row = reason=3). Same-box
-     * forward bridging is correct v3 behavior since the mark leak
-     * (v2's real poison) is gone. */
+     * bridge (dialing the UDP row used to fail the stream with
+     * HOST_FAILED). Same-box forward bridging is correct now that UDP
+     * source identity is the bound vport (no internal mark on the wire). */
     {
         int al = dt_alias_real(port, SOCK_STREAM);
         if (al) port = al;
@@ -339,7 +339,6 @@ struct dt_usess *dt_usess_find(int game_port, const unsigned *ovirt, const struc
             g_us[i].last = now;
             g_us[i].lport = 0;
             g_us[i].ovirt = ovirt ? *ovirt : 0;
-            g_us[i].ovirt = 0;
 #ifdef LINUX_BUILD
             dt_reals();
             g_us[i].real = socket(AF_INET, SOCK_DGRAM, 0);
@@ -387,10 +386,7 @@ int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen, int cpo
     DLOCK();
     struct dt_usess *u = dt_usess_find(game_port, &ovhost, &cli, 1);
     int rs = u ? u->real : -1;
-    if (u) {
-        u->last = dt_now_ms();
-        if (iplen >= 4) memcpy(&u->ovirt, ipb, 4);
-    } /* host-order vnode */
+    if (u) u->last = dt_now_ms();
     DUNLOCK();
     if (!u || rs < 0) return 0;
     if (r_sendto(rs, raw, rl, 0, (struct sockaddr *)&lo, sizeof(lo)) > 0) {
@@ -400,11 +396,6 @@ int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen, int cpo
         if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
         DLOCK();
         if (lp && u->lport == 0) u->lport = lp; /* injection source port */
-        if (u && iplen >= 4) {
-            unsigned ov;
-            memcpy(&ov, ipb, 4);
-            u->ovirt = ntohl(ov);
-        } /* accept door peer */
         DUNLOCK();
     }
     return 1;
@@ -422,11 +413,6 @@ int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen, int cpo
         if (getsockname(rs, (struct sockaddr *)&sn, &sl) == 0) lp = ntohs(sn.sin_port);
         DLOCK();
         if (lp && u->lport == 0) u->lport = lp; /* injection source port */
-        if (u && iplen >= 4) {
-            unsigned ov;
-            memcpy(&ov, ipb, 4);
-            u->ovirt = ntohl(ov);
-        } /* accept door peer */
         DUNLOCK();
     }
     return 1;
@@ -706,10 +692,10 @@ int dt_udp_pop(long long gsock, unsigned char *buf, size_t blen, struct sockaddr
     return r;
 }
 struct dt_slot *dt_slot_get(long long gsock, int game_port, const struct sockaddr_in *orig) {
-    /* Per-dest slots: same socket to different game servers gets different
-     * marks, so S2C replies demux by mark and relay triples
-     * (virt-IP, mark) stay unique per destination. Same socket + port +
-     * dest reuses its slot. */
+    /* Per-dest slots: same socket to different game servers keeps a
+     * distinct flow so S2C replies demux by (game_port, bound vport)
+     * and relay triples stay unique per destination. Same socket +
+     * port + dest reuses its slot. */
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock && g_sl[i].game_port == game_port &&
             g_sl[i].orig.sin_addr.s_addr == orig->sin_addr.s_addr &&

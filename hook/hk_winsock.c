@@ -773,7 +773,8 @@ int WSAAPI hk_WSAConnect(SOCKET s, const struct sockaddr *a, int l, LPWSABUF b1,
 /* shared spoof door for getpeername (want=0) and getsockname (want=1).
  * For accepted (bridged) sockets only: presents the vnode view the
  * kernel would give on a real LAN - peer = opener's vnode, local = own
- * vnode; the listen port stays real either way. */
+ * vnode; the local port is the listen vport (dt_acc_self_view), not
+ * an aliased kernel ephemeral. */
 static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self) {
     if (l < (int)sizeof(struct sockaddr_in) || !g_direct) return;
     struct sockaddr_in o;

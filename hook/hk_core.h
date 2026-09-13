@@ -36,6 +36,13 @@ typedef int socklen_int_t;
 #define DT_STOK 0x0B
 #define DT_STFAIL 0x0C
 #define DT_STSHUT 0x0D
+/* Fixed payload lengths (HDR covers type+payload). Lockstep: common.py. */
+#define DT_ASSIGN_HDR_N 11
+#define DT_STOPEN_N 14
+#define DT_STREQ_N 10
+#define DT_STJOIN_N 8
+#define DT_STSID_N 4
+#define DT_STFAIL_N 5
 #define STF_NO_ROUTE 1
 #define STF_JOIN_TIMEOUT 2
 #define STF_HOST_FAILED 3
@@ -172,11 +179,11 @@ struct dt_evmap {
     WSAEVENT ev;
     long mask;
 };
-#endif
 struct dt_nbtrack {
     long long sock;
     int nb;
 };
+#endif
 
 #ifdef LINUX_BUILD
 HK_INT extern pthread_mutex_t g_dmu;

@@ -1,7 +1,7 @@
 J ?= auto
-# Compile parallelism: default to nproc. `make -jN` / `make -j1` still wins.
+# Compile parallelism: default to nproc. An explicit -j / parent jobserver wins.
 NPROC ?= $(shell nproc 2>/dev/null || echo 1)
-ifeq ($(filter -j%,$(MAKEFLAGS)),)
+ifeq ($(filter -j%,$(MAKEFLAGS))$(findstring jobserver,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(NPROC)
 endif
 CC64=x86_64-w64-mingw32-gcc
@@ -12,15 +12,15 @@ HDRS=hk_plat.h hk_api.h hk_version.h hk_core.h hk_mod.h \
 MOD_COMMON=hk_util hk_alias hk_ledger hk_core hk_ports hk_sess hk_stream hk_udp hk_route
 MOD_LNX=$(MOD_COMMON) hk_linux
 MOD_WIN=$(MOD_COMMON) hk_winsock hk_wicmp hk_winnic hk_wininst
-DEPS=$(HDRS) $(addsuffix .c,$(MOD_COMMON)) lan_hook.c
 
 all: lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so
 
-%.lnx.o: %.c $(DEPS) hk_linux.c hk_linux.h
+# Header change rebuilds every object; a .c touch rebuilds only that object.
+%.lnx.o: %.c $(HDRS)
 	gcc -fPIC -DLINUX_BUILD $(CFLAGS) -c -o $@ $<
-%.w64.o: %.c $(DEPS) $(addsuffix .c,$(MOD_WIN))
+%.w64.o: %.c $(HDRS)
 	$(CC64) $(CFLAGS) -c -o $@ $<
-%.w32.o: %.c $(DEPS) $(addsuffix .c,$(MOD_WIN))
+%.w32.o: %.c $(HDRS)
 	$(CC32) $(CFLAGS) -c -o $@ $<
 
 lan_hook64.dll: lan_hook.w64.o $(addsuffix .w64.o,$(MOD_WIN)) lan_hook.def

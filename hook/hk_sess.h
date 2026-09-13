@@ -6,7 +6,7 @@ HK_INT extern struct dt_hosted g_hs[DT_MAXHOST];
 HK_INT extern struct dt_usess g_us[DT_MAXUSESS];
 HK_INT extern struct dt_accfd g_acc[DT_MAXACC];
 #ifndef LINUX_BUILD
-extern struct dt_evmap g_evmap[DT_MAXEV];
+HK_INT extern struct dt_evmap g_evmap[DT_MAXEV];
 #endif
 
 HK_INT struct dt_hosted *dt_hs_by_sid(unsigned sid);

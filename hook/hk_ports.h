@@ -4,7 +4,9 @@
 
 HK_INT extern int g_lports[DT_MAXLISTEN];
 HK_INT extern DTSOCK g_wake_r, g_wake_w;
+#ifndef LINUX_BUILD
 HK_INT extern struct dt_nbtrack g_nbt[DT_MAXUDP + DT_MAXSTREAM];
+#endif
 
 HK_INT void dt_record_listen(int port);
 HK_INT int dt_owns_listen(int port);

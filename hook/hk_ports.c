@@ -302,20 +302,20 @@ unsigned dt_ipnum(const unsigned char *b) {
 /* ASSIGN: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt),
  * all multi-byte fields big-endian on the wire. */
 void dt_apply_assign(const unsigned char *p, size_t n) {
-    if (n < 11) return;
+    if (n < DT_ASSIGN_HDR_N) return;
     {
         int bits = p[8];
         int cnt = ((int)p[9] << 8) | p[10];
         if (bits <= 0 || bits > 32 || cnt < 0 || cnt > DT_MAXMEMB) return;
-        if (n != (size_t)(11 + 8 * cnt)) return;
+        if (n != (size_t)(DT_ASSIGN_HDR_N + 8 * cnt)) return;
         DLOCK();
         g_myvirt = dt_ipnum(p);
         memcpy(g_vnetb, p + 4, 4);
         g_vbits = bits;
         g_nmembers = 0;
         for (int i = 0; i < cnt && i < DT_MAXMEMB; i++) {
-            g_members[g_nmembers].node = dt_ipnum(p + 11 + 8 * i);
-            g_members[g_nmembers].virt = dt_ipnum(p + 15 + 8 * i);
+            g_members[g_nmembers].node = dt_ipnum(p + DT_ASSIGN_HDR_N + 8 * i);
+            g_members[g_nmembers].virt = dt_ipnum(p + DT_ASSIGN_HDR_N + 4 + 8 * i);
             g_nmembers++;
         }
         DUNLOCK();

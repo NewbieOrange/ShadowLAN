@@ -13,11 +13,11 @@
  * opener:  app connect(vnet) -> dt_on_connect -> stream thread:
  *          dial relay, DT_STOPEN, wait DT_STOK/DT_STFAIL (10s), pipe.
  * joinee:  control link DT_STREQ -> dt_on_streq -> join thread:
- *          dial relay, DT_STJOIN, local bridge connect, DT_STJOINED,
- *          pipe per-stream-tcp <-> local bridge.
+ *          dial relay, DT_STJOIN, claim DT_STOK, local bridge,
+ *          DT_STJOINED, pipe per-stream-tcp <-> local bridge.
  * Frame layout on per-stream TCPs (handshake only, then raw bytes):
  *          [u32 len][u8 type][payload]  (same framing as the control
- *          connection; the relay swaps to raw after DT_STOK/DT_STJOINED).
+ *          connection; the relay swaps to raw after DT_STJOINED).
  * -------------------------------------------------------------------- */
 /* Give the relay tunnels generous TCP capacity: large send/receive
  * buffers requested BEFORE connect so window scaling rides the SYN
@@ -497,7 +497,7 @@ DWORD WINAPI dt_stream_thread(LPVOID u)
             return 0;
         }
         unsigned dest = dt_virt_node(orig.sin_addr.s_addr); /* 0 = implicit host */
-        unsigned char p[14];
+        unsigned char p[DT_STOPEN_N];
         dt_put32(p, g_node);
         dt_put32(p + 4, dest);
         dt_put32(p + 8, sid);
@@ -508,7 +508,7 @@ DWORD WINAPI dt_stream_thread(LPVOID u)
                      (unsigned)current_pid(), gsock, sid, dest, origport);
             dlog(lb);
         }
-        if (dt_st_send_frame(fd, DT_STOPEN, p, 14) != 0) {
+        if (dt_st_send_frame(fd, DT_STOPEN, p, DT_STOPEN_N) != 0) {
             dt_st_close_fd(fd);
             dt_st_fail_local(st, STF_JOIN_TIMEOUT);
             return 0;
@@ -566,9 +566,10 @@ DWORD WINAPI dt_stream_thread(LPVOID u)
              * only honest verdict for a stream nobody completed is the
              * one the app's select() would reap - then free the slot. */
             unsigned vfail = STF_NO_ROUTE;
-            if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid)
+            if (r == 0 && type == DT_STOK && rn >= DT_STSID_N && dt_get32(rp) == sid)
                 vfail = 0; /* we DID connect: orphaned */
-            else if (r == 0 && type == DT_STFAIL && rn >= 5 && dt_get32(rp) == sid) vfail = rp[4];
+            else if (r == 0 && type == DT_STFAIL && rn >= DT_STFAIL_N && dt_get32(rp) == sid)
+                vfail = rp[4];
             if (vfail) {
                 struct dt_stream *cur = dt_stream_by_sock_peeked(st->orig);
                 if (cur && cur->state == ST_CONNECTING) {
@@ -601,11 +602,11 @@ DWORD WINAPI dt_stream_thread(LPVOID u)
             return 0;
         }
         if (!gone) {
-            if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid) {
+            if (r == 0 && type == DT_STOK && rn >= DT_STSID_N && dt_get32(rp) == sid) {
                 st->state = ST_OPEN;
                 st->ever_open = 1;
                 dt_sig_locked(gsock);
-            } else if (r == 0 && type == DT_STFAIL && rn >= 5 && dt_get32(rp) == sid) {
+            } else if (r == 0 && type == DT_STFAIL && rn >= DT_STFAIL_N && dt_get32(rp) == sid) {
                 st->state = ST_DEAD;
                 st->fail = rp[4];
                 dt_sig_locked(gsock);
@@ -983,10 +984,10 @@ DWORD WINAPI dt_join_thread(LPVOID u)
         return 0;
     }
     {
-        unsigned char p[8];
+        unsigned char p[DT_STJOIN_N];
         dt_put32(p, g_node);
         dt_put32(p + 4, sid);
-        if (dt_st_send_frame(fd, DT_STJOIN, p, 8) != 0) {
+        if (dt_st_send_frame(fd, DT_STJOIN, p, DT_STJOIN_N) != 0) {
             dt_st_close_fd(fd);
             dt_hs_close(sid);
             return 0;
@@ -999,7 +1000,7 @@ DWORD WINAPI dt_join_thread(LPVOID u)
             unsigned char type = 0, rp[16];
             size_t rn = 0;
             if (dt_st_recv_frame(fd, &type, rp, sizeof(rp), &rn, DT_ST_TIMEOUT_MS) != 0 ||
-                type != DT_STOK || rn < 4 || dt_get32(rp) != sid) {
+                type != DT_STOK || rn < DT_STSID_N || dt_get32(rp) != sid) {
                 char lb[160];
                 snprintf(lb, sizeof(lb), "hosted join stood down pid=%u sid=%u (dup/busy)",
                          (unsigned)current_pid(), sid);
@@ -1017,10 +1018,10 @@ DWORD WINAPI dt_join_thread(LPVOID u)
             else dt_msleep(250);
         }
         if (!ok) {
-            unsigned char q[5];
+            unsigned char q[DT_STFAIL_N];
             dt_put32(q, sid);
             q[4] = STF_HOST_FAILED;
-            dt_st_send_frame(fd, DT_STFAIL, q, 5);
+            dt_st_send_frame(fd, DT_STFAIL, q, DT_STFAIL_N);
             char lb[160];
             snprintf(lb, sizeof(lb), "hosted open fail pid=%u sid=%u port=%d",
                      (unsigned)current_pid(), sid, gport);
@@ -1029,9 +1030,9 @@ DWORD WINAPI dt_join_thread(LPVOID u)
             dt_hs_close(sid);
             return 0;
         }
-        unsigned char q[4];
+        unsigned char q[DT_STSID_N];
         dt_put32(q, sid);
-        if (dt_st_send_frame(fd, DT_STJOINED, q, 4) != 0) {
+        if (dt_st_send_frame(fd, DT_STJOINED, q, DT_STSID_N) != 0) {
             dt_st_close_fd(fd);
             dt_hs_close(sid);
             return 0;
@@ -1436,6 +1437,8 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
             if (!pl) goto redial;
             if (dt_recv_all(s, pl, ml)) goto redial;
             unsigned char t = pl[0];
+            /* ml = type + payload. Variable frames use a minimum;
+             * STREQ is exact (same as common.decode_streq). */
             if (t == DT_BCAST && ml >= 5) {
                 dt_dispatch_bcast((int)dt_get16(pl + 1), (int)dt_get16(pl + 3), pl + 5, ml - 5);
             } else if (t == DT_BCAST_FROM && ml >= 9) {
@@ -1454,16 +1457,13 @@ static DWORD WINAPI dt_tcp_thread(LPVOID u) {
                     dlog(lb);
                 }
                 dt_dispatch_bcast_from(node, bport, sport, pl + 9, ml - 9);
-            } else if (t == DT_ASSIGN && ml >= 2) {
+            } else if (t == DT_ASSIGN && ml >= 1 + DT_ASSIGN_HDR_N) {
                 dt_apply_assign(pl + 1, ml - 1);
-            } else if (t == DT_STREQ && ml >= 7) {
+            } else if (t == DT_STREQ && ml == 1 + DT_STREQ_N) {
                 /* another player is joining OUR game. Serve it on a
                  * dedicated per-stream relay connection (join thread);
                  * stream data never transits this control link. */
-                unsigned sid = dt_get32(pl + 1);
-                int gport = (int)dt_get16(pl + 5);
-                unsigned ovirt = (ml >= 11) ? dt_get32(pl + 7) : 0;
-                dt_on_streq(sid, gport, ovirt);
+                dt_on_streq(dt_get32(pl + 1), (int)dt_get16(pl + 5), dt_get32(pl + 7));
             } else if (t == DT_UDP_TUN && ml >= 2) {
                 /* UDP-over-TCP mode: one decapsulated UDP-tunnel
                  * datagram; same ingress path as the UDP socket */
@@ -2050,7 +2050,7 @@ unsigned dt_next_sid(void) {
  * assigned, else loopback. Unique triples keep relay per-dest flows and
  * host session tables from merging two players that share home-LAN
  * numbering (or two hook sockets that share slot 0 -> 127.0.0.1:50000).
- * Player-side demux uses the mark/slot, so the IP choice is safe. */
+ * Player-side S2C demux matches (game_port, bound vport). */
 int dt_src_ip(char *out, size_t n) {
     unsigned v;
     DLOCK();

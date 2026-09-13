@@ -37,17 +37,18 @@ NODE_F_HOST = 0x01   # host claim: per-link ordering stamp only, no election
 # process dials the relay and sends T_STJOIN, and the relay answers the
 # claim ON THAT connection: T_STOK = first joiner, serve it; T_STFAIL
 # (STF_BUSY) = a sibling already claimed, stand down WITHOUT bridging.
-# The winner bridges to its local game and sends T_STJOINED; the relay
-# then replies T_STOK to the opener and pipes raw bytes both ways.
+# The winner is STOKed at claim (opener connect() completes then);
+# it bridges the local game and sends T_STJOINED; the relay pipes raw
+# bytes both ways. A bridge failure after claim is a post-connect reset.
 T_STOPEN = 0x07   # opener->relay (per-stream TCP): !I node + !I dest_node + !I sid + !H gport
 T_STREQ = 0x08    # relay->dest (control TCP): !I sid + !H gport + !I opener_virt
 T_STJOIN = 0x09   # dest->relay (per-stream TCP): !I node + !I sid
 T_STJOINED = 0x0A # dest->relay (per-stream TCP, local bridge up): !I sid
 T_STOK = 0x0B     # relay->opener / relay->joinee (claim): !I sid
-T_STFAIL = 0x0C
+T_STFAIL = 0x0C   # relay->opener/joinee: !I sid + !B reason
 T_STSHUT = 0x0D   # half-close: sender flushed, its write side is done
                     # (relay: write_eof the peer's transport; both
-                    # halves EOF -> the stream retires)   # relay->opener/joinee or dest->relay: !I sid + !B reason
+                    # halves EOF -> the stream retires)
 STF_NO_ROUTE = 1  # destination node unknown / not connected / no host for port
 STF_JOIN_TIMEOUT = 2  # destination never joined in time
 STF_HOST_FAILED = 3  # destination could not reach its local game
@@ -74,6 +75,15 @@ U_ICMP_REP = 0x06  # same layout, reply
 
 # stream handshake budget (both sides + relay)
 ST_TIMEOUT_S = 10.0
+
+# Fixed payload lengths (HDR covers type+payload, so wire len = 1 + N).
+# Keep in lockstep with DT_*_N in hook/hk_core.h.
+ASSIGN_HDR_N = 11   # !I my_virt + !I net + !B bits + !H n  (+ 8*n members)
+STOPEN_N = 14       # !I node + !I dest_node + !I sid + !H gport
+STREQ_N = 10        # !I sid + !H gport + !I opener_virt
+STJOIN_N = 8        # !I node + !I sid
+STSID_N = 4         # T_STJOINED / T_STOK: !I sid
+STFAIL_N = 5        # !I sid + !B reason
 
 
 def parse_ports(s):
@@ -211,14 +221,15 @@ def encode_assign(my_virt: int, net: int, bits: int, members) -> bytes:
 def decode_assign(payload: bytes):
     """T_ASSIGN payload -> (my_virt, net, bits, [(node, virt)]) or None."""
     try:
-        if len(payload) < 11:
+        if len(payload) < ASSIGN_HDR_N:
             return None
-        my_virt, net, bits, n = struct.unpack("!IIBH", payload[:11])
-        if len(payload) != 11 + 8 * n:
+        my_virt, net, bits, n = struct.unpack("!IIBH", payload[:ASSIGN_HDR_N])
+        if len(payload) != ASSIGN_HDR_N + 8 * n:
             return None
         members = []
         for i in range(n):
-            node, virt = struct.unpack("!II", payload[11 + 8 * i:19 + 8 * i])
+            off = ASSIGN_HDR_N + 8 * i
+            node, virt = struct.unpack("!II", payload[off:off + 8])
             members.append((node, virt))
         return my_virt, net, bits, members
     except struct.error:
@@ -234,7 +245,7 @@ def encode_stopen(node: int, dest_node: int, sid: int, gport: int) -> bytes:
 def decode_stopen(payload: bytes):
     """T_STOPEN -> (node, dest_node, sid, gport) or None."""
     try:
-        if len(payload) != 14:
+        if len(payload) != STOPEN_N:
             return None
         return struct.unpack("!IIIH", payload)
     except struct.error:
@@ -249,7 +260,7 @@ def encode_streq(sid: int, gport: int, ovirt: int = 0) -> bytes:
 def decode_streq(payload: bytes):
     """-> (sid, gport, opener_virt) or None."""
     try:
-        if len(payload) != 10:
+        if len(payload) != STREQ_N:
             return None
         return struct.unpack("!IHI", payload)
     except struct.error:
@@ -262,7 +273,7 @@ def encode_stjoin(node: int, sid: int) -> bytes:
 
 def decode_stjoin(payload: bytes):
     try:
-        if len(payload) != 8:
+        if len(payload) != STJOIN_N:
             return None
         return struct.unpack("!II", payload)
     except struct.error:
@@ -276,7 +287,7 @@ def encode_stsid(sid: int) -> bytes:
 
 def decode_stsid(payload: bytes):
     try:
-        if len(payload) != 4:
+        if len(payload) != STSID_N:
             return None
         return struct.unpack("!I", payload)[0]
     except struct.error:
@@ -289,7 +300,7 @@ def encode_stfail(sid: int, reason: int) -> bytes:
 
 def decode_stfail(payload: bytes):
     try:
-        if len(payload) != 5:
+        if len(payload) != STFAIL_N:
             return None
         return struct.unpack("!IB", payload)
     except struct.error:
