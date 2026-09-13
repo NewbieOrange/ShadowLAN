@@ -246,6 +246,27 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   init stays 1 s to avoid dial storms.
 - Shared UDP ports: bind EADDRINUSE -> bind ephemeral + `vport` alias
   (SO_REUSEADDR broadcast semantics emulated; fanout matches vport).
+- Windows ledger APIs that fault where docs say they cannot: `OpenProcess
+  + GetProcessTimes(h,&ct,0,0,0)` AV'd the field game at startup inside
+  kernelbase's out-param write (steam_api64 bind -> hk_bind -> slp_claim;
+  reproduced exactly under Wine with the real DLL). Self start-stamp =
+  read `Peb->CreateTime` (gs:0x60, +0xa8; 32-bit fs:[0x30], +0x0a4);
+  foreign liveness = OpenProcess + GetExitCodeProcess ONLY, fail-safes
+  split: `ERROR_INVALID_PARAMETER` = dead (take claim over),
+  `ACCESS_DENIED` = alive (respect it). Wine stubs Peb->CreateTime (same
+  value everywhere) — stamps are self-audit only, never cross-pid.
+- `GetLastError() != ERROR_ALREADY_EXISTS` after `CreateFileMappingA` is
+  NOT a reliable "fresh" signal (Wine: err=0 while a live holder existed
+  — a false fresh WIPES the shared registry between processes). Init is
+  content-based: check the magic under the mutex, never the create error.
+- Keep the mapping's CREATE handle open for the process lifetime
+  (`g_slp_sec`): Wine drops the shared pages of a handle-closed section
+  despite live views (Windows docs keep it via views — do not gamble).
+  Cross-process `Local\` sections themselves share fine under Wine.
+- Test suites must REAP children they kill (`p.kill(); p.wait()`): an
+  unreaped SIGKILL'd holder is still "alive" to the ledger and to the
+  kernel, so the very next trial legitimately collides with it — this
+  masqueraded as a ledger bug for a whole debugging round.
 
 ## Reference test app facts (never modify it)
 
@@ -416,6 +437,20 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   claimed vports. test_bindfidelity guards the whole matrix.
 
 ## Status snapshot (UNRELEASED)
+
+Ledger rc-fixes (field crash cut): rc10 AV'd the game at startup -
+GetProcessTimes faulted writing its create-time out-param (reproducible
+under Wine); replaced with Peb->CreateTime self-stamp + GetExitCodeProcess
+liveness (never GetProcessTimes). Same repro surfaced two registry
+integrity bugs: fresh-detection via ERROR_ALREADY_EXISTS is not preserved
+(Wine showed fresh=1 while a holder was live - wiping the registry between
+processes; init is content-based under the mutex now) and the section
+create handle must stay open (Wine drops pages of handle-closed sections
+despite live views). Debug-gated slp claim/attach logs ship for field
+runs. Verified under Wine with the real DLL: same-node TCP dup -> 10048
+with live-holder verdict in log, cross-node dup aliases and presents the
+vport, bind(0) lands in the node ephemeral space; Linux 19/19, Wine
+test-all gates the release of this cut.
 
 Parallel-haul fixes (this cut, beyond the harness work): (1) ARP
 fan-out for implicit streams now excludes the OPENER'S WHOLE NODE and
