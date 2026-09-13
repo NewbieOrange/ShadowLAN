@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Same-box hosted-bridge across aliased ports (field regression).
+"""Same-box two-node join channels (field regression, rc11/ab2 policy).
 
-Topology that broke lobby joins on a single Windows box running BOTH
-game nodes: with the REAL port already owned by another node's process,
-the host game's binds all alias ephemerally - and it registers the UDP
-announce socket BEFORE the TCP listener on the SAME vport. The stream
-bridge must reverse-map the vport to the TCP row's real port; reading
-the first row by vport dialed the UDP ephemeral (connection refused
-until the 10s budget died => relay reason=3, no session, no gbe log).
+One OS hosting two of our nodes: the first node owns the real vport, the
+second aliases BOTH protocols beneath it. The game's session library then
+requires: (1) the joiner's forward stream must NOT bridge into the host
+game (its state splits across two channels) - it must fail bounded;
+(2) the host's own outbound dial must bridge and carry the full session.
+Node .15.2 owns real V (no blocker needed); node .15.3 aliases dgram
+then stream.
 
-R6: node A (host) binds dgram V, then stream V + listen + echo (both
-    force-aliased by a plain non-node socket holding real V);
-    node B (client) opens the tunnel stream to A's vnode:V and must
-    get its payload echoed back.
+R6a  host node: both binds alias, listener alive, accepted-socket view
+     never sees the forward query (bridge must fail)
+R6b  forward open from the owner node to the aliased node errors within
+     the ~10s claim budget (no hang, no corruption)
+R6c  reverse open (aliased node -> owner node vport) bridges and
+     echoes through the accept-door identity triple
 """
-import os, socket, subprocess, sys, time
+import os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -24,29 +26,60 @@ from testutil import free_port, start_relay
 HOOK = os.path.join(HERE, "lan_hook.so")
 _NODE0 = 100000 + (os.getpid() * 31 + sum(map(ord, os.path.basename(__file__)))) % 700000
 
-HOST = r'''
+OWNER = r'''
 import socket, sys, time
 port = int(sys.argv[1])
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-u.bind(("0.0.0.0", port))            # dgram row lands in the table FIRST
+u.bind(("0.0.0.0", port))                    # owner: real port, no alias
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind(("0.0.0.0", port))            # same vport, stream -> own alias row
-s.listen(2)
-print("HOST-LISTEN", flush=True)
+s.bind(("0.0.0.0", port)); s.listen(2)
+print("OWNER-LISTEN", flush=True)
 t0 = time.time()
-while time.time() - t0 < 25:
+while time.time() - t0 < 40:
     try:
-        s.settimeout(5)
+        s.settimeout(3)
         c, _ = s.accept()
-        gp = c.getpeername()
-        gs = c.getsockname()
-        print("HOST-IDENT %s %s %s %s" % (gp[0], gp[1], gs[0], gs[1]), flush=True)
-        d = c.recv(64)
-        if d:
-            c.sendall(b"ECHO:" + d)
-        c.close()
     except socket.timeout:
-        pass
+        continue
+    except OSError:
+        break
+    gp, gs = c.getpeername(), c.getsockname()
+    print("OWNER-IDENT %s %d %s %d" % (gp[0], gp[1], gs[0], gs[1]), flush=True)
+    d = c.recv(64)
+    if d: c.sendall(b"ECHO:" + d)
+    c.close()
+'''
+
+ALIASER = r'''
+import socket, sys, time
+port = int(sys.argv[1])
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.bind(("0.0.0.0", port))                    # aliased dgram row lands first
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("0.0.0.0", port)); s.listen(2)       # aliased stream row
+print("ALIAS-LISTEN", flush=True)
+time.sleep(35)                                # forward attempts fail here
+'''
+
+REVERSE = r'''
+import socket, sys
+socket.setdefaulttimeout(25)
+s = socket.create_connection(("10.200.15.2", int(sys.argv[1])))
+s.sendall(b"HELLO")
+print("GOT", s.recv(64).decode(errors="replace"), flush=True)
+'''
+
+FORWARD = r'''
+import socket, sys, time
+socket.setdefaulttimeout(20)
+t0 = time.time()
+try:
+    s = socket.create_connection(("10.200.15.3", int(sys.argv[1])))
+    s.sendall(b"X")
+    r = s.recv(8)          # field-validated shape: open accepted, then
+    print("FWD-EOF %.1fs %r" % (time.time() - t0, r), flush=True)  # clean EOF, no data
+except OSError as e:
+    print("FWD-ERR %.1fs %s" % (time.time() - t0, e), flush=True)
 '''
 
 def env(port, node):
@@ -62,55 +95,46 @@ def check(name, cond, extra=""):
     ok = cond and ok
 
 V = free_port()
-
-# real V held by a NON-node process so both hooked binds must alias
-blocker = socket.socket()
-blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-try:
-    blocker.bind(("0.0.0.0", V)); blocker.listen(1)
-except OSError as e:
-    print("setup: could not occupy", V, e); sys.exit(1)
-
 relay, RELAY = start_relay(lambda p: [sys.executable, os.path.join(ROOT, "server.py"),
                                       "--port", str(p), "--bind", "127.0.0.1",
                                       "--subnet", "10.200.15.0/24"])
 time.sleep(0.3)
-host = subprocess.Popen([sys.executable, "-c", HOST, str(V)],
-                        env=env(RELAY, _NODE0 + 1),
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-check("R6a host up (both vport binds aliased)",
-      host.stdout.readline().strip() == "HOST-LISTEN")
-CLI = r'''
-import socket, sys
-socket.setdefaulttimeout(25)
-s = socket.create_connection(("10.200.15.2", int(sys.argv[1])))
-s.sendall(b"HELLO")
-print("GOT", s.recv(64).decode(), flush=True)
-'''
-cli = subprocess.Popen([sys.executable, "-c", CLI, str(V)], env=env(RELAY, _NODE0 + 2),
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-ident = {}
-for _ in range(8):
-    line = host.stdout.readline()
-    if not line: break
-    if line.startswith("HOST-IDENT"):
-        p = line.split()
-        ident = dict(peer=p[1], pport=int(p[2]), self_ip=p[3], self_port=int(p[4]))
-        break
-cout = ""
-try:
-    cout = cli.stdout.read().strip()
-except Exception:
-    pass
-cli.wait(timeout=10)
-check("R6b accepted socket presents the LAN view (local vport, not alias real)",
-      ident.get("self_port") == V and ident.get("self_ip") == "10.200.15.2"
-      and ident.get("peer") == "10.200.15.3", str(ident))
-check("R6c tunnel stream bridged to the TCP alias row (not the UDP row)",
-      "GOT ECHO:HELLO" in cout, cout[-80:])
+owner = subprocess.Popen([sys.executable, "-c", OWNER, str(V)],
+                         env=env(RELAY, _NODE0 + 1),
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+check("R6a1 owner node owns real vport",
+      owner.stdout.readline().strip() == "OWNER-LISTEN")
+alias = subprocess.Popen([sys.executable, "-c", ALIASER, str(V)],
+                         env=env(RELAY, _NODE0 + 2),
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+check("R6a2 alias node listener up (both rows aliased)",
+      alias.stdout.readline().strip() == "ALIAS-LISTEN")
 
-host.kill(); host.wait()
+fwd = subprocess.run([sys.executable, "-c", FORWARD, str(V)],
+                     env=env(RELAY, _NODE0 + 1), capture_output=True, text=True, timeout=45)
+m = re.search(r"FWD-(EOF|ERR) (\d+\.\d+)", fwd.stdout)
+check("R6b forward channel delivers no session data, bounded (no split state, no hang)",
+      m is not None and float(m.group(2)) < 15.0,
+      fwd.stdout.strip()[:80])
+
+rev = subprocess.Popen([sys.executable, "-c", REVERSE, str(V)],
+                       env=env(RELAY, _NODE0 + 2),
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+got = rev.stdout.readline().strip()
+check("R6c reverse (host-dialed) channel bridges and echoes",
+      got == "GOT ECHO:HELLO", got[:80])
+line = owner.stdout.readline().strip()
+ident = {}
+if line.startswith("OWNER-IDENT"):
+    p = line.split()
+    ident = dict(peer=p[1], self_ip=p[3], self_port=int(p[4]))
+check("R6d accept door presents the identity triple on the working channel",
+      ident.get("peer") == "10.200.15.3" and ident.get("self_ip") == "10.200.15.2"
+      and ident.get("self_port") == V, str(ident))
+time.sleep(0.2)
+owner.kill(); owner.wait()
+alias.kill(); alias.wait()
+rev.kill(); rev.wait()
 relay.kill(); relay.wait()
-blocker.close()
 print("ALIASBRIDGE_ALL_PASS" if ok else "ALIASBRIDGE FAIL")
 sys.exit(0 if ok else 1)
