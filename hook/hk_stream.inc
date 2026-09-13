@@ -740,6 +740,27 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
 }
 /* Joinee side: serve one inbound stream (DT_STREQ from the control link). */
 static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
+    {   /* co-host guard: if MY listener for this game port is aliased,
+         * one of our other nodes owns the real port on this same kernel.
+         * Two "machines" sharing one kernel while advertising identical
+         * ports is a state no physical LAN produces and the games'
+         * reconnect/replace logic does not survive (field rc15/16: live
+         * session sockets killed mid-handshake by the peer's redial
+         * storm crossing the bridge). Yield the forward claim: the join
+         * completes over the peers' own outbound leg - deterministically
+         * reproducing what passing same-box runs (rc11/ab2) did by
+         * alias-table luck. Cross-machine this never fires: a lone node
+         * always owns its real ports. */
+        int rr = dt_alias_real(gport, SOCK_STREAM);
+        if (rr && rr != gport) {
+            char lb[160];
+            snprintf(lb, sizeof lb,
+                     "hosted req co-hosted (aliased listener), yielding pid=%u sid=%u port=%d real=%d",
+                     (unsigned)current_pid(), sid, gport, rr);
+            dlog(lb);
+            return;
+        }
+    }
     if (!dt_owns_listen(gport)) {
         /* this process has no listener on the game port: leave the
          * stream to the sibling that does (or to timeout if none) */

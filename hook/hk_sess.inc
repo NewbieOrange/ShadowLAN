@@ -124,7 +124,9 @@ static int dt_host_bridge(unsigned sid, int port) {
      * channel fails bounded (relay reason=3) and the join completes over
      * the host's own dial, carrying the full lobby blob (271KB measured).
      * Cross-machine runs never alias - one row or zero - and are
-     * unaffected. Do NOT 'correct' this to SOCK_STREAM; the app decides. */
+     * unaffected. The DETERMINISTIC protection is the co-host guard in
+     * dt_on_streq (aliased listener => yield the claim); this line is
+     * only a backstop. Do NOT 'correct' it to SOCK_STREAM. */
     { int al = dt_alias_real(port, -1); if (al) port = al; }
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)port);
