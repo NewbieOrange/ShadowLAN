@@ -740,45 +740,6 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
 }
 /* Joinee side: serve one inbound stream (DT_STREQ from the control link). */
 static void dt_on_streq(unsigned sid, int gport, unsigned ovirt) {
-    {   /* co-host guard: if MY listener for this game port is aliased,
-         * one of our other nodes owns the real port on this same kernel.
-         * Two "machines" sharing one kernel while advertising identical
-         * ports is a state no physical LAN produces and the games'
-         * reconnect/replace logic does not survive (field rc15/16: live
-         * session sockets killed mid-handshake by the peer's redial
-         * storm crossing the bridge). Yield the forward claim: the join
-         * completes over the peers' own outbound leg - deterministically
-         * reproducing what passing same-box runs (rc11/ab2) did by
-         * alias-table luck. Cross-machine this never fires: a lone node
-         * always owns its real ports. */
-        int rr = dt_alias_real(gport, SOCK_STREAM);
-        if (rr && rr != gport) {
-            char lb[160];
-            snprintf(lb, sizeof lb,
-                     "hosted req co-hosted (aliased listener), yielding pid=%u sid=%u port=%d real=%d",
-                     (unsigned)current_pid(), sid, gport, rr);
-            dlog(lb);
-            return;
-        }
-    }
-    {   /* replacement atomicity: a session arriving for the SAME
-         * (peer, game port) pair means the peer already closed the old
-         * socket - on a real network that truth reaches us with or
-         * before the new SYN; our multi-hop relay path can lag it.
-         * Retire any live predecessor BEFORE claiming, so the game's
-         * socket-replacement sees the LAN invariant: old gone, new in.
-         * Harmless cross-machine (usually a no-op; when it fires, the
-         * old stream is genuinely dead anyway). */
-        unsigned old_sids[4]; int n_old = 0;
-        DLOCK();
-        for (int i = 0; i < DT_MAXHOST; i++)
-            if (g_hs[i].used && g_hs[i].ovirt == ovirt &&
-                g_hs[i].gport == gport && g_hs[i].sid != sid && n_old < 4)
-                old_sids[n_old++] = g_hs[i].sid;
-        DUNLOCK();
-        for (int k = 0; k < n_old; k++)
-            dt_hs_close(old_sids[k]);
-    }
     if (!dt_owns_listen(gport)) {
         /* this process has no listener on the game port: leave the
          * stream to the sibling that does (or to timeout if none) */
@@ -1409,15 +1370,19 @@ static void dt_udp_ingress(const unsigned char *buf, size_t n) {
     if (n < 10 || buf[0] != 'V' || buf[1] != 'N' || buf[2] != DU_VER) return;
     { char lb[80]; snprintf(lb, sizeof(lb), "udp tun in op=0x%02x n=%d pid=%u", buf[3], (int)n, (unsigned)current_pid()); dlog(lb); }
     if (buf[3] == DU_C2S) {
-        /* inbound: another player targets OUR hosted game */
+        /* inbound: another player targets OUR hosted game.
+         * source slot carries the sender's BOUND VPORT (LAN-true:
+         * what its NIC puts on the wire) - apps may fold it and dial
+         * it back (SNS does). The legacy return-routing mark moved to
+         * an optional tail. */
         int gp2 = dt_get16(buf + 4), il2 = dt_get16(buf + 6);
         if (8 + il2 + 2 > (int)n) return;
         {
             int cport2 = dt_get16(buf + 8 + il2);
-            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2,
-                                  buf + 10 + il2, n - 10 - (size_t)il2))
-                dt_direct_udp_in(gp2, buf + 8, il2,
-                                 buf + 10 + il2, n - 10 - (size_t)il2);
+            const unsigned char *pl = buf + 10 + il2;
+            size_t rl = n - 10 - (size_t)il2;
+            if (!dt_hosted_udp_in(gp2, buf + 8, il2, cport2, pl, rl))
+                dt_direct_udp_in(gp2, buf + 8, il2, pl, rl);
         }
         return;
     }
@@ -1435,21 +1400,28 @@ static void dt_udp_ingress(const unsigned char *buf, size_t n) {
     dlog("udp tun: S2C in");
     {
         int gp = dt_get16(buf + 4), il = dt_get16(buf + 6);
-        int mp, slot;
+
         const unsigned char *raw;
         size_t rl;
         struct sockaddr_in orig; long long gs = -1; int ok = 0;
         if (8 + il + 2 > (int)n) return;
-        mp = dt_get16(buf + 8 + il);
+        int cport = dt_get16(buf + 8 + il);   /* our port, per the flow triple */
         raw = buf + 10 + il; rl = n - 10 - (size_t)il;
-        slot = dt_unmark(mp);
-        DLOCK();
-        if (slot >= 0 && slot < DT_MAXSLOT && g_sl[slot].used && g_sl[slot].game_port == gp) {
-            orig = g_sl[slot].orig; gs = g_sl[slot].gsock; ok = 1;
+        {   /* match the C2S flow row we recorded when WE dialed this host:
+             * (host service port, our bound vport) - the same information
+             * v2 encoded as a slot index; no wire handle needed. */
+            DLOCK();
+            for (int si = 0; si < DT_MAXSLOT; si++) {
+                if (!g_sl[si].used || g_sl[si].game_port != gp) continue;
+                int lv = dt_alias_vport(g_sl[si].gsock);
+                if (lv == cport) {
+                    orig = g_sl[si].orig; gs = g_sl[si].gsock; ok = 1; break;
+                }
+            }
+            DUNLOCK();
         }
-        DUNLOCK();
         if (ok) dt_udp_push(gs, raw, rl, &orig);
-        else dlog("udp tun: slot miss");
+        else dlog("udp tun: flow miss");
     }
 }
 

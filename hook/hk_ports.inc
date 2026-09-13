@@ -90,6 +90,7 @@ static ssize_t (*r_recv)(int, void *, size_t, int);
 static ssize_t (*r_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
 static int (*r_close)(int);
 static int (*r_bind)(int, const struct sockaddr *, socklen_t);
+
 static int (*r_connect)(int, const struct sockaddr *, socklen_t);
 #endif
 

@@ -115,21 +115,15 @@ static int dt_bind_alias(long long s, const struct sockaddr_in *want,
 }
 /* Local loopback bridge to our own game server (joinee side). */
 static int dt_host_bridge(unsigned sid, int port) {
-    /* FIELD-VALIDATED channel policy (rc11 + ab2 runs, broken in rc15/16):
-     * when one OS hosts TWO of our nodes, the game's session library needs
-     * the inbound lobby-query channel to NOT reach it in parallel with its
-     * own outbound session channel - it splits its per-peer state over the
-     * two sockets and stalls (6B retransmits -> host closes -> RST, no
-     * session). With any-proto first-match the bridge resolves to the
-     * datagram alias row when both protocols are aliased, so the forward
-     * channel fails bounded (relay reason=3) and the join completes over
-     * the host's own dial, carrying the full lobby blob (271KB measured).
-     * Cross-machine runs never alias - one row or zero - and are
-     * unaffected. The DETERMINISTIC protection is the co-host guard in
-     * dt_on_streq (aliased listener => yield the claim); this line is
-     * only a backstop. Do NOT 'correct' it to SOCK_STREAM. */
-    { int al = dt_alias_real(port, -1); if (al) port = al; }
-    struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
+    /* Resolve the hosted listener's REAL port (it may be aliased when
+     * another of our nodes owns the vport number on this kernel).
+     * Proto-scoped: the datagram alias row must never capture a TCP
+     * bridge (field rc14: dialing the UDP row = reason=3). Same-box
+     * forward bridging is correct v3 behavior since the mark leak
+     * (v2's real poison) is gone. */
+    { int al = dt_alias_real(port, SOCK_STREAM); if (al) port = al; }
+    struct sockaddr_in lo;
+    memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     DTSOCK s;

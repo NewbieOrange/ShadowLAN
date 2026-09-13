@@ -313,6 +313,52 @@ static int dt_reject_wire4(const struct sockaddr_in *dst) {
     if (sockaddr_is_lan_target((const struct sockaddr *)dst, &dummy)) return 0;
     return 1;
 }
+/* v3 source identity: the port a peer may dial us back at = our BOUND
+ * vport (explicit bind, or the kernel's auto-bind recorded as an
+ * identity row on first send - exactly what a real NIC stamps). Apps
+ * fold recvfrom sources into peer state, so it must never be an
+ * internal number. Returns 0 only if no identity can be established. */
+static int dt_sport_presentation(long long gsock) {
+    int sv = dt_alias_vport(gsock);
+    if (sv > 0) return sv;
+    struct sockaddr_in sn;
+#ifdef LINUX_BUILD
+    socklen_t sl = sizeof(sn);
+    if (getsockname((int)gsock, (struct sockaddr *)&sn, &sl) != 0) return 0;
+#else
+    int sl = (int)sizeof(sn);
+    if (getsockname((SOCKET)gsock, (struct sockaddr *)&sn, &sl) != 0) return 0;
+#endif
+    if (sn.sin_family != AF_INET) return 0;
+    int p = ntohs(sn.sin_port);
+    if (!p) {
+        /* unbound UDP socket: replicate the implicit bind the kernel
+         * performs on the first sendto (raw: ephemeral, not a ledger
+         * claim), so the reply has a real port to come back to */
+        memset(&sn, 0, sizeof(sn));
+        sn.sin_family = AF_INET;
+        sn.sin_addr.s_addr = htonl(INADDR_ANY);
+#ifdef LINUX_BUILD
+        dt_reals();
+        if (!r_bind || r_bind((int)gsock, (struct sockaddr *)&sn,
+                              (socklen_t)sizeof(sn)) != 0) return 0;
+#else
+        if (bind((SOCKET)gsock, (struct sockaddr *)&sn, (int)sizeof(sn)) != 0) return 0;
+#endif
+#ifdef LINUX_BUILD
+        sl = sizeof(sn);
+        if (getsockname((int)gsock, (struct sockaddr *)&sn, &sl) != 0) return 0;
+#else
+        sl = (int)sizeof(sn);
+        if (getsockname((SOCKET)gsock, (struct sockaddr *)&sn, &sl) != 0) return 0;
+#endif
+        p = ntohs(sn.sin_port);
+        if (!p) return 0;
+    }
+    dt_alias_add(gsock, p, p, dt_sock_type(gsock));
+    return p;
+}
+
 static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
                         const struct sockaddr_in *dst) {
     if (dt_is_icmp_sock(gsock))
@@ -412,14 +458,15 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
         if (slot < 0) return 1;
         char srcip[32]; const char *mip = "127.0.0.1"; int ml = 9;
         if (dt_src_ip(srcip, sizeof(srcip))) { mip = srcip; ml = (int)strlen(srcip); }
-        int mark = dt_mark(slot);
+        int sp = dt_sport_presentation(gsock);
+        if (sp <= 0) return 1;
         size_t n = 4 + 4 + 2 + 2 + (size_t)ml + 2 + len;
         unsigned char *d = (unsigned char *)malloc(n);
         if (!d) return 1;
         d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_PDAT;
         dt_put32(d + 4, vnode);
         dt_put16(d + 8, (unsigned)game_port); dt_put16(d + 10, (unsigned)ml);
-        memcpy(d + 12, mip, (size_t)ml); dt_put16(d + 12 + ml, (unsigned)mark);
+        memcpy(d + 12, mip, (size_t)ml); dt_put16(d + 12 + ml, (unsigned)sp);
         if (len) memcpy(d + 14 + ml, buf, len);
         dt_udp_tun_send(d, n);
         free(d);
@@ -485,16 +532,17 @@ static int dt_on_sendto(long long gsock, const unsigned char *buf, size_t len,
     int slot = sl ? (int)(sl - g_sl) : -1;
     DUNLOCK();
     if (slot < 0) { dlog("udp game: slot table full"); return 1; } /* table full: drop, pretend sent */
-    /* build U_GAME_C2S: VN 02 01 | H game | H iplen | ip | H mark | raw */
+    /* build C2S v3: 'V','N',3,01 | H game | H iplen | ip | H sport(=bound vport: the dial-back identity) | H mark(internal) | raw */
     char srcip2[32]; const char *mip = "127.0.0.1"; int ml = 9;
     if (dt_src_ip(srcip2, sizeof(srcip2))) { mip = srcip2; ml = (int)strlen(srcip2); }
-    int mark = dt_mark(slot);
+    int sp = dt_sport_presentation(gsock);
+    if (sp <= 0) { dlog("udp game: no presentation port"); return 1; }
     size_t n = 4 + 2 + 2 + (size_t)ml + 2 + len;
     unsigned char *d = (unsigned char *)malloc(n);
     if (!d) return 1;
     d[0] = 'V'; d[1] = 'N'; d[2] = DU_VER; d[3] = DU_C2S;
     dt_put16(d + 4, (unsigned)game_port); dt_put16(d + 6, (unsigned)ml);
-    memcpy(d + 8, mip, (size_t)ml); dt_put16(d + 8 + ml, (unsigned)mark);
+    memcpy(d + 8, mip, (size_t)ml); dt_put16(d + 8 + ml, (unsigned)sp);
     if (len) memcpy(d + 10 + ml, buf, len);
     dt_udp_tun_send(d, n);
     free(d);

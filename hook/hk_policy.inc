@@ -204,7 +204,13 @@ typedef SOCKET DTSOCK;
 #define ST_DEAD 3
 /* UDP tunnel datagram ops: 'V' 'N' DU_VER op payload... (keep in sync
  * with common.py U_* table) */
-#define DU_VER 2
+/* UDP tunnel datagram framing version 3 (the only version on the wire):
+ * source port = the sender socket's BOUND VPORT (what a real NIC puts
+ * on the wire; apps legitimately fold recvfrom sources and dial them
+ * back - the legacy mark-in-source-port broke exactly that, field SNS
+ * black-screen). Return-routing mark travels as its own fixed u16
+ * field. Co-ships with the relay and all hooks (like PVER 2). */
+#define DU_VER 3
 #define DU_C2S 0x01
 #define DU_S2C 0x02
 #define DU_PDAT 0x03

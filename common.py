@@ -62,7 +62,10 @@ STF_BUSY = 5      # stream id already in use
 # datagram header instead.
 PVER = 0x02
 UMAGIC = b"VN"
-UVER = PVER
+UVER = 3          # UDP datagram framing v3 (sole version): source port =
+                  # sender's bound vport (the dial-back identity); the
+                  # internal return-routing mark is its own fixed u16
+                  # field. Co-ships with the hooks, like PVER.
 U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
 U_GAME_P2P = 0x03  # payload: !I dest_node + std triple+raw
@@ -128,6 +131,13 @@ class QueueProto(asyncio.DatagramProtocol):
 
 
 def encode_udp_game(mtype, game_port, cli_ip, cli_port, raw):
+    """Game datagram (C2S/S2C). v3: cli_port is the SENDER socket's
+    bound vport - the dial-back identity a real NIC stamps (v2 carried
+    an internal slot number there, which apps folded and could not
+    re-dial: field SNS black screen). Byte layout unchanged from v2;
+    UVER marks the meaning. No mark field exists in v3: return routing
+    rides (game_port, ip, cli_port) - the receiver locates its socket
+    by the triple it itself used."""
     ipb = cli_ip.encode()
     return (UMAGIC + bytes([UVER, mtype])
             + struct.pack("!HH", game_port, len(ipb)) + ipb
