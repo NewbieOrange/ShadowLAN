@@ -33,7 +33,8 @@ never head-of-line-block discovery or other streams.
 
 - `connect()` to a vnet/LAN address only returns success after the relay
   confirms the destination actually bridged the stream to its local game
-  (STOPEN → STREQ → STJOIN → claim → STJOINED → STOK, 10s budget). With
+  (STOPEN → STREQ → STJOIN → STOK at claim; STJOINED starts the pipe,
+  10s budget). With
   a shared process-tree identity the STREQ goes to every sibling and the
   relay answers each JOIN with a claim (`OK`/`BUSY`) before anything
   touches the local game port. Nonblocking
@@ -203,6 +204,6 @@ capture: no UDP broadcasts / LAN connects = nothing to tunnel.
 - IPv4 only. IPv6 passes through.
 - Async overlapped `WSARecvFrom`/`WSASend`/`WSARecv` pass through unspoofed
   (most LAN discovery/gameplay uses blocking calls).
-- `ConnectEx` / `WSAConnectByList` / event-based (`WSAEventSelect`)
-  waiting not hooked.
+- `ConnectEx` / `WSAConnectByList` are not hooked. `WSAEventSelect` /
+  `WSAWaitForMultipleEvents` are (virtual FD_READ/WRITE/CONNECT/CLOSE).
 - One game per relay port; `--token` is the room key.

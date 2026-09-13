@@ -70,9 +70,10 @@ both ends dial out; that is the anti-HoL design; never multiplex streams):
     T_STOPEN=0x07 -> relay fans T_STREQ=0x08 to EVERY live link of dest
     node; siblings race to serve. T_STJOIN=0x09 is answered on the
     joiner's own conn with the CLAIM: T_STOK=0x0B (you serve) or
-    T_STFAIL=0x0C + STF_BUSY (stand down BEFORE bridging). Winner bridges
-    127.0.0.1:game-port (retries ~1s) then sends T_STJOINED=0x0A; relay
-    then STOKs the OPENER. After that: raw bytes both ways. 10s budget
+    T_STFAIL=0x0C + STF_BUSY (stand down BEFORE bridging). The opener
+    is also STOKed at claim (connect() completes). Winner bridges
+    127.0.0.1:game-port (retries ~1s) then sends T_STJOINED=0x0A and
+    the relay pipes raw bytes both ways. 10s budget
     (ST_TIMEOUT_S / DT_ST_TIMEOUT_MS).
     Failure reasons STF_NO_ROUTE/TIMEOUT/HOST_FAILED/BAD_ID/BUSY = 1..5;
     hook maps them to WSAECONNREFUSED/WSAETIMEDOUT (also ECONNRESET on
@@ -310,7 +311,7 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   they move together in a dedicated `chore: bump version to X` commit.
 - **rc versions are NEVER committed** — local stamp only; keep those two
   lines dirty in the working tree between releases (current: none —
-  2.0.0 is released; the next committed stamp is the 3.0.0 release).
+  3.0.0 is released; the next local build starts 3.0.1-rc1).
   At release: change to the final number, commit the bump, build, ship.
 - **No rc references in git content either**: all change notes between
   releases live in ONE "Status snapshot (UNRELEASED)" section here; at
@@ -441,298 +442,36 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   from the node's ephemeral space (>=49152) and must not collide with
   claimed vports. test_bindfidelity guards the whole matrix.
 
-## Status snapshot (UNRELEASED)
+## Status snapshot (3.0.0)
 
-PVER 3 + hook modules (this cut): control registration is now PVER 3
-(old PVER-2 peers fail-fast at NODE). ASSIGN dropped the unused
-`link_id` tail (payload length `11+8*n`); `decode_streq` requires the
-10-byte opener-virt form; `dt_mark`/`dt_unmark`/`g_link_id` deleted;
-NODE token prefix renamed `dt_token_prefix`. UVER stays 3. Hook is
-real TUs: `hk_core` (ops, tables, DLOCK, policy) plus one `.c` per
-former `.inc` fragment; `lan_hook.c` is the version stamp only.
-Makefile `MOD` lists every `hk_*.c` (Linux skips `hk_win*`, Windows
-skips `hk_linux.c`). Product stamps stay dirty locally until the
-release bump. Hook + relay ship together.
+3.0.0 RELEASED. Wire is PVER 3 / UVER 3; hook + relay ship together
+(PVER-2 peers fail-fast at NODE).
 
-Source-port identity (prior unreleased cut): source port = bound vport,
-mark system DELETED (dt_mark/dt_unmark/g_link_id-arithmetic gone; frame
-bytes unchanged from the v2 UDP layout - only the meaning + UVER 3).
-This was the last same-box
-fidelity gap: with it fixed, the co-host yield guard and the any-proto
-bridge backstop were RETIRED - same-box double-node runs now behave
-exactly like two machines (forward+reverse channels both bridge;
-test_aliasbridge R6b asserts FWD round-trip through the alias; local
-SNS dual-dial harness /tmp/opencode/gbelob echoes both directions).
-Replacement atomicity (dt_on_streq retires the same (peer,gport)
-session before claiming) stays: it restores the kernel guarantee that
-a new connection implies the old is dead - GBE's REPLACED logic
-depends on it at ~0ms RTT. The v2-era 'do NOT correct dt_host_bridge
-to SOCK_STREAM' decree is OVERTURNED by the mark fix - that policy
-existed only to keep the poisoned forward channel from being used.
-Same-box field round still needed after the source-identity cut.
-
-Own-vnode TCP hairpin (this cut): must use THIS process's alias real
-port, not the vport number. Same-box JoinLobby timed out because the
-joiner's self-dial of 10.200.0.3:47584 was rewritten to
-127.0.0.1:47584 - the HOST's real listener. Host accepted it
-(acc-hook learn=0), the session library replaced the tunneled peer
-socket. Two real machines (or Tailscale) never share a kernel port,
-so a NIC hairpin cannot cross vnodes. dt_host_bridge already rewrote
-this way; dt_on_connect did not. test_aliasbridge R6e: aliased node
-connect(own vnode:V) is accepted by the aliaser, never the owner.
-Cross-machine: no alias row => hairpin still uses the vport
-(real == vport).
-
-Stream recv gather (this cut): FIONREAD reports the full in-queue
-(st->total) but dt_stream_pop returned only the first chunk. Kernel
-TCP: recv(N) when N bytes are already queued returns N. The reference
-lobby stack does ioctl(FIONREAD) then recv(exactly that) and never
-shrinks a short read - a first-chunk pop leaves an oversized buffer
-whose length prefix never completes, so a later JOIN sitting behind a
-271KB friends dump is never parsed (host app-rx'd the 72B, zero
-UNBUFFER / no LOBBY MESSAGE). Same-box field after the hairpin fix
-was this. test_fullduplex scenario 4. Accept-door learn also stopped
-using "first live hosted row": a self-dial loopback accept stole the
-opener vnode (hairpin learn=1). Match is accept-peer == hosted bridge
-ephemeral only.
-
-Co-host guard (replaces slot-luck): dt_on_streq now yields the inbound
-forward claim WHENEVER its own listener for that vport is aliased
-(real != vport = another of our nodes owns the kernel port). Field
-traces proved identity spoofing is complete (FOLD/ACC-VIEW byte-equal
-pass-vs-fail) - the killer is GBE's reconnect storm (epoch-initialized
-timers send an immediate first beat; every stale redial lands as a real
-inbound through the bridge and REPLACEd - kills live sockets). Two
-machines never enter this state; vnet-same-box with both nodes serving
-47584 does, and no spoofing can make the app's state machine survive
-it. Yielding the forward channel is exactly what the passing same-box
-runs did by luck. test_aliasbridge R6b went nondeterministic->10.0s
-deterministic. Cross-machine: predicate never true => provably inert.
-Linux same-box harness note: flaky BOTH configs after heavy kernel-UDP
-windows - trust Windows field rounds for join semantics.
-
-rc17 = the A/B outcome: bridge dial reverted to any-proto first-match
-(field-validated rc11/ab2 behavior, deliberate policy now), self-view
-and proto-scoped helpers KEPT. A/B binaries: rc11-abtest and rc16-ab2
-both joined same-box; rc15/16 did not -> single call site was the axis.
-Deploy rc17 for field: identical semantics to rc11-era joins plus all
-crash fixes and the ledger.
-
-rc15 field round (same-box): alias bridge fix verified working end to
-end (271KB lobby + heartbeats crossed byte-exact), but the host game's
-ACCEPTED sockets still leaked the listener's alias real port via
-getsockname -> identity triple disagreed -> app closed the session and
-RST the retries. New dt_acc_self_view presents (own vnode, listen
-vport) on both platforms (test_aliasbridge R6b guards the triple).
-The WAN topology can never hit this (no aliasing); only one-machine
-double-node runs do.
-
-Channel policy (settled by A/B after three field rounds): when one OS
-hosts two of our nodes, the HOST game must NOT receive the joiner's
-forward lobby-query on a bridged accept socket - its session library
-then splits per-peer state across the forward channel and its own
-outbound session dial (observed rc15/16: full 271KB served on the
-forward channel, 6B retransmits, host closes, retries RST, no session).
-rc11 'worked' because the proto-blind bridge resolver dialed the datagram
-alias row: the forward channel died bounded (reason=3 / connect-then-EOF
-in ~1s) and the join completed on the host's own outbound dial. ab2
-(rc16 minus the proto-scoped bridge call) reproduced rc11 success; rc17
-ships that as POLICY with the reasoning in code (hk_sess dt_host_bridge)
-and a field-faithful guard (test_aliasbridge: owner node + aliasing node,
-forward must stay dataless+bounded, reverse must echo with the correct
-accept-door triple). dt_alias_real keeps its proto parameter - hosted-UDP
-inbound and every future consumer use it; ONLY the bridge dials -1.
-Cross-machine runs have no alias rows and are untouched either way.
-
-TU refactor (post-split sweep): hk_util.c (clock/log/stamp/sleep/pid/rng),
-hk_alias.c (vport<->real table; slp_release_sock became dt_alias_release_all
-so the table owner iterates its own rows - alias->ledger is one-way now)
-and hk_ledger.c (claim registry; node id PUSHED via slp_set_node, module
-reads no core globals; claim verdict dlogs on both platforms) compile as
-independent TUs behind hk_api.h; the tangled core stays one TU (root +
-fragments, order-dependent, shared statics - documented at the include
-list). Interface names all dt_/slp_-prefixed (verified zero libc .dynsym
-collisions; LD_PRELOAD-safe). Gotchas logged: GNU make silently REJECTS a
-pattern rule whose extra prerequisites (headers) are missing - the error
-names the target, not the missing header; and `make clean` + test-all
-missing injector.exe in its deps = test_late build() -> LATE_SKIP -> suite
-FAIL (deps now closed). Gate 20/20 incl. Wine; core still -Wextra clean.
-
-Post-rc11 sweep (field-confirmed state): dead code gone
-(dt_fd_readable_peek, Windows slp_starttime, stream_freed accumulator),
-retired-election wording purged from comments/READMEs, g_ta gets
-DT_TA_MAX, select/poll misleading-indentation reformatted (now zero
-compiler warnings on -Wextra for the Linux build), helper imports
-consolidated, runtests prints per-suite wall times. Substantive fix
-found by the audit: dt_rand_seed accumulated in 'unsigned long' =
-32-bit on EVERY Windows ABI, so the (x>>32) fold was UB/no-op - the
-sid/heap seed was weaker than designed on both DLL builds; now a real
-64-bit accumulator. CAUTION logged the hard way twice more: pruning
-'unused' imports needs WORD-ANCHORED usage counts (line-count grep
-swallowed encode_stsid -> _implicit_grant NameError -> perdest spun its
-10s-retry loop looking like a hang), and never pipe runtests through
-tail (buffers until EOF; write to a file). Full gate 20/20 parallel. Then the registry's own bug: stale
-claims accumulate (SIGKILL'd suites never release) and only key-matched
-takeover reclaimed them - a day of runs filled all 192 slots and the
-fail-open (-2) path silently re-allowed same-node duplicate binds.
-slp_claim now does a janitor pass at allocation (dead-owner slot =
-free slot; full tables pay one bounded liveness scan per claim).
-bindfidelity runs stacked-green against an intentionally full registry;
-gate 20/20 again.
-
-Shared-port fidelity final cut: the ledger's UDP rule is now exactly
-the kernel's (SO_REUSEADDR on both sides), the Wine clash fixture was
-corrected to test the faithful matrix instead of the old alias-around
-behavior (a fixture asserting non-kernel semantics was the blocker, not
-the hook), and hk_bind's single-exit path both restores the debug
-`bind pid=` line the harnesses watch and stops dlog from clobbering
-WSAGetLastError (field-visible class of bug: apps saw err 2 for a
-refused bind). test-all now runs everything - 19 Linux suites + Wine -
-as ONE parallel set: 20/20.
-
-Ledger rc-fixes (field crash cut): rc10 AV'd the game at startup -
-GetProcessTimes faulted writing its create-time out-param (reproducible
-under Wine); replaced with Peb->CreateTime self-stamp + GetExitCodeProcess
-liveness (never GetProcessTimes). Same repro surfaced two registry
-integrity bugs: fresh-detection via ERROR_ALREADY_EXISTS is not preserved
-(Wine showed fresh=1 while a holder was live - wiping the registry between
-processes; init is content-based under the mutex now) and the section
-create handle must stay open (Wine drops pages of handle-closed sections
-despite live views). Debug-gated slp claim/attach logs ship for field
-runs. Verified under Wine with the real DLL: same-node TCP dup -> 10048
-with live-holder verdict in log, cross-node dup aliases and presents the
-vport, bind(0) lands in the node ephemeral space; Linux 19/19, Wine
-test-all gates the release of this cut.
-
-Parallel-haul fixes (this cut, beyond the harness work): (1) ARP
-fan-out for implicit streams now excludes the OPENER'S WHOLE NODE and
-grants claims on a short preferential window (IMPLICIT_GRACE_S: all
-claims collected, freshest host_claim wins, rest get BUSY) - with
-pure first-come claims a bridge host could claim its own stream and
-host-migration was nondeterministic (perdest/tcp-survive caught it).
-(2) wclient fire-and-forget `create_task` calls had no strong refs -
-the loop holds only weak references, so live stream pumps could be
-GC'd mid-flight (the exact "Task was destroyed but it is pending"
-+ peer-EOP pattern perdest hit under parallel load); all spawn sites
-now go through WinClient._spawn() (same pattern the relay's
-_conn_tasks uses).
-
-Parallel test harness (this cut): `make -C hook test` now runs every
-suite concurrently via runtests.py (-j auto = cpu_count; `J=n` or
-SHADOWLAN_TEST_JOBS to override; name substrings filter). All 18 suites
-self-allocate REAL ports via testutil.free_port()/free_ports()/free_trio()
-and pid-unique tmp paths; test_socket_doors is now fully self-contained
-(both child scripts embedded instead of the old /tmp/opencode files, with
-an explicit client-dead mode instead of a hard-coded port-number sniff).
-Hook-internal vports may stay fixed (aliasing covers same-port siblings).
-
-Event-driven internal IO (this cut): every tunnel wait is now an event,
-not a poll cadence. Control link + per-stream pumps select on kernel
-readiness PLUS self-wake datagram pairs (socketpair on Linux, connected
-loopback UDP pair on Windows) so a cross-thread enqueue (app send,
-control-frame queue, in-window reopen, close handoff) wakes the sleeper
-immediately; poll slices remain only as idle backstops (100ms control,
-100ms pumps, 2ms handshake frames). Wake paths MUST call real libc/ws2
-symbols (r_send/r_recv, GetProcAddress'd send/recv): the hooked entry
-points re-enter the non-recursive DLOCK and deadlock - caught by
-test_direct/virtual_p2p/lanonly when the first cut used plain calls.
-Wake-only select wakeups must skip the frame reader (EAGAIN there means
-redial: the first cut tore the control link down on every app send).
-Measured locally: claim round trip open->ok <1ms (was 44ms in field
-logs), 271KB relay->app in 77ms pre-fix; suites + fullduplex gate it.
-
-Field join timeline closed (rc7 logs): joiner received the host's full
-270,986B lobby reply 77ms after the bridge (per-chunk hs out proves the
-pump caught the game's writes instantly; partial recvs rule out pump
-lag). The remaining ~16s = the HOST GAME writing the giant message's
-final 464B as 113B pieces on its own exact 5.0s rounds - head-of-line
-protobuf parse waits for that tail; a JOIN retry after it lands joins
-immediately. Trigger counts (LAN 12 vs vnet 1 lobby-dataupdates) also
-point at app-side peer bookkeeping, not transport. Nothing pending in
-hook/relay for the join path; exit-drain verified live (3x per machine,
-clean player-gone cascade).
-
-Kernel close/duplex fidelity (this cut): shutdown() implemented
-(SHUT_RD discards, SHUT_WR flushes + FINs the peer via new T_STSHUT
-control frame; reverse direction stays alive); close() now flushes the
-queued out-queue before retiring the stream; peer FIN half-closes both
-pumps instead of killing them; FIN vs RST distinguished (recv: 0 vs
-ECONNRESET; Linux send-on-reset raises SIGPIPE); getsockopt(SO_ERROR)
-emulates connect completion (0 while pending - the kernel carries only
-completion errors - refused/timeout/reset after); select/poll suppress
-the vacuous writable of a still-connecting socket and deliver the
-connect edge once at verdict; hosted-pump relay-read gate fixed (the
-hold slot could be overwritten mid-drain, silently dropping up to a
-64KB window). New test_fullduplex covers all of it; exitdrain uses an
-isolated subnet. T_STSHUT: relay+hook ship together (old peers just
-never half-close - degrades, no corruption).
-
-Hosted-pump integrity (this cut): the joinee pipe used to abandon the
-remainder of a game read when the relay connection would block
-(nonblocking send + bare break) - a silently corrupted stream strands
-the peer's message parser until the sender's NEXT write flushes the
-tail, which presents as multi-second-to-minute join/data stalls that
-look app-side. Now a hold slot + writable watch + read-gate (no new
-game reads while pending), i.e. kernel send-buffer semantics inside the
-pump. Pump chunk logs (hs in/out) are unconditional for field timing.
-
-Exit semantics + membership truth (this cut): (1) the kernel flushes a
-socket's queued bytes when a process exits — our stream out-queue did
-not, so a game's parting frames died with it and peers waited out the
-app-level timeout instead of seeing a clean close (field: stale player
-after quit). dt_flush_streams() now drains queued stream bytes + the
-control-frame queue on exit (cooperative flushing/sending handshake
-with the pumps, bounded budget, fds left open so teardown FINs after
-the bytes). Hooked doors: Windows ExitProcess/TerminateProcess (self),
-Linux exit/_exit + atexit. test_exitdrain proves 200KB queued +
-os._exit still lands byte-exact. (2) members() only lists nodes with a
-LIVE link — a fully dark node keeps its virtual IP reserved for
-reconnect, but is no longer advertised in ASSIGN, so peer member
-tables drop a departed machine immediately (was: up to NODE_TTL).
-
-Transport tuning + visibility (this cut): every tunnel TCP dial
-(per-stream + control) requests TCP_NODELAY and 4MB SO_SNDBUF/RCVBUF
-BEFORE connect (window scaling rides the SYN); relay accepted sockets
-get the same. App-tx/app-rx hook logs now stamp every >=4KB write
-(throttle only applies below that) and the hosted pump logs `hs in/out
-sid= n= tot=` for >=4KB reads — needed because the accepted-side game
-writes were previously invisible (bridge sockets bypass the stream
-hooks). Verified in-sandbox under the exact field topology (LAN_ONLY=1,
-local relay, same-box two-link nodes): a single 135,725B push lands in
-38ms with zero gaps - relay-side `pipe closed` counts matched both
-apps' totals to the byte. Field trickle of the same payload is
-therefore APP-side pacing (lobby pushes ride its 5s beacon rounds;
-LAN differs only in per-hop timing), not tunnel stalls. If a field run
-still starves a JOIN budget, the new unthrottled logs show exactly
-which hop paced.
-
-Unpushed relay + hook layer commits: designated-host election RETIRED (ARP-style implicit fan-out,
-claim resolves; NODE_F_HOST = ordering stamp only); UDP-over-TCP links
-addressable via ("tcp",writer) identity in node_udp_addrs/udp_targets/
-udp_sendto (fixes the field `pdat drop (no-udp-endpoint)` = "lobby
-visible, join never starts"); st["busy"] KeyError landmine removed;
-hook: dt_rand_seed (sid collisions under inherited LAN_HOOK_NODE),
-own-machine dial loopback (dt_is_dial_local must compare against
-g_node, NOT the vnode number - comparing wrongly left it dead code and
-own-address dials returned as ghost self-connections: field
-`TCP SOCKET HEARTBEAT TIMEOUT` storms before any peer activity),
-accept-door real symbol + rlport fix, Windows MSG_DONTWAIT misuse
-dropped. A beacon cache/replay for late joiners was tried and REMOVED:
-a LAN forwards, it never replays (see hard constraints). Linux suite
-10/10 + relay suites + doors + e2e green, Wine test-all green.
-
-Findings: transport proven fully transparent in the field - the relay's
-`pipe closed ... Xb/Yb` counts match both apps' byte counters exactly
-(the apparent "duplicated 135KB blob" was the app's own JOIN re-push
-within 1ms, hidden by hook log throttling). Remaining join failure is
-at the bridge library's TCP message parsing on the joiner (271KB reply
-delivered intact, ~5 messages unbuffered, no lobby object created) -
-next diagnostic: a same-game LAN-pair run with full logs to diff the
-message sequence. KNOWN: Linux-sandbox game-only pair segfaults (-11)
-with ANY hook/relay version incl. none of this round's changes, while
-the same build joins fine on a pure LAN pair and Windows field runs
-never crash - Linux-only pre-existing artifact, NOT a field blocker;
-do not re-chase from the tunnel side.
+- ASSIGN has no `link_id` tail (payload `11+8*n`). STREQ is exactly
+  10 bytes (`sid + gport + opener vnode`); hook, wclient, and
+  `decode_streq` reject anything shorter. Shared sizes live in
+  `common.py` (`STREQ_N`, `ASSIGN_HDR_N`, …) and `hk_core.h`
+  (`DT_STREQ_N`, `DT_ASSIGN_HDR_N`, …).
+- UDP source identity is the sender's bound vport. No mark system
+  (`dt_mark` / `g_link_id` arithmetic is gone). S2C demux matches
+  `(game_port, own vport)`.
+- `connect()` completes at claim (early STOK). `T_STJOINED` starts
+  the raw pipe. A bridge failure after that is a post-connect reset.
+- Hook is real TUs: `hk_core` (ops, tables, DLOCK, policy) plus one
+  `.c` per module; `lan_hook.c` is the version stamp only.
+- Same-box: hairpin uses this process's alias real port; accept-door
+  matches the bridge ephemeral (never "first live hosted row");
+  `recv` gathers the full in-queue that FIONREAD reported.
+- Hosted UDP sessions stamp `ovirt` from the parsed vnode, not the
+  ASCII IP bytes on the frame. Implicit streams record the winning
+  joiner so `T_STSHUT` half-closes the opener and node-death teardown
+  finds the stream.
+- Replacement atomicity stays: `dt_on_streq` retires the same
+  `(peer, gport)` session before claiming (kernel: a new connection
+  implies the old is dead).
+- Channel policy: same-box double-node runs behave like two machines
+  (forward and reverse both bridge). The old co-host yield guard and
+  any-proto bridge backstop were retired with the mark fix.
 
 ## Status snapshot (2026-09-13)
 

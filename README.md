@@ -134,6 +134,6 @@ python3 hook/test_icmp.py        # hook-level ping mesh via raw sockets (ICMP_AL
 - One game per relay port is the supported setup; `--token` is the room key (empty = open relay). Accidental double-claims no longer kill live sessions (new implicit joins follow the newest claim; addressed hook sessions are per-dest isolated).
 - Same-dest UDP with byte-identical LAN triples from two sites still last-writer-wins per dest (logged); the hook sends from its virtual IP so hook nodes don't collide, and `wclient` client ports are usually random ephemerals.
 - No encryption — trusted peers only (or wrap in WireGuard)
-- Async overlapped Winsock and `ConnectEx`/`WSAEventSelect` waiting are not hooked; blocking sockets and `select`/`poll` are
+- Async overlapped Winsock and `ConnectEx` are not hooked; blocking sockets, `select`/`poll`, and `WSAEventSelect` are
 - Full per-peer virtual-IP attribution needs the hook; `wclient` re-emits beacons with its own source
 - Games embedding a private IP inside the discovery payload (instead of dialing the broadcast source) need a per-title payload rewrite
