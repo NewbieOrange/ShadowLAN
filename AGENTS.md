@@ -81,26 +81,20 @@ UDP tunnel ops: U_GAME_C2S=1, U_GAME_S2C=2, U_GAME_P2P=3 (dest-node
 prefixed), U_NODE=4 (carries host flag; refreshes link udp_addr and,
 when flagged, the link's `host_claim` ordering stamp), U_ICMP_REQ/REP=5/6 (dest node 0 = relay answers
 at .1; `10.200.0.1` is the relay's pseudo-IP, relay pings are local).
-Marks: a client socket is presented as (vnode, link_id*256 + slot) -
-the FULL u16 port space, nothing reserved away from games. link_id is
-relay-allocated per LINK (1..255) and delivered in the ASSIGN tail
-(hook var `g_link_id`); slot is the per-process client-socket table
-index (DT_MAXSLOT=256). Rationale: slots are per-PROCESS, so sibling
-links of one node used to collide in the relay's return-path binding
-("UDP triple collision, latest sender wins") and S2C replies
-flip-flopped between processes - the cross-machine UDP killer of
-2026-09-09. Two invariants make full-range marks safe: (1) the mark is
-always HOOK-allocated and stable - the relay rewrites nothing, because
-apps unicast-reply to whatever recvfrom presented and the hook
-forwards that value as the frame game_port (relay-internal numbers
-would become phantom game ports: an attempt that way same-boxed a
-regression and never shipped); (2) sendto(vnode, P) is first demuxed
-against the HOSTED-SESSION table by exact (peer-virt, P) tuple - a
-reply to a mark flows as a proper S2C instead of a C2S whose game_port
-is a mark number - so marks landing in some game's service band are
-harmless. Wire is otherwise PVER 2, but the mandatory ASSIGN tail
-means hook+relay ship TOGETHER (mismatched length = fatal 201 fail-
-fast, intended).
+Source identity (UVER 3): the `cli_port` field of C2S/S2C/PDAT frames
+is the sender socket's BOUND VPORT - exactly what a real NIC stamps.
+Unbound sockets get the kernel's implicit-bind replicated at first send
+(dt_sport_presentation) and recorded as an identity row. v2 instead
+presented an internal slot mark (link_id*256+slot) as the source port:
+apps fold recvfrom sources into peer state and DIAL them - the mark was
+un-dialable from the app's seat, which poisoned GBE's peer tables
+(MEMBERS flip) and deadlocked SteamNetworkingSockets (post-join black
+screen, same-box field rounds). No mark exists on the wire in v3: S2C
+receivers resolve the flow from (game_port, own port) against their own
+outbound flow table. link_id stays only as the relay's per-link
+bookkeeping/ASSIGN tail. Wire is PVER 2 + UVER 3; the mandatory ASSIGN
+tail means hook+relay ship TOGETHER (mismatched length = fatal 201
+fail-fast, intended).
 
 Semantics that matter:
 - `connect()` completes when a dest link CLAIMS the stream (STOK at
@@ -449,6 +443,22 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   claimed vports. test_bindfidelity guards the whole matrix.
 
 ## Status snapshot (UNRELEASED)
+
+Protocol v3 (this cut): source port = bound vport, mark system DELETED
+(dt_mark/dt_unmark/g_link_id-arithmetic gone; frame bytes unchanged
+from v2 - only the meaning + UVER 3). This was the last same-box
+fidelity gap: with it fixed, the co-host yield guard and the any-proto
+bridge backstop were RETIRED - same-box double-node runs now behave
+exactly like two machines (forward+reverse channels both bridge;
+test_aliasbridge R6b asserts FWD round-trip through the alias; local
+SNS dual-dial harness /tmp/opencode/gbelob echoes both directions).
+Replacement atomicity (dt_on_streq retires the same (peer,gport)
+session before claiming) stays: it restores the kernel guarantee that
+a new connection implies the old is dead - GBE's REPLACED logic
+depends on it at ~0ms RTT. The v2-era 'do NOT correct dt_host_bridge
+to SOCK_STREAM' decree is OVERTURNED by the mark fix - that policy
+existed only to keep the poisoned forward channel from being used.
+Field round needed: rc20 same-box should join AND reach gameplay.
 
 Co-host guard (replaces slot-luck): dt_on_streq now yields the inbound
 forward claim WHENEVER its own listener for that vport is aliased
