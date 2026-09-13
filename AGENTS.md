@@ -450,6 +450,13 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Field join fix (same-box): dt_alias_real was vport-first-match, so with
+a node hosting BOTH games on one OS (every bind aliased) the TCP stream
+bridge dialed the UDP alias row (refused -> reason=3, hosted open fail,
+no gbe log). Reverse-maps are proto-scoped (bridge=STREAM, hosted-UDP
+inbound=DGRAM); test_aliasbridge guards the topology, negative-checked.
+Cross-machine runs never exercised it because they never alias.
+
 TU refactor (post-split sweep): hk_util.c (clock/log/stamp/sleep/pid/rng),
 hk_alias.c (vport<->real table; slp_release_sock became dt_alias_release_all
 so the table owner iterates its own rows - alias->ledger is one-way now)
