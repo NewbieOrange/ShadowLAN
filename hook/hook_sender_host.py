@@ -2,7 +2,7 @@
 """Hooked game-host simulator. Runs UNDER LD_PRELOAD hook with
 LAN_HOOK_SERVER set. Behaves like a real LAN game server:
 
-- TCP listen + accept/echo  (the listen() call auto-claims designated-host)
+- TCP listen + accept/echo  (the listen() call stamps the host claim)
 - UDP bind + echo
 - periodic broadcast beacons (payload given on CLI)
 

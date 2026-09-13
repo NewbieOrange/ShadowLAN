@@ -2,7 +2,7 @@
 
 Every test MUST take its network ports from free_port()/free_ports() and
 its temp files from tmp_path() instead of hard-coded constants, so the
-suite runs in any order, concurrently (runtests.py / make test-parallel),
+suite runs in any order, concurrently (runtests.py / make test-all),
 and beside a dev box that happens to be running other tests. Virtual
 ports inside the emulated LAN (47584-style vports, 10.200.x addresses)
 are per-relay and may stay fixed - only REAL bindable ports and shared
@@ -11,6 +11,9 @@ file paths need allocation.
 import fcntl
 import json
 import os
+import socket
+import subprocess
+import time
 
 _RES = None  # lazy: /tmp/opencode/shadowlan_ports.json (pid->ports)
 
@@ -63,9 +66,6 @@ def _alloc_one():
         raise RuntimeError("port pool exhausted")
 
 
-import socket
-
-
 def free_port():
     return _alloc_one()
 
@@ -98,7 +98,6 @@ def free_trio():
     """Three consecutive free TCP ports (a child that binds base and
     base+1 while base+2 must stay unclaimed). Probed by simultaneous
     bind, then released for the real users."""
-    import socket
     while True:
         p = free_port()
         socks = []
@@ -119,9 +118,8 @@ def free_trio():
 def relay_up(port, timeout=10.0, proc=None):
     """Poll until a relay on 127.0.0.1:port accepts TCP (and, if given,
     the spawn proc is still alive). Replaces fixed sleep(0.7)."""
-    import time as _t
-    end = _t.time() + timeout
-    while _t.time() < end:
+    end = time.time() + timeout
+    while time.time() < end:
         if proc is not None and proc.poll() is not None:
             return False
         try:
@@ -129,7 +127,7 @@ def relay_up(port, timeout=10.0, proc=None):
             s.close()
             return True
         except OSError:
-            _t.sleep(0.1)
+            time.sleep(0.1)
     return False
 
 
@@ -137,7 +135,6 @@ def start_relay(argv_builder, attempts=5, timeout=10.0):
     """argv_builder(port) -> argv list for Popen. Allocates a free port,
     spawns, health-checks; re-allocates if the port raced away or the
     process died at bind. Returns (proc, port)."""
-    import subprocess
     for _ in range(attempts):
         p = free_port()
         proc = subprocess.Popen(argv_builder(p))

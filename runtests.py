@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Linux test suites in parallel and report verdicts.
+"""Run the test suites in parallel and report verdicts.
 
 Tests self-allocate their real ports (testutil.free_ports) so any
 subset can run concurrently. A test passes iff its output contains an
@@ -13,7 +13,7 @@ them. Build test_late.exe/test_lateplug.dll first (make test-all does).
 
 N defaults to auto = number of CPUs; SHADOWLAN_TEST_JOBS overrides too.
 """
-import os, re, subprocess, sys, threading
+import os, re, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FILES = []
@@ -52,16 +52,21 @@ def main():
     results = {}
     lock = threading.Lock()
 
+    durs = {}
+
     def _once(path):
         # wine startup is slow; it gets its own budget
         to = 900 if "test_late" in path else 400
+        t0 = time.time()
         try:
             p = subprocess.run([sys.executable, path], cwd=os.path.dirname(path),
                                capture_output=True, text=True, timeout=to,
                                start_new_session=True)
             out = p.stdout + p.stderr
+            durs[path] = time.time() - t0
             return bool(MARK.search(out)) and p.returncode == 0, out
         except subprocess.TimeoutExpired as te:
+            durs[path] = time.time() - t0
             try:  # kill the suite AND its hooked children (orphaned
                   # holders poison later runs' node ledgers)
                 os.killpg(os.getpgid(te.process.pid), 9)
@@ -80,7 +85,8 @@ def main():
                 out = "RETRY-recovered\n" + out
         with lock:
             results[name] = ok
-            print(("PASS " if ok else "FAIL ") + name, flush=True)
+            print(("PASS " if ok else "FAIL ") + name +
+                  ("  (%.1fs)" % durs.get(path, 0.0)), flush=True)
             if not ok:
                 tail = [l for l in out.splitlines() if l.strip()][-6:]
                 print("  " + "\n  ".join(tail)[:800], flush=True)
@@ -96,6 +102,9 @@ def main():
         t.join()
 
     bad = [k for k, v in results.items() if not v]
+    slow = sorted(durs.items(), key=lambda kv: -kv[1])[:5]
+    print("slowest: " + ", ".join("%s %.0fs" % (os.path.basename(p)[:-3], d)
+                                  for p, d in slow))
     print("\n%d/%d passed" % (len(results) - len(bad), len(results)))
     if bad:
         print("failed:", ", ".join(sorted(bad)))
