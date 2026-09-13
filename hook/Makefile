@@ -28,8 +28,8 @@ lan_hook.so: lan_hook.c
 test: lan_hook.so
 	python3 ../runtests.py -j $(J)
 
-test-all: test test_late.exe test_lateplug.dll
-	SHADOWLAN_WINEPREFIX=~/.wine python3 test_late.py
+test-all: lan_hook.so test_late.exe test_lateplug.dll
+	SHADOWLAN_WINEPREFIX=~/.wine python3 ../runtests.py -j $(J) --wine
 
 clean:
 	rm -f lan_hook64.dll lan_hook32.dll injector.exe lan_hook.so \

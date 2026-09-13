@@ -22,9 +22,11 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
     if (!strcmp(argv[1], "clash")) {
-        /* shared-port emulation: s1 owns qport plainly; s2's bind to the
-         * same port must EADDRINUSE on the real stack, get aliased by
-         * the hook, and still receive broadcasts addressed to qport */
+        /* faithful shared-UDP-port semantics for one machine: binds
+         * coexist only with SO_REUSEADDR on BOTH sockets, and every
+         * member receives the broadcast copy via the hook's fanout; a
+         * non-reuse bind against a holder must collide like the real
+         * kernel collides it */
         SOCKET s1 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         SOCKET s2 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         struct sockaddr_in p;
@@ -32,14 +34,19 @@ int main(int argc, char **argv) {
         p.sin_family = AF_INET;
         p.sin_addr.s_addr = INADDR_ANY;
         p.sin_port = htons((unsigned short)qport);
-        if (bind(s1, (struct sockaddr *)&p, sizeof(p))) { printf("clash s1 fail %d\n", WSAGetLastError()); return 1; }
         int on = 1;
+        setsockopt(s1, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
         setsockopt(s2, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
+        if (bind(s1, (struct sockaddr *)&p, sizeof(p))) { printf("clash s1 fail %d\n", WSAGetLastError()); return 1; }
         if (bind(s2, (struct sockaddr *)&p, sizeof(p))) { printf("clash s2 fail %d\n", WSAGetLastError()); return 1; }
+        { SOCKET s3 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+          if (bind(s3, (struct sockaddr *)&p, sizeof(p)) == 0) { printf("clash s3 bound WITHOUT reuse against holders\n"); return 1; }
+          if (WSAGetLastError() != WSAEADDRINUSE) { printf("clash s3 wrong err %d\n", WSAGetLastError()); return 1; }
+          closesocket(s3); }
         struct sockaddr_in chk;
         int cl = sizeof(chk);
-        getsockname(s2, (struct sockaddr *)&chk, &cl); /* must read as qport via alias */
-        printf("clash armed aliasport=%d\n", (int)ntohs(chk.sin_port));
+        getsockname(s2, (struct sockaddr *)&chk, &cl); /* must read as qport */
+        printf("clash armed port=%d\n", (int)ntohs(chk.sin_port));
         int tmo = 30000;
         setsockopt(s2, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof(tmo));
         char buf[256];

@@ -5,7 +5,11 @@ Tests self-allocate their real ports (testutil.free_ports) so any
 subset can run concurrently. A test passes iff its output contains an
 '*_ALL_PASS' or 'ALL PASS' marker. Exit code 0 only when all pass.
 
-usage: python3 runtests.py [-j N|auto] [name-substring ...]
+usage: python3 runtests.py [-j N|auto] [--wine] [name-substring ...]
+
+--wine adds the Wine-driven Windows suite (test_late) to the parallel
+set; it overlaps with the Linux suites instead of serializing after
+them. Build test_late.exe/test_lateplug.dll first (make test-all does).
 
 N defaults to auto = number of CPUs; SHADOWLAN_TEST_JOBS overrides too.
 """
@@ -16,14 +20,18 @@ FILES = []
 for d in (ROOT, os.path.join(ROOT, "hook")):
     for f in sorted(os.listdir(d)):
         if f.startswith("test_") and f.endswith(".py") and f != "test_late.py":
-            # test_late drives Wine + the Windows build: only via make test-all
             FILES.append(os.path.join(d, f))
+# test_late drives Wine + the Windows builds: opted in with --wine so it
+# runs CONCURRENTLY with the Linux suites (make test-all)
+WINE_FILES = [os.path.join(ROOT, "hook", "test_late.py")]
 
 MARK = re.compile(r"[A-Z0-9_]*ALL_PASS|ALL PASS")
 
 
 def main():
     args = sys.argv[1:]
+    wine = "--wine" in args
+    args = [a for a in args if a != "--wine"]
     jobs = None
     if args and args[0] == "-j":
         jobs_arg = args[1]
@@ -38,15 +46,18 @@ def main():
             # suites are multi-process and latency-sensitive (lease and
             # watchdog budgets); cap concurrency well below core count
             jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
-    files = [f for f in FILES if not args or any(a in os.path.basename(f) for a in args)]
+    pool = FILES + (WINE_FILES if wine else [])
+    files = [f for f in pool if not args or any(a in os.path.basename(f) for a in args)]
 
     results = {}
     lock = threading.Lock()
 
     def _once(path):
+        # wine startup is slow; it gets its own budget
+        to = 900 if "test_late" in path else 400
         try:
             p = subprocess.run([sys.executable, path], cwd=os.path.dirname(path),
-                               capture_output=True, text=True, timeout=400,
+                               capture_output=True, text=True, timeout=to,
                                start_new_session=True)
             out = p.stdout + p.stderr
             return bool(MARK.search(out)) and p.returncode == 0, out

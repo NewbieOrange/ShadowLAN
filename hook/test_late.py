@@ -108,16 +108,16 @@ def main():
     clog = os.path.join(tmp, "cli-hook.log")
     cout = os.path.join(tmp, "cli.out")
     ok = False
-    # ---- phase A: shared-port alias (SO_REUSEADDR semantics) ----
+    # ---- phase A: shared UDP port (SO_REUSEADDR both sides) ----
     khlog = os.path.join(tmp, "klash-hook.log")
     kout = os.path.join(tmp, "klash.out")
     clash = launch("clash", winpath(khlog), kout, ports=(PUB + 3,))
-    aliased = wait_for(khlog, r"bind alias .*vport=%d" % (PUB + 3), 90)
+    aliased = wait_for(kout, r"clash armed port=%d" % (PUB + 3), 90)
     done = None
     if not aliased:
-        print("clash never aliased the busy port")
+        print("clash never armed the shared port")
     else:
-        print("clash aliased:", aliased)
+        print("clash armed:", aliased)
         acli = launch("client", os.path.join(tmp, "aclihook.log"),
                       os.path.join(tmp, "acli.out"),
                       ports=(PUB + 4, PUB + 5, PUB + 3))
