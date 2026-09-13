@@ -44,7 +44,8 @@ os._exit(0)              # die RIGHT NOW: only a flushed exit can deliver
 '''
 
 relay = subprocess.Popen([sys.executable, "/root/my_vnet/server.py",
-                          "--port", str(PUB), "--bind", "127.0.0.1"],
+                          "--port", str(PUB), "--bind", "127.0.0.1",
+                          "--subnet", "10.200.8.0/24"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(0.7)
 

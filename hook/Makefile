@@ -30,6 +30,7 @@ test: lan_hook.so
 	python3 test_perdest.py
 	python3 test_noloop.py
 	python3 test_exitdrain.py
+	python3 test_fullduplex.py
 	python3 test_udptcp.py
 	python3 test_fatal.py
 	python3 test_icmp.py
