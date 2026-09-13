@@ -35,10 +35,15 @@ int dt_alias_vport(long long sock) {
     return -1;
 }
 /* real local port serving this virtual port in THIS process (0: none) */
-int dt_alias_real(int vport) {
+int dt_alias_real(int vport, int proto) {
     int i;
+    /* proto-filtered: a game that aliased UDP and TCP on the SAME vport
+     * (two machines on one OS) must never have its TCP bridge dial the
+     * UDP row's ephemeral (field join failure, single-box runs). */
     for (i = 0; i < DT_TA_MAX; i++)
-        if (g_ta[i].vport == vport && g_ta[i].real > 0) return g_ta[i].real;
+        if (g_ta[i].vport == vport && g_ta[i].real > 0 &&
+            (proto <= 0 || (int)g_ta[i].proto == proto))
+            return g_ta[i].real;
     return 0;
 }
 void dt_alias_bindv(long long sock) {

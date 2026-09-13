@@ -19,7 +19,7 @@ void dt_rand_mix(unsigned v);
 /* --- hk_alias.c: per-process vport<->real presentation table --- */
 void dt_alias_add(long long sock, int vport, int real, int proto);
 int  dt_alias_vport(long long sock);
-int  dt_alias_real(int vport);
+int  dt_alias_real(int vport, int proto);  /* proto<=0: any */
 void dt_alias_bindv(long long sock);
 int  dt_alias_is_bindv(long long sock);
 void dt_alias_drop(long long sock);

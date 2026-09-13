@@ -114,7 +114,7 @@ static int dt_bind_alias(long long s, const struct sockaddr_in *want,
 }
 /* Local loopback bridge to our own game server (joinee side). */
 static int dt_host_bridge(unsigned sid, int port) {
-    { int al = dt_alias_real(port); if (al) port = al; }
+    { int al = dt_alias_real(port, SOCK_STREAM); if (al) port = al; }
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -320,7 +320,7 @@ static int dt_hosted_udp_in(int game_port, const unsigned char *ipb, int iplen,
     cli.sin_family = AF_INET; cli.sin_port = htons((unsigned short)cport);
     cli.sin_addr.s_addr = inet_addr(ipstr);
     if (cli.sin_addr.s_addr == INADDR_NONE) return 0;
-    { int al = dt_alias_real(game_port); if (al) game_port = al; }
+    { int al = dt_alias_real(game_port, SOCK_DGRAM); if (al) game_port = al; }
     struct sockaddr_in lo; memset(&lo, 0, sizeof(lo));
     lo.sin_family = AF_INET; lo.sin_port = htons((unsigned short)game_port);
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
