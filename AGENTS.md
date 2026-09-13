@@ -404,11 +404,16 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   FIONREAD/select on the tool side as retry-worthy) — unverified idea.
 - dist/ cleanup of v1.2.0-rc*/v1.0.0/v1.1.1 packages: offered to user,
   not yet done.
-- `getsockname` is NOT hooked: on a tunneled TCP socket it reports the
-  real local endpoint (own NIC ip + ephemeral port). Games almost never
-  consult their own side (getpeername IS spoofed and that is what they
-  key on), but it is a door LAN_ONLY does not close; hook it (vnode +
-  real port) if an app ever shows it.
+- `getsockname` IS hooked (both platforms): aliased/virtual ports and
+  vnode binds are presented as the app bound them (never the ephemeral
+  real number, never 0.0.0.0 where a vnode was requested). Ledger notes:
+  every hook-level bind claims the vport in a NODE-scoped shared ledger
+  (Local\ CreateFileMapping / shm_open+flock; dead holders' claims are
+  taken over) so same-node sibling binds collide like a real kernel
+  collides them, while DIFFERENT nodes on one OS alias ephemerally
+  beneath and never see each other. `bind(0)` under LAN_ONLY=1 allocates
+  from the node's ephemeral space (>=49152) and must not collide with
+  claimed vports. test_bindfidelity guards the whole matrix.
 
 ## Status snapshot (UNRELEASED)
 
