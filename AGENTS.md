@@ -450,6 +450,21 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Co-host guard (replaces slot-luck): dt_on_streq now yields the inbound
+forward claim WHENEVER its own listener for that vport is aliased
+(real != vport = another of our nodes owns the kernel port). Field
+traces proved identity spoofing is complete (FOLD/ACC-VIEW byte-equal
+pass-vs-fail) - the killer is GBE's reconnect storm (epoch-initialized
+timers send an immediate first beat; every stale redial lands as a real
+inbound through the bridge and REPLACEd - kills live sockets). Two
+machines never enter this state; vnet-same-box with both nodes serving
+47584 does, and no spoofing can make the app's state machine survive
+it. Yielding the forward channel is exactly what the passing same-box
+runs did by luck. test_aliasbridge R6b went nondeterministic->10.0s
+deterministic. Cross-machine: predicate never true => provably inert.
+Linux same-box harness note: flaky BOTH configs after heavy kernel-UDP
+windows - trust Windows field rounds for join semantics.
+
 rc17 = the A/B outcome: bridge dial reverted to any-proto first-match
 (field-validated rc11/ab2 behavior, deliberate policy now), self-view
 and proto-scoped helpers KEPT. A/B binaries: rc11-abtest and rc16-ab2
