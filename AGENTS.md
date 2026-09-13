@@ -403,6 +403,15 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Hosted-pump integrity (this cut): the joinee pipe used to abandon the
+remainder of a game read when the relay connection would block
+(nonblocking send + bare break) - a silently corrupted stream strands
+the peer's message parser until the sender's NEXT write flushes the
+tail, which presents as multi-second-to-minute join/data stalls that
+look app-side. Now a hold slot + writable watch + read-gate (no new
+game reads while pending), i.e. kernel send-buffer semantics inside the
+pump. Pump chunk logs (hs in/out) are unconditional for field timing.
+
 Exit semantics + membership truth (this cut): (1) the kernel flushes a
 socket's queued bytes when a process exits — our stream out-queue did
 not, so a game's parting frames died with it and peers waited out the
