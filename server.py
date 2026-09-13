@@ -218,7 +218,13 @@ class Relay:
         return int_to_ip(v)
 
     def members(self):
-        return [(n, e["virt"]) for n, e in self.nodes.items() if e.get("virt")]
+        # The visible membership of the virtual LAN: only nodes with a
+        # LIVE control link. A fully dark node keeps its virtual IP
+        # reserved (a reconnecting tree gets it back), but peers stop
+        # seeing it the moment its last link closes - like a LAN where
+        # the departed machine simply stops answering.
+        return [(n, e["virt"]) for n, e in self.nodes.items()
+                if e.get("virt") and self.live_links(n)]
 
     async def send_assign(self, writer):
         node = self.writer_node.get(id(writer))
