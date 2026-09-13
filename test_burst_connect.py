@@ -16,15 +16,15 @@ from common import (HDR, T_NODE, T_ASSIGN, T_STOPEN, T_STREQ, T_STJOIN,
                     T_STJOINED, T_STOK, T_STFAIL, STF_NO_ROUTE,
                     STF_JOIN_TIMEOUT,
                     encode_ctl_node)
-
-PUB = 47966
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
+PUB = _free_port()
 NH, ND = 0x11111111, 0x22222222
-
 
 async def frame(w, mtype, payload):
     w.write(HDR.pack(1 + len(payload)) + bytes([mtype]) + payload)
     await w.drain()
-
 
 async def expect(r, mtype, timeout=3.0):
     while True:
@@ -36,18 +36,15 @@ async def expect(r, mtype, timeout=3.0):
         # tolerate membership refresh noise on control conns
         assert body[0] == T_ASSIGN, f"got op {body[0]:#x} want {mtype:#x}"
 
-
 async def register(name, node):
     r, w = await asyncio.open_connection("127.0.0.1", PUB)
     await frame(w, T_NODE, encode_ctl_node(b"", node, 6000 + node % 100))
     await expect(r, T_ASSIGN)
     return r, w
 
-
 async def dial():
     r, w = await asyncio.open_connection("127.0.0.1", PUB)
     return r, w
-
 
 async def main():
     relay = Relay(PUB, token="", bind="127.0.0.1")
@@ -103,6 +100,5 @@ async def main():
     srv.cancel()
     print("BURST_ALL_PASS" if ok else "BURST_FAIL")
     return 0 if ok else 1
-
 
 sys.exit(asyncio.run(main()))

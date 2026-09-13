@@ -17,7 +17,9 @@ import os
 import socket
 import struct
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HOOKDIR)
 sys.path.insert(0, ROOT)
@@ -31,10 +33,9 @@ from common import (
     tcp_send, tcp_read,
 )
 
-PUB = 47801
+PUB = _free_port()
 G = 55601
 N1, N2 = 0x0A0A0A0A, 0x0B0B0B0B
-
 
 def udp_sock():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -42,10 +43,8 @@ def udp_sock():
     s.setblocking(False)
     return s
 
-
 async def recv_one(loop, sock, timeout=3):
     return await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout)
-
 
 async def expect_silence(loop, sock, timeout=0.7):
     try:
@@ -54,7 +53,6 @@ async def expect_silence(loop, sock, timeout=0.7):
     except asyncio.TimeoutError:
         return
     raise AssertionError(f"relay echoed to source: {data!r}")
-
 
 async def register_node(node_id, udp_sock):
     port = udp_sock.getsockname()[1]
@@ -73,7 +71,6 @@ async def register_node(node_id, udp_sock):
         pass
     return writer, reader
 
-
 async def tcp_collect(reader, out_q):
     try:
         while True:
@@ -82,7 +79,6 @@ async def tcp_collect(reader, out_q):
                 await out_q.put((mtype, payload))
     except Exception:
         pass
-
 
 async def test_noloop_udp():
     loop = asyncio.get_running_loop()
@@ -114,7 +110,6 @@ async def test_noloop_udp():
     a.close()
     b.close()
 
-
 async def test_noloop_bcast():
     loop = asyncio.get_running_loop()
     a, b = udp_sock(), udp_sock()
@@ -139,7 +134,6 @@ async def test_noloop_bcast():
     wb.close()
     a.close()
     b.close()
-
 
 async def test_icmp():
     loop = asyncio.get_running_loop()
@@ -200,7 +194,6 @@ async def test_icmp():
     a.close()
     b.close()
 
-
 async def main():
     relay = Relay(PUB, bind="127.0.0.1")
     assert (relay.relay_virt() & 0xFF) == 1, hex(relay.relay_virt())
@@ -216,12 +209,10 @@ async def main():
     print("NOLOOP_ALL_PASS", flush=True)
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

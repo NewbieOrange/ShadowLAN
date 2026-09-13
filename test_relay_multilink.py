@@ -18,7 +18,9 @@ import asyncio
 import os
 import struct
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 from server import Relay
@@ -26,10 +28,9 @@ from common import (HDR, T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, T_STOPEN,
                     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
                     STF_BUSY, encode_ctl_node, decode_bcast_from, tcp_read)
 
-PUB = 47975
+PUB = _free_port()
 N1, N2, N3 = 0x11111111, 0x22222222, 0x33333333
 SID = 0xABCD1234
-
 
 class Link:
     def __init__(self, name):
@@ -74,20 +75,16 @@ class Link:
         except Exception:
             pass
 
-
 def my_virt(assign_payload):
     return struct.unpack("!I", assign_payload[:4])[0]
-
 
 async def stream_dial():
     r, w = await asyncio.open_connection("127.0.0.1", PUB)
     return r, w
 
-
 async def stream_frame(w, mtype, payload):
     w.write(HDR.pack(1 + len(payload)) + bytes([mtype]) + payload)
     await w.drain()
-
 
 async def stream_expect(r, mtype, timeout=3.0):
     hdr = await asyncio.wait_for(r.readexactly(4), timeout)
@@ -95,7 +92,6 @@ async def stream_expect(r, mtype, timeout=3.0):
     body = await asyncio.wait_for(r.readexactly(mlen), timeout)
     assert body[0] == mtype, f"want op {mtype:#x}, got {body.hex()}"
     return body
-
 
 async def main():
     relay = Relay(PUB, token="", bind="127.0.0.1")
@@ -186,12 +182,10 @@ async def main():
             pass
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

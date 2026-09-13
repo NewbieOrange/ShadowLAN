@@ -11,8 +11,10 @@ Scenario 3 half-close: A shutdown(SHUT_WR)s after sending; B must read
   A's data, then 0, and A must still receive B's reply afterwards.
 """
 import os, subprocess, sys, threading, time
-
-PUB = 47793
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path, relay_up as _relay_up
+PUB = _free_port()
 HOOK = "/root/my_vnet/hook/lan_hook.so"
 
 SHELL_A = r'''
@@ -22,7 +24,7 @@ s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("0.0.0.0", 47584)); s.listen(2)
 print("LISTENING", flush=True)
 t0 = time.time(); c = None
-while c is None and time.time() - t0 < 15:
+while c is None and time.time() - t0 < 90:
     s.settimeout(0.5)
     try: c, a = s.accept()
     except socket.timeout: pass
@@ -35,14 +37,14 @@ if mode == "stall":
     time.sleep(2.5)
     print("A_READS_START t=%.2f" % (time.time() - t0), flush=True)
     got = b""
-    c.settimeout(15)
+    c.settimeout(60)
     while len(got) < 65536:
         d = c.recv(65536)
         if not d: break
         got += d
     print("A_MARKER_OK" if got == b"B" * 65536 else "A_MARKER_BAD %d" % len(got), flush=True)
 elif mode == "closeflush":
-    c.settimeout(15)
+    c.settimeout(60)
     got = 0
     try:
         while True:
@@ -56,7 +58,7 @@ elif mode == "halfclose":
     c.sendall(b"Z" * 65536)
     c.shutdown(socket.SHUT_WR)
     print("A_SHUT_WR", flush=True)
-    c.settimeout(15)
+    c.settimeout(60)
     back = b""
     try:
         while len(back) < 4096:
@@ -73,7 +75,7 @@ SHELL_B = r'''
 import socket, sys, time, threading
 mode = sys.argv[1]
 t0 = time.time()
-for a in range(40):
+for a in range(120):
     try:
         s = socket.create_connection(("10.200.7.2", 47584), timeout=2); break
     except OSError: time.sleep(0.4)
@@ -82,7 +84,7 @@ else:
 if mode == "stall":
     threading.Timer(0.2, lambda: s.sendall(b"B" * 65536)).start()
     total = 0
-    s.settimeout(15)
+    s.settimeout(60)
     while total < 262144:
         d = s.recv(65536)
         if not d: break
@@ -93,7 +95,7 @@ elif mode == "closeflush":
     s.close()                       # kernel must flush, then FIN
     print("B_CLOSED", flush=True)
 elif mode == "halfclose":
-    s.settimeout(15)
+    s.settimeout(60)
     got = b""
     while len(got) < 65536:
         d = s.recv(65536)
@@ -109,7 +111,12 @@ def start_relay(port):
                           "--port", str(port), "--bind", "127.0.0.1",
                           "--subnet", "10.200.7.0/24"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.7)
+    if not _relay_up(port, proc=r):
+        try:
+            r.kill(); r.wait(timeout=2)
+        except Exception:
+            pass
+        raise RuntimeError("relay did not come up on %d" % port)
     return r
 
 def env(node, port):
@@ -118,7 +125,8 @@ def env(node, port):
                 LAN_HOOK_TOKEN="", LAN_HOOK_DEBUG="0",
                 LAN_HOOK_LEASE_WAIT="25", LAN_HOOK_NODE=str(node))
 
-def run(mode, nA, nB, port):
+def run(mode, nA, nB):
+    port = _free_port()
     relay = start_relay(port)
     pa = subprocess.Popen([sys.executable, "-c", SHELL_A, mode], env=env(nA, port),
                           stdout=subprocess.PIPE, text=True)
@@ -131,18 +139,24 @@ def run(mode, nA, nB, port):
                                      iter(pa.stdout.readline, '')], daemon=True).start()
     threading.Thread(target=lambda: [ob.append(l.rstrip()) for l in
                                      iter(pb.stdout.readline, '')], daemon=True).start()
-    t0 = time.time()
-    key = {"stall": "A_MARKER_OK", "closeflush": "A_GOT", "halfclose": "A_BACK_OK"}[mode]
-    while time.time() - t0 < 25 and not any(key in l for l in oa):
-        time.sleep(0.4)
-    time.sleep(0.6)
-    pa.kill(); pb.kill(); relay.kill()
-    pa.wait(); pb.wait()
-    time.sleep(0.4)
+    # Both children terminate on their own once the scenario completes
+    # (each ends with a bounded sleep); wait for real exit, not a
+    # sentinel line - under parallel load the lines just arrive later.
+    try:
+        pa.wait(timeout=200)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        pb.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    relay.kill()
+    pa.kill(); pb.kill()
+    time.sleep(0.3)   # let the reader threads drain final flushed lines
     return oa, ob
 
 ok = True
-oa, ob = run("stall", 440101, 440102, PUB)
+oa, ob = run("stall", 440101, 440102)
 b_rx = next((l for l in ob if l.startswith("B_RX_DONE")), "")
 a_read = next((l for l in oa if l.startswith("A_READS_START")), "t=999")
 bt = float(b_rx.split("t=")[1].split()[0]) if "t=" in b_rx else 999
@@ -151,12 +165,12 @@ s1 = "A_MARKER_OK" in " ".join(oa) and "total=262144" in b_rx and bt < at
 print(f"[1 stall-independence] B_done={bt:.2f} < A_reads={at:.2f}: {'OK' if s1 else 'FAIL'} {oa} {ob}")
 ok &= s1
 
-oa, ob = run("closeflush", 440103, 440104, PUB - 2)
+oa, ob = run("closeflush", 440103, 440104)
 s2 = "A_GOT 200000" in " ".join(oa)
 print(f"[2 close-flush] {'OK' if s2 else 'FAIL'} {oa}")
 ok &= s2
 
-oa, ob = run("halfclose", 440105, 440106, PUB - 4)
+oa, ob = run("halfclose", 440105, 440106)
 s3 = ("A_BACK_OK" in " ".join(oa)) and ("B_SAW_EOF" in " ".join(ob))
 print(f"[3 half-close] {'OK' if s3 else 'FAIL'} {oa} {ob}")
 ok &= s3

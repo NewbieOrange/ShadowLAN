@@ -15,17 +15,19 @@ import os
 import socket
 import sys
 import time
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HOOKDIR))
 from server import Relay
 
 HOOK = os.path.join(HOOKDIR, "lan_hook.so")
-PUB = 47871
+PUB = _free_port()
 HOST_TCP, HOST_UDP, DISC = 47872, 47873, 47874
-IN_PORT = 47875
-ACC_PORT = 47876
-ECHO_PORT = 47877
+IN_PORT = _free_port()
+ACC_PORT = _free_port()
+ECHO_PORT = _free_port()
 PUBLIC = "192.0.2.10"          # TEST-NET-1: guaranteed no route / unroutable
 
 PROBE = r"""
@@ -123,7 +125,6 @@ elif mode == "acc":
     print("ACC_OK")
 """
 
-
 def own_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -133,7 +134,6 @@ def own_ip():
         return None if ip.startswith("127.") else ip
     except OSError:
         return None
-
 
 async def hooked_py(src, args, env, timeout=20):
     import tempfile
@@ -149,7 +149,6 @@ async def hooked_py(src, args, env, timeout=20):
         return p.returncode, out.decode(errors="replace")
     finally:
         os.unlink(path)
-
 
 async def main():
     relay = Relay(PUB, bind="127.0.0.1")
@@ -240,7 +239,6 @@ async def main():
             os.unlink(path)
         print("PASS[lanonly] wire TCP peer dropped at accept", flush=True)
 
-
     # phase 5: own-broadcast local echo carries the vnode, never the NIC
     rc, out = await hooked_py(PROBE, ["echo", str(ECHO_PORT)], env)
     assert rc == 0 and "ECHO_OK" in out, (rc, out[-400:])
@@ -251,10 +249,8 @@ async def main():
     await asyncio.gather(relay_task, return_exceptions=True)
     return 0
 
-
 async def _guarded():
     return await asyncio.wait_for(main(), timeout=90)
-
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(_guarded()))

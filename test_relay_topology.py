@@ -16,19 +16,20 @@ import asyncio
 import os
 import socket
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 
-PUB = 47791
-RELAY_TCP = 47300
-TCP_PROXY = 47401
-UDP_PROXY = 47402
-A_TCP, A_UDP = 47101, 47102
-B_TCP, B_UDP = 47201, 47202
-
+PUB = _free_port()
+RELAY_TCP = _free_port()
+TCP_PROXY = _free_port()
+UDP_PROXY = _free_port()
+A_TCP, A_UDP = _free_port(), _free_port()
+B_TCP, B_UDP = _free_port(), _free_port()
 
 def make_game(tag, tcp_port, udp_port):
     async def on_tcp(r, w):
@@ -40,7 +41,6 @@ def make_game(tag, tcp_port, udp_port):
             await w.drain()
         w.close()
     return on_tcp
-
 
 async def start_game(tag, tcp_port, udp_port):
     tcp_srv = await asyncio.start_server(make_game(tag, tcp_port, udp_port),
@@ -56,7 +56,6 @@ async def start_game(tag, tcp_port, udp_port):
             await loop.sock_sendto(usock, tag + b":" + data, addr)
 
     return tcp_srv, asyncio.create_task(udp_loop())
-
 
 async def tcp_check(expect, tag):
     try:
@@ -75,7 +74,6 @@ async def tcp_check(expect, tag):
     assert got == expect + b":ping", (tag, got)
     print(f"PASS[{tag}] tcp -> {got!r}", flush=True)
     w.close()
-
 
 async def main():
     relay_task = asyncio.create_task(Relay(PUB, bind="127.0.0.1").run())
@@ -135,12 +133,10 @@ async def main():
     srv_b.close()
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

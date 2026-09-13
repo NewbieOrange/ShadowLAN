@@ -20,13 +20,15 @@ import os
 import re
 import sys
 import tempfile
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HOOKDIR))
 from server import Relay
 
 HOOK = os.path.join(HOOKDIR, "lan_hook.so")
-PUB = 47841
+PUB = _free_port()
 
 CHILD = r"""
 import socket, time, sys, os
@@ -56,7 +58,6 @@ time.sleep(1.0)   # both children registered by now; sample window ~1.5s
 c1.wait(); c2.wait()
 print("PARENT_DONE", flush=True)
 """
-
 
 async def main():
     relay = Relay(PUB, token="", bind="127.0.0.1")
@@ -124,12 +125,10 @@ async def main():
     await asyncio.gather(relay_task, return_exceptions=True)
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

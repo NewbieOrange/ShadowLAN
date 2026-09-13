@@ -14,13 +14,15 @@ import struct
 import subprocess
 import sys
 import time
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HOOKDIR)
 sys.path.insert(0, ROOT)
 
-PUB = 47812
-DISC = 45699
+PUB = _free_port()
+DISC = _free_port()
 
 CHILD = r"""
 import socket, struct, sys, time
@@ -101,7 +103,6 @@ for line in sys.stdin:
     print("REPLIES " + ",".join(sorted(set(got))), flush=True)
 """.replace("%DISC%", str(DISC))
 
-
 async def read_line(stream, timeout=20):
     try:
         line = await asyncio.wait_for(stream.readline(), timeout)
@@ -109,14 +110,12 @@ async def read_line(stream, timeout=20):
         return ""
     return line.decode().strip()
 
-
 async def spawn(tag, env):
     p = await asyncio.create_subprocess_exec(
         sys.executable, "-c", CHILD, tag,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL, env=env)
     return p
-
 
 async def main():
     from server import Relay
@@ -185,11 +184,9 @@ async def main():
     print("ICMP_ALL_PASS", flush=True)
     return 0
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s."""
     return await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(_guarded()))

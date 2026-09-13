@@ -21,22 +21,21 @@ from server import Relay
 from common import (HDR, T_NODE, T_ASSIGN, T_STOPEN, T_STREQ, T_STJOIN,
                     T_STJOINED, T_STOK, T_STFAIL, STF_NO_ROUTE,
                     STF_HOST_FAILED, encode_ctl_node)
-
-PUB = 47958
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
+PUB = _free_port()
 NH, ND = 0x11111111, 0x22222222
-
 
 async def frame(w, mtype, payload):
     w.write(HDR.pack(1 + len(payload)) + bytes([mtype]) + payload)
     await w.drain()
-
 
 async def rd1(r, timeout=6):
     hdr = await asyncio.wait_for(r.readexactly(4), timeout)
     (mlen,) = HDR.unpack(hdr)
     body = await asyncio.wait_for(r.readexactly(mlen), timeout)
     return body[0], body
-
 
 async def expect(r, mtype, timeout=6):
     while True:
@@ -45,17 +44,14 @@ async def expect(r, mtype, timeout=6):
             return b
         assert t == T_ASSIGN, f"got op {t:#x} want {mtype:#x}"
 
-
 async def register(node):
     r, w = await asyncio.open_connection("127.0.0.1", PUB)
     await frame(w, T_NODE, encode_ctl_node(b"", node, 6000 + node % 100))
     await expect(r, T_ASSIGN)
     return r, w
 
-
 async def dial():
     return await asyncio.open_connection("127.0.0.1", PUB)
-
 
 def closer(*objs):
     for o in objs:
@@ -63,7 +59,6 @@ def closer(*objs):
             o.close()
         except Exception:
             pass
-
 
 async def wait_eof(r, timeout=8):
     try:
@@ -76,7 +71,6 @@ async def wait_eof(r, timeout=8):
         return True
     except asyncio.TimeoutError:
         return False
-
 
 async def main():
     relay = Relay(PUB, token=b"", bind="127.0.0.1")
@@ -149,6 +143,5 @@ async def main():
     all_ok = all(results.values()) and len(results) == 3
     print("STFAIL_ALL_PASS" if all_ok else f"STFAIL_FAIL {results}")
     return 0 if all_ok else 1
-
 
 sys.exit(asyncio.run(main()))

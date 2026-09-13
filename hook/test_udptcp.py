@@ -11,7 +11,9 @@ import os
 import socket
 import struct
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HOOKDIR)
 sys.path.insert(0, ROOT)
@@ -24,10 +26,9 @@ from common import (
     tcp_send, tcp_read,
 )
 
-PUB = 47821
+PUB = _free_port()
 G = 55701
 NA, NB, NC = 0xE1E1E1E1, 0xE2E2E2E2, 0xE3E3E3E3
-
 
 def udp_sock():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -35,10 +36,8 @@ def udp_sock():
     s.setblocking(False)
     return s
 
-
 async def recv_one(loop, sock, timeout=4):
     return await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout)
-
 
 async def expect_udp_silence(loop, sock, timeout=0.7):
     try:
@@ -47,7 +46,6 @@ async def expect_udp_silence(loop, sock, timeout=0.7):
     except asyncio.TimeoutError:
         return
     raise AssertionError(f"UDP arrived despite TCP mode: {data!r}")
-
 
 async def register_udp(node_id, udp_sock):
     """Plain UDP-mode node (TCP NODE + UDP U_NODE)."""
@@ -66,7 +64,6 @@ async def register_udp(node_id, udp_sock):
     except (asyncio.TimeoutError, Exception):
         pass
     return writer, reader
-
 
 class TcpModePeer:
     """TCP-mode node simulator: raw TCP link, optional owned UDP socket
@@ -136,7 +133,6 @@ class TcpModePeer:
             self.writer.close()
         if self.udp:
             self.udp.close()
-
 
 async def main():
     loop = asyncio.get_running_loop()
@@ -227,12 +223,10 @@ async def main():
     print("UDPTCP_ALL_PASS", flush=True)
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

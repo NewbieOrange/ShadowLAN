@@ -27,7 +27,9 @@ import socket
 import struct
 import sys
 import time
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HOOKDIR)
 sys.path.insert(0, ROOT)
@@ -40,15 +42,14 @@ from common import (
     tcp_send, tcp_read,
 )
 
-PUB = 47795
+PUB = _free_port()
 G = 55555
 G2 = 55556
 TRIPLE_IP, TRIPLE_PORT = "192.168.1.10", 5000
 N1, N2 = 0x11111111, 0x22222222
 
-R_TCP = 47391
-A_LOCAL, B_LOCAL, PROXY = 47591, 47592, 47593
-
+R_TCP = _free_port()
+A_LOCAL, B_LOCAL, PROXY = _free_port(), _free_port(), _free_port()
 
 def udp_sock():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -56,10 +57,8 @@ def udp_sock():
     s.setblocking(False)
     return s
 
-
 async def recv_one(loop, sock, timeout=5):
     return await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout)
-
 
 async def register_node(node_id, udp_sock):
     """Connect, announce, and WAIT for the relay's ASSIGN: registration
@@ -88,7 +87,6 @@ async def register_node(node_id, udp_sock):
             pass
 
     return writer, asyncio.create_task(drain())
-
 
 async def test_udp_p2p_perdest():
     loop = asyncio.get_running_loop()
@@ -124,7 +122,6 @@ async def test_udp_p2p_perdest():
         w.close()
     for s in (hd1, hd2, p1, p2):
         s.close()
-
 
 async def test_udp_persender_learned():
     loop = asyncio.get_running_loop()
@@ -171,7 +168,6 @@ async def test_udp_persender_learned():
     for s in (h1, h2, q1, q2):
         s.close()
 
-
 async def echo_game(tag, port):
     async def on_conn(r, w):
         while True:
@@ -184,12 +180,11 @@ async def echo_game(tag, port):
 
     return await asyncio.start_server(on_conn, "127.0.0.1", port)
 
-
 async def test_disc_distinct_hosts():
     # two hosts, byte-identical beacon payload, one player: player must
     # see BOTH servers as distinct attributed beacons
     loop = asyncio.get_running_loop()
-    DISC = 45678
+    DISC = _free_port()
     PAYLOAD = b"SAME-GAME-BEACON"
     hu1, hu2 = udp_sock(), udp_sock()
     w1, d1 = await register_node(0x55555555, hu1)
@@ -248,7 +243,6 @@ async def test_disc_distinct_hosts():
     print("PASS[disc-per-source] identical beacons from both hosts seen",
           flush=True)
 
-
 async def wait_echo(open_conn, reader, writer, msg, want, tries=40):
     """Poll an echo round-trip instead of sleeping: fast when ready,
     bounded when not."""
@@ -267,7 +261,6 @@ async def wait_echo(open_conn, reader, writer, msg, want, tries=40):
             last = e
         await asyncio.sleep(0.1)
     raise AssertionError(f"echo {msg!r} never got {want!r} (last={last!r})")
-
 
 async def test_tcp_survives_claim():
     srv_a = await echo_game(b"A", A_LOCAL)
@@ -310,7 +303,6 @@ async def test_tcp_survives_claim():
     srv_a.close()
     srv_b.close()
 
-
 async def test_subnet_eviction(relay):
     # fill the /24 with dead entries, then a live NODE must evict one
     # and register (old code: "subnet full, rejecting node" forever)
@@ -343,7 +335,6 @@ async def test_subnet_eviction(relay):
             relay.nodes.pop(nid, None)
         relay.nodes.pop(0x7E11C7, None)
 
-
 async def main():
     relay = Relay(PUB, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
@@ -360,12 +351,10 @@ async def main():
     print("PERDEST_ALL_PASS", flush=True)
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

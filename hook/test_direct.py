@@ -5,7 +5,9 @@ over TCP+UDP. Relay only; no wclient.py anywhere."""
 import asyncio
 import os
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HOOKDIR))
 from server import Relay
@@ -13,16 +15,14 @@ from server import Relay
 HOOK = os.path.join(HOOKDIR, "lan_hook.so")
 HOST_SENDER = os.path.join(HOOKDIR, "hook_sender_host.py")
 PLAY_SENDER = os.path.join(HOOKDIR, "hook_sender_direct.py")
-PUB = 47788
-DISC = 45010
-TCP_A = 47021
-UDP_A = 47022
-
+PUB = _free_port()
+DISC = _free_port()
+TCP_A = _free_port()
+UDP_A = _free_port()
 
 def hook_env():
     return dict(os.environ, LD_PRELOAD=HOOK, LAN_HOOK_SERVER="127.0.0.1",
                LAN_HOOK_PORT=str(PUB), LAN_HOOK_DEBUG="1")
-
 
 async def main():
     relay_task = asyncio.create_task(Relay(PUB, bind="127.0.0.1").run())
@@ -81,12 +81,10 @@ async def main():
     await asyncio.gather(relay_task, return_exceptions=True)
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

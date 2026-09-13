@@ -1,3 +1,4 @@
+J ?= auto
 CC64=x86_64-w64-mingw32-gcc
 CC32=i686-w64-mingw32-gcc
 CFLAGS=-O2 -Wall
@@ -22,19 +23,10 @@ test_lateplug.dll: test_lateplug.c
 lan_hook.so: lan_hook.c
 	gcc -shared -fPIC -DLINUX_BUILD -O2 -Wall -o $@ $< -ldl -lpthread
 
+# Parallel suite: tests self-allocate real ports (testutil) so any
+# subset runs concurrently. J=n overrides the auto (= CPU count).
 test: lan_hook.so
-	python3 test_direct.py
-	python3 test_virtual_p2p.py
-	python3 test_childprop.py
-	python3 test_treeid.py
-	python3 test_perdest.py
-	python3 test_noloop.py
-	python3 test_exitdrain.py
-	python3 test_fullduplex.py
-	python3 test_udptcp.py
-	python3 test_fatal.py
-	python3 test_icmp.py
-	python3 test_lanonly.py
+	python3 ../runtests.py -j $(J)
 
 test-all: test test_late.exe test_lateplug.dll
 	SHADOWLAN_WINEPREFIX=~/.wine python3 test_late.py

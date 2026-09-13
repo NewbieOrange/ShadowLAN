@@ -15,18 +15,18 @@ import subprocess
 import sys
 import tempfile
 import time
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 HOOKDIR = os.path.dirname(os.path.abspath(__file__))
 
-PUB = int(os.environ.get("SHADOWLAN_LATE_PORT", "47825"))
+PUB = int(os.environ.get("SHADOWLAN_LATE_PORT") or _free_port())
 WINEPREFIX = os.environ.get("SHADOWLAN_WINEPREFIX", "")
 WINE = shutil.which("wine")
-
 
 def winpath(p):
     """POSIX path -> Wine Z: path with literal backslashes."""
     return "Z:" + p.replace("/", "\\")
-
 
 def build():
     cc = shutil.which("x86_64-w64-mingw32-gcc")
@@ -51,13 +51,11 @@ def build():
             return False
     return True
 
-
 def cleanup():
     subprocess.run("ps -eo pid,args | grep -E '[t]est_late.exe|[i]njector.exe' "
                    "| awk '{print $1}' | xargs -r kill",
                    shell=True, capture_output=True)
     time.sleep(0.5)
-
 
 def launch(mode, winlog, outpath, ports=None, extra=None):
     env = dict(os.environ)
@@ -71,7 +69,6 @@ def launch(mode, winlog, outpath, ports=None, extra=None):
            f'--port {PUB} --debug -- "{h}\\lan_hook64.dll" '
            f'"{h}\\test_late.exe" {mode} {portargs} > {outpath} 2>&1')
     return subprocess.Popen(["bash", "-c", cmd], env=env)
-
 
 def wait_for(path, pattern, timeout):
     """Poll a text file until pattern matches; return matched line or None."""
@@ -88,12 +85,10 @@ def wait_for(path, pattern, timeout):
         time.sleep(0.5)
     return None
 
-
 def dump_tail(path, n=15):
     if os.path.exists(path):
         print(f"--- {os.path.basename(path)} (tail) ---")
         print("\n".join(open(path, errors="replace").read().splitlines()[-n:]))
-
 
 def main():
     if not WINE or not WINEPREFIX or not build():
@@ -193,7 +188,6 @@ def main():
         print("artifacts: " + tmp)
     print("LATE_ALL_PASS" if ok else "LATE_FAIL")
     return 0 if ok else 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

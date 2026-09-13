@@ -16,21 +16,22 @@ import asyncio
 import os
 import socket
 import sys
-
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 from server import Relay
 from wclient import WinClient
 
-PUB_A = 47777
-PUB_B = 47778
-DISC = 45000
-DISC_CLI = 45001
-TCP_REAL = 47001
-TCP_PROXY = 47011
-UDP_REAL = 47002
-UDP_PROXY = 47012
-
+PUB_A = _free_port()
+PUB_B = _free_port()
+DISC = _free_port()
+DISC_CLI = _free_port()
+TCP_REAL = _free_port()
+TCP_PROXY = _free_port()
+UDP_REAL = _free_port()
+UDP_PROXY = _free_port()
 
 async def fake_game_server():
     async def on_tcp(r, w):
@@ -61,7 +62,6 @@ async def fake_game_server():
 
     return tcp_srv, asyncio.create_task(udp_loop()), asyncio.create_task(bcast_loop())
 
-
 async def run_stack(pub, token, checks):
     relay = Relay(pub, token=token, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
@@ -88,7 +88,6 @@ async def run_stack(pub, token, checks):
                              return_exceptions=True)
         await asyncio.sleep(0.2)
 
-
 async def check_discovery(tag):
     rsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rsock.bind(("127.0.0.1", DISC_CLI))
@@ -102,7 +101,6 @@ async def check_discovery(tag):
     assert data == b"FAKESERVER:hello", data
     print(f"PASS[{tag}] discovery: {data!r}", flush=True)
     rsock.close()
-
 
 async def check_tcp_udp(tag):
     loop = asyncio.get_running_loop()
@@ -135,7 +133,6 @@ async def check_tcp_udp(tag):
     print(f"PASS[{tag}] udp: {data!r}", flush=True)
     csock.close()
 
-
 async def main():
     tcp_srv, udp_task, bcast_task = await fake_game_server()
 
@@ -157,12 +154,10 @@ async def main():
     tcp_srv.close()
 
 
-
 async def _guarded():
     """Hard watchdog: a stuck future must fail loudly in <=20s, never
     pin the suite (Python 3.12 wait_closed and co. can swallow hangs)."""
     await asyncio.wait_for(main(), timeout=20)
-
 
 if __name__ == "__main__":
     asyncio.run(_guarded())

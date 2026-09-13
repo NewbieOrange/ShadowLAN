@@ -4,8 +4,10 @@ IMMEDIATELY (no sleep). On a real LAN the kernel flushes the socket;
 the listener must receive every byte before EOF. Pre-fix, the hook's
 userspace out-queue died with the process and the tail was lost."""
 import os, subprocess, sys, threading, time
-
-PUB = 47799
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from testutil import free_port as _free_port, tmp_path as _tmp_path
+PUB = _free_port()
 HOOK = "/root/my_vnet/hook/lan_hook.so"
 N = 200000
 
