@@ -31,6 +31,11 @@ Hard constraints from the user:
   (addresses, ports, `getpeername`, adapters — see Interface shim).
 - Universal > game-specific. No timing hacks: real per-connection TCP
   errors/timeouts do the work; the hook never invents stall timeouts.
+- No replay of discovery traffic: on a real LAN a machine that appears
+  late simply waits for the next beacon round, so the relay only
+  forwards beacons — it must never cache and re-send them (the
+  `bcast_cache`/`BCAST_FRESH` replay added on 2026-09-13 was removed
+  for this reason; the field run disproved its necessity anyway).
 
 ## Wire protocol (2.0 generation, `common.py` + `DT_*/DU_*` in lan_hook.c)
 
@@ -42,7 +47,8 @@ defined once: `common.py` header, `lan_hook.c` ~line 212).
 TCP control conn (one per hook process, ephemeral, auto-redial):
 
     T_NODE=0x01    ver + !H tlen + token + !I node + !H uport + !B flags
-                   flags bit0 = NODE_F_HOST (designated-host claim).
+                   flags bit0 = NODE_F_HOST (listener claim: an ordering
+                   stamp for implicit fan-out ONLY — no election).
                    Registration is the ONLY versioned frame: gating it
                    gates everything routed by the node id (streams too).
     T_ASSIGN=0x02  relay->peer: my_virt, net, bits, members + trailing
@@ -72,8 +78,8 @@ both ends dial out; that is the anti-HoL design; never multiplex streams):
     post-connect peer death).
 
 UDP tunnel ops: U_GAME_C2S=1, U_GAME_S2C=2, U_GAME_P2P=3 (dest-node
-prefixed), U_NODE=4 (carries host flag; refreshes link udp_addr AND
-host_udp when flagged), U_ICMP_REQ/REP=5/6 (dest node 0 = relay answers
+prefixed), U_NODE=4 (carries host flag; refreshes link udp_addr and,
+when flagged, the link's `host_claim` ordering stamp), U_ICMP_REQ/REP=5/6 (dest node 0 = relay answers
 at .1; `10.200.0.1` is the relay's pseudo-IP, relay pings are local).
 Marks: a client socket is presented as (vnode, link_id*256 + slot) -
 the FULL u16 port space, nothing reserved away from games. link_id is
@@ -282,6 +288,10 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   lines dirty in the working tree between releases (current: none —
   2.0.0 is released; the next local build starts 2.0.1-rc1).
   At release: change to the final number, commit the bump, build, ship.
+- **No rc references in git content either**: all change notes between
+  releases live in ONE "Status snapshot (UNRELEASED)" section here; at
+  release, rename that section (and the stamps) to the final version.
+  Commit titles and bodies never mention rc numbers.
 - **Every local build/package you hand to the user must increment the rc
   number** (rc1 -> rc2 -> ...) — never rebuild under a stale stamp, or
   field logs and `dist/` artifacts become indistinguishable. Exception:
@@ -368,10 +378,15 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   reveals the real NIC through another door.
 - Blocking-socket `accept` under LAN_ONLY returns EAGAIN for dropped
   wire peers (callers may spin; rare) — could sleep-slice.
-- Host-claim ping-pong between two genuine hosts (both games listen) is
-  log noise only: explicit addressing rules; last claim wins for
-  implicit routing.
-- The reference app's uninitialized-`Connection` dial lottery: consider
+- (retired) The designated-host election (`host_writer`/`host_udp`) is
+  GONE from the relay: two real games both claim host via `listen()` and
+  the election flapped every few seconds. Implicit (port-only) dials now
+  fan STREQ to ALL live links (LAN ARP: everyone is asked, only the
+  process that actually listens claims; the rest never answer). The
+  NODE_F_HOST flag survives ONLY as a per-link ordering stamp
+  (`host_claim`) so wclient `--host` bridge migration stays deterministic
+  (freshest claimer first) — it never excludes or demotes anything.
+- The bridge library's uninitialized-`Connection` dial lottery: consider
   nudge if it ever blocks a sale (e.g. treat a never-read garbage fd's
   FIONREAD/select on the tool side as retry-worthy) — unverified idea.
 - dist/ cleanup of v1.2.0-rc*/v1.0.0/v1.1.1 packages: offered to user,
@@ -382,13 +397,44 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   key on), but it is a door LAN_ONLY does not close; hook it (vnode +
   real port) if an app ever shows it.
 
+## Status snapshot (UNRELEASED)
+
+Relay `986b711` + `3a9e95c`, hook `6993b15` + `b8ffbf3` (unpushed at cut
+time): designated-host election RETIRED (ARP-style implicit fan-out,
+claim resolves; NODE_F_HOST = ordering stamp only); UDP-over-TCP links
+addressable via ("tcp",writer) identity in node_udp_addrs/udp_targets/
+udp_sendto (fixes the field `pdat drop (no-udp-endpoint)` = "lobby
+visible, join never starts"); st["busy"] KeyError landmine removed;
+hook: dt_rand_seed (sid collisions under inherited LAN_HOOK_NODE),
+own-machine dial loopback (dt_is_dial_local must compare against
+g_node, NOT the vnode number - comparing wrongly left it dead code and
+own-address dials returned as ghost self-connections: field
+`TCP SOCKET HEARTBEAT TIMEOUT` storms before any peer activity),
+accept-door real symbol + rlport fix, Windows MSG_DONTWAIT misuse
+dropped. A beacon cache/replay for late joiners was tried and REMOVED:
+a LAN forwards, it never replays (see hard constraints). Linux suite
+10/10 + relay suites + doors + e2e green, Wine test-all green.
+
+Findings: transport proven fully transparent in the field - the relay's
+`pipe closed ... Xb/Yb` counts match both apps' byte counters exactly
+(the apparent "duplicated 135KB blob" was the app's own JOIN re-push
+within 1ms, hidden by hook log throttling). Remaining join failure is
+at the bridge library's TCP message parsing on the joiner (271KB reply
+delivered intact, ~5 messages unbuffered, no lobby object created) -
+next diagnostic: a same-game LAN-pair run with full logs to diff the
+message sequence. KNOWN: Linux-sandbox game-only pair segfaults (-11)
+with ANY hook/relay version incl. none of this round's changes, while
+the same build joins fine on a pure LAN pair and Windows field runs
+never crash - Linux-only pre-existing artifact, NOT a field blocker;
+do not re-chase from the tunnel side.
+
 ## Status snapshot (2026-09-13)
 
 2.0.0 RELEASED + post-release field fixes on master (pushed): early-STOK
 `39ff861`, relay verdict/fuse + accept-door spoof + dial/select fixes
 (`3d30c2d`) with test_socket_doors / test_stfail_semantics /
 test_burst_connect; LAN e2e + Wine IF_* suites green. The field game
-session flow now blocks INSIDE the bridge library's `CreateSteam2Server`
+session flow now blocks INSIDE the bridge library's server-init
 assert (reproduced on a pure LAN pair with no tunnel involved) - the
 lobby layer is end-to-end healthy.
 

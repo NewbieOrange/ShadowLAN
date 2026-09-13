@@ -54,7 +54,6 @@ class Relay:
     """
 
     BEACON_TTL = 30        # beaconer fallback freshness
-    BCAST_FRESH = 12       # replay window for beacons to new members
     KNOWN_TTL = 120        # known UDP endpoint freshness
     LEARN_TTL = 60         # (src, game_port) -> replier freshness (per-sender sticky)
     FLOW_TTL = 120         # per-dest triple -> player routing freshness
@@ -82,13 +81,6 @@ class Relay:
             raise ValueError(f"bad --subnet {subnet!r} (need A.B.C.0/24)")
         self.players = set()
         self.beaconers = {}
-        # (node, dport) -> (sport, payload, t): the last beacon each node
-        # broadcast on each discovery port. A LAN delivers broadcasts to
-        # everyone *present in the medium*; a joiner that appears later
-        # gets the freshest cached beacons replayed at registration so
-        # host announcements reach late games exactly like a LAN hub
-        # re-transmits (and far better than silence for a 5 s phase).
-        self.bcast_cache = {}  # (node, dport|'round') -> beacon: replay to late members
         # virtual-IP membership: node_id -> dict(virt, seen_tcp, links)
         # where links maps control-writer -> per-link state
         #   dict(tcp_ip, udp_port, udp_addr, seen_udp, udp_tcp, link_id).
@@ -268,7 +260,7 @@ class Relay:
                         self.writer_node.pop(o, None)
 
     async def register_node(self, writer, peer, token, node, udp_port,
-                    flags=0):
+                        flags=0):
         """T_NODE/U_NODE endpoint: returns True if accepted. The SAME
         node id may register from several control links (processes that
         share one identity block); each gets its own per-link state and
@@ -315,7 +307,6 @@ class Relay:
             self.nodes[node] = ent
             print(f"[relay] node {node} -> {self.virt_str(virt)}", flush=True)
         ent["seen_tcp"] = now
-        first_link = not ent["links"]
         link = ent["links"].get(writer)
         if link is None:
             used = {l.get("link_id") for l in ent["links"].values()}
@@ -339,21 +330,6 @@ class Relay:
             if n > 1:
                 print(f"[relay] node {node} link joined ({n} links)",
                       flush=True)
-        if first_link:
-            # LAN medium replay: push the freshest beacons of OTHER
-            # nodes to this brand-new member right now (its members
-            # list arrives with the same ASSIGN burst, and the game
-            # starts answering/announcing immediately).
-            replayed = set()
-            for (nid, dport), val in list(self.bcast_cache.items()):
-                if dport == 0 and isinstance(val, tuple):
-                    dport0, sport, raw, seen = val
-                    if nid != node and now - seen <= self.BCAST_FRESH \
-                            and nid not in replayed:
-                        replayed.add(nid)
-                        await self.r_send(writer, T_BCAST_FROM,
-                                          encode_bcast_from(nid, dport0,
-                                                            sport, raw))
         link["tcp_ip"] = tcp_ip
         if udp_port:
             if link["udp_port"] != udp_port or link["udp_addr"] is None:
@@ -786,19 +762,6 @@ class Relay:
                             # visible.
                             self.beaconers[writer] = time.monotonic()
                             src_node = self.writer_node.get(owner, 0)
-                            if src_node:
-                                # The app's 10-port sweep is ONE logical
-                                # broadcast round on a LAN medium: keep
-                                # only the first dport per (node, round)
-                                # so a late joiner gets one beacon, not
-                                # a 10x burst (which raced the app's own
-                                # connection bookkeeping on one tick).
-                                rnd = int(time.monotonic() // 1.0)
-                                key = (src_node, "round")
-                                if self.bcast_cache.get(key) != rnd:
-                                    self.bcast_cache[key] = rnd
-                                    self.bcast_cache[(src_node, 0)] = (
-                                        dport, sport, raw, time.monotonic())
                             for w in self.all_links():
                                 if w is writer or w.is_closing():
                                     continue
