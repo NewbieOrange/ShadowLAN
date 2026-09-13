@@ -792,7 +792,10 @@ static int slp_claim(int vport, int proto, int reuse, int real) {
                 x->pid = (unsigned)current_pid(); x->real = real;
                 x->start = slp_self_start();
                 x->reuse = (unsigned char)reuse; rc = 0;
-            } else if (proto == SOCK_DGRAM && x->reuse && reuse) { rc = 1; }
+            } else if (proto == SOCK_DGRAM && x->reuse && reuse) {
+                rc = 1;      /* kernel-faithful: datagram sharing needs
+                              * SO_REUSEADDR on BOTH sockets */
+            }
             else rc = -1;                       /* kernel would collide */
         } else {
             for (i = 0; i < SLP_MAX; i++)
@@ -5850,7 +5853,10 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
                 snprintf(lb, sizeof lb, "slp dbg pid=%u node=%u want=%d proto=%d reuse=%d rv=%d",
                          (unsigned)GetCurrentProcessId(), (unsigned)g_node, want, proto, reuse, rv);
                 dlog(lb); }
-            if (rv == -1) { WSASetLastError(WSAEADDRINUSE); return SOCKET_ERROR; }
+            if (rv == -1) {
+                WSASetLastError(WSAEADDRINUSE);
+                r = SOCKET_ERROR; goto bindexit;
+            }
             r = p_bind ? p_bind(s, (struct sockaddr *)&in, l) : SOCKET_ERROR;
             if (r != 0 && (WSAGetLastError() == WSAEADDRINUSE ||
                            WSAGetLastError() == WSAEACCES)) {
@@ -5858,7 +5864,7 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
                         (int (*)(int, const struct sockaddr *, socklen_t))p_bind) == 0) {
                     if (bindv) dt_alias_bindv((long long)s);
                     if (proto == SOCK_DGRAM) { DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK(); }
-                    return 0;
+                    r = 0; goto bindexit;
                 }
                 slp_release(want, proto);
             } else if (r == 0) {
@@ -5870,7 +5876,7 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
             } else {
                 slp_release(want, proto);
             }
-            return r;
+            goto bindexit;
         }
         if (g_lan_only || slp_used() > 0) {
             int i, base = 49152 + (int)(current_pid() % 4096);
@@ -5890,7 +5896,7 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
                     }
                     DUNLOCK();
                     if (bindv) dt_alias_bindv((long long)s);
-                    return 0;
+                    r = 0; goto bindexit;
                 }
                 slp_release(p0, proto);
                 if (WSAGetLastError() != WSAEADDRINUSE) break;
@@ -5910,31 +5916,30 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
                 if (bindv) dt_alias_bindv((long long)s);
             }
         }
-        return r;
+        goto bindexit;
     }
     r = p_bind ? p_bind(s, a, l) : SOCKET_ERROR;
-    /* Shared discovery ports: several game processes bind one UDP port
-     * (SO_REUSEADDR). If the real stack refuses it - another socket on
-     * this machine owns the port - bind ephemerally instead but register
-     * the socket as a member of the requested port, so tunnel fanout and
-     * getsockname still present it as bound there. Without this, the
-     * second binder goes deaf: inbound traffic for the shared port no
-     * longer matches its (fallback) bound port. */
-    if (g_debug && g_direct && a && a->sa_family == AF_INET) {
-        const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
-        unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
-        char lb[192];
-        snprintf(lb, sizeof(lb), "bind pid=%u sock=%lld %lu.%lu.%lu.%lu:%d r=%d err=%d",
-                 (unsigned)GetCurrentProcessId(), (long long)s,
-                 (addr & 255), ((addr >> 8) & 255), ((addr >> 16) & 255),
-                 ((addr >> 24) & 255), (int)ntohs(ba->sin_port),
-                 r, r ? WSAGetLastError() : 0);
-        dlog(lb);
+bindexit:
+    {
+        int berr = (r != 0) ? WSAGetLastError() : 0; /* snapshot: the
+              * logging calls below may overwrite last-error */
+        if (g_debug && g_direct && a && a->sa_family == AF_INET) {
+            const struct sockaddr_in *ba = (const struct sockaddr_in *)a;
+            unsigned long addr = 0; memcpy(&addr, &ba->sin_addr.s_addr, 4);
+            char lb[192];
+            snprintf(lb, sizeof(lb), "bind pid=%u sock=%lld %lu.%lu.%lu.%lu:%d r=%d err=%d",
+                     (unsigned)GetCurrentProcessId(), (long long)s,
+                     (addr & 255), ((addr >> 8) & 255), ((addr >> 16) & 255),
+                     ((addr >> 24) & 255), (int)ntohs(ba->sin_port),
+                     r, berr);
+            dlog(lb);
+        }
+        if (r != 0) WSASetLastError(berr);
+        if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
+            DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
+        }
+        return r;
     }
-    if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
-        DLOCK(); dt_udp_entry((long long)s, 1); DUNLOCK();
-    }
-    return r;
 }
 static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self);
 /* kernel: a socket still in connect() never reports writable */
