@@ -657,6 +657,7 @@ static int slp_attach(void) {
 #define SLP_UNLOCK() do { if (g_slp_fd >= 0) flock(g_slp_fd, LOCK_UN); } while (0)
 #else
 static HANDLE g_slp_mx = 0;
+static HANDLE g_slp_sec = 0;
 static slp_t *g_slp = 0;
 static int slp_attach(void) {
     char nm[96], mx[96];
@@ -669,15 +670,20 @@ static int slp_attach(void) {
     HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
                                   0, sizeof(slp_t), nm);
     if (!h) { CloseHandle(m); return 0; }
-    int fresh = (GetLastError() != ERROR_ALREADY_EXISTS);
     void *p = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, sizeof(slp_t));
-    CloseHandle(h);   /* mapping lives as long as any process holds it */
     if (!p) { CloseHandle(m); return 0; }
-    g_slp_mx = m; g_slp = (slp_t *)p;
+    /* keep the section handle: some environments (observed under Wine)
+     * drop the shared pages when the last CREATE handle closes even if
+     * views remain - never gamble on that here */
+    g_slp_mx = m; g_slp_sec = h; g_slp = (slp_t *)p;
+    /* OWNED init, never GetLastError(ERROR_ALREADY_EXISTS): some
+     * environments (observed under Wine) do not preserve that flag to
+     * this point, and a false "fresh" would WIPE a live registry. */
     WaitForSingleObject(g_slp_mx, INFINITE);
-    if (fresh || g_slp->magic != SLP_MAGIC) {
-        g_slp->magic = SLP_MAGIC; g_slp->gen = 0;
+    if (g_slp->magic != SLP_MAGIC) {
+        g_slp->magic = 0; g_slp->gen = 0;
         memset(g_slp->e, 0, sizeof g_slp->e);
+        InterlockedExchange((LONG *)&g_slp->magic, (LONG)SLP_MAGIC);
     }
     ReleaseMutex(g_slp_mx);
     return 1;
@@ -721,25 +727,41 @@ static unsigned long long slp_self_start(void) {
     return slp_starttime((unsigned)current_pid());
 }
 #else
-static unsigned long long slp_starttime(unsigned pid) {
-    HANDLE h; FILETIME ct; unsigned long long v = 0;
-    if (!pid) return 0;
-    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return 0;
-    if (GetProcessTimes(h, &ct, 0, 0, 0))
-        v = ((unsigned long long)ct.dwHighDateTime << 32) | ct.dwLowDateTime;
-    CloseHandle(h);
+/* process start time straight from the PEB (field stable across all
+ * supported Windows; the 32-bit build reads the TEB's static PEB
+ * pointer).  OpenProcess+GetProcessTimes is NOT an option here: it
+ * faults inside kernelbase under some builds (field AV at startup,
+ * reproduced under Wine) and we may run on arbitrary app threads. */
+static unsigned long long slp_self_start(void) {
+    unsigned long long v = 0;
+#ifdef _WIN64
+    unsigned char *peb = (unsigned char *)__readgsqword(0x60);
+    if (peb) v = *(unsigned long long *)(peb + 0x0a8);   /* Peb->CreateTime */
+#else
+    unsigned char *peb = 0;
+    __asm__ __volatile__ ("movl %%fs:0x30, %0" : "=r"(peb));
+    if (peb) v = *(unsigned long long *)(peb + 0x0a4);   /* 32-bit offset */
+#endif
     return v;
 }
-static int slp_alive(unsigned pid, unsigned long long start) {
-    unsigned long long now;
-    if (!pid) return 0;
-    now = slp_starttime(pid);
-    if (!now) return 0;              /* gone or unqueryable: reap-able */
-    return !start || now == start;
+static unsigned long long slp_starttime(unsigned pid) {
+    /* only the current process has a queryable PEB; liveness of other
+     * pids is answered by slp_alive with this same stamp */
+    return pid == (unsigned)GetCurrentProcessId() ? slp_self_start() : 0;
 }
-static unsigned long long slp_self_start(void) {
-    return slp_starttime((unsigned)GetCurrentProcessId());
+/* NEVER GetProcessTimes here (field AV at app startup, reproducible
+ * under Wine). Liveness by exit code; access-denied means alive; the
+ * start stamp is kept only for self-audits. */
+static int slp_alive(unsigned pid, unsigned long long start) {
+    HANDLE h; DWORD code = 0; int alive;
+    (void)start;
+    if (!pid) return 0;
+    if (pid == (unsigned)GetCurrentProcessId()) return 1;
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return GetLastError() != ERROR_INVALID_PARAMETER;
+    alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
 }
 #endif
 /* claim vport for THIS process. 0/1 = ok (1 = shared), -1 = conflict,
@@ -760,6 +782,12 @@ static int slp_claim(int vport, int proto, int reuse, int real) {
         }
         if (found >= 0) {
             slp_ent *x = &g_slp->e[found];
+#ifndef LINUX_BUILD
+            if (g_debug) { char lb[160];
+                snprintf(lb, sizeof lb, "slp dbg found=%d holder=%u start=%llx self=%llx alive=%d",
+                         found, x->pid, x->start, slp_self_start(), slp_alive(x->pid, x->start));
+                dlog(lb); }
+#endif
             if (!slp_alive(x->pid, x->start)) { /* stale claim: take over */
                 x->pid = (unsigned)current_pid(); x->real = real;
                 x->start = slp_self_start();
@@ -5818,6 +5846,10 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
         int want = ntohs(in.sin_port);
         if (want != 0) {
             int rv = slp_claim(want, proto, reuse, want);
+            if (g_debug) { char lb[128];
+                snprintf(lb, sizeof lb, "slp dbg pid=%u node=%u want=%d proto=%d reuse=%d rv=%d",
+                         (unsigned)GetCurrentProcessId(), (unsigned)g_node, want, proto, reuse, rv);
+                dlog(lb); }
             if (rv == -1) { WSASetLastError(WSAEADDRINUSE); return SOCKET_ERROR; }
             r = p_bind ? p_bind(s, (struct sockaddr *)&in, l) : SOCKET_ERROR;
             if (r != 0 && (WSAGetLastError() == WSAEADDRINUSE ||
