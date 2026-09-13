@@ -43,9 +43,7 @@ def main():
         if env.isdigit() and int(env) > 0:
             jobs = int(env)
         else:
-            # suites are multi-process and latency-sensitive (lease and
-            # watchdog budgets); cap concurrency well below core count
-            jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
+            jobs = max(1, os.cpu_count() or 1)
     pool = FILES + (WINE_FILES if wine else [])
     files = [f for f in pool if not args or any(a in os.path.basename(f) for a in args)]
 

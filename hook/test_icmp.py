@@ -25,7 +25,7 @@ PUB = _free_port()
 DISC = _free_port()
 
 CHILD = r"""
-import socket, struct, sys, time
+import socket, struct, sys, time, threading
 
 def cksum(b):
     s = 0
@@ -56,19 +56,27 @@ u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 u.bind(("0.0.0.0", %DISC%))
 u.settimeout(0.5)
 print("READY", flush=True)
-peer = None
-t0 = time.time()
-while time.time() - t0 < 15 and peer is None:
-    if time.time() - t0 > 1:
+# Keep announcing: the first sighting used to stop the sender, so the
+# slower joiner never heard us (relay never replays beacons). A real
+# LAN keeps beaconing on its own period.
+def _announce():
+    me = ("BEACON-" + tag).encode()
+    while True:
         try:
-            u.sendto(("BEACON-" + tag).encode(), ("255.255.255.255", %DISC%))
+            u.sendto(me, ("255.255.255.255", %DISC%))
         except OSError:
             pass
+        time.sleep(0.4)
+threading.Thread(target=_announce, daemon=True).start()
+peer = None
+t0 = time.time()
+mine = ("BEACON-" + tag).encode()
+while time.time() - t0 < 15 and peer is None:
     try:
         data, addr = u.recvfrom(65535)
     except socket.timeout:
         continue
-    if data.startswith(b"BEACON-") and data != ("BEACON-" + tag).encode():
+    if data.startswith(b"BEACON-") and data != mine:
         peer = addr[0]
         print(f"PEER {peer} {data.decode()}", flush=True)
 if peer is None:
@@ -129,14 +137,18 @@ async def main():
     relay = Relay(PUB, bind="127.0.0.1")
     relay_task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.2)
-    env = dict(os.environ,
-               LD_PRELOAD=os.path.join(HOOKDIR, "lan_hook.so"),
-               LAN_HOOK_SERVER="127.0.0.1", LAN_HOOK_PORT=str(PUB),
-               LAN_HOOK_DEBUG="0", LAN_HOOK_INIT_TIMEOUT="15000")
+    _n0 = 200000 + (os.getpid() * 31 + sum(map(ord, "icmp"))) % 700000
+    def hook_env(node):
+        e = dict(os.environ,
+                 LD_PRELOAD=os.path.join(HOOKDIR, "lan_hook.so"),
+                 LAN_HOOK_SERVER="127.0.0.1", LAN_HOOK_PORT=str(PUB),
+                 LAN_HOOK_DEBUG="0", LAN_HOOK_INIT_TIMEOUT="15000",
+                 LAN_HOOK_NODE=str(node))
+        return e
     a = b = None
     try:
-        a = await spawn("A", env)
-        b = await spawn("B", env)
+        a = await spawn("A", hook_env(_n0 + 1))
+        b = await spawn("B", hook_env(_n0 + 2))
         for p, want in ((a, "A"), (b, "B")):
             line = await read_line(p.stdout, timeout=10)
             assert line == "READY", (want, line)

@@ -9,6 +9,11 @@ Scenario 2 close flush: B sends 200 KB then close()s without waiting;
   A must receive all 200 KB, then EOF - never a truncated stream.
 Scenario 3 half-close: A shutdown(SHUT_WR)s after sending; B must read
   A's data, then 0, and A must still receive B's reply afterwards.
+Scenario 4 FIONREAD gather: A writes 200 KB on the accepted socket; B
+  (the tunneled opener) ioctl(FIONREAD) then recv(exactly that). Kernel
+  contract: recv returns the full queued count, not the first chunk.
+  The reference lobby stack resizes to FIONREAD and never shrinks a
+  short read.
 """
 import os, subprocess, sys, threading, time
 import os as _os, sys as _sys
@@ -69,6 +74,10 @@ elif mode == "halfclose":
     except socket.timeout:
         pass
     print("A_BACK_OK" if back == b"R" * 4096 else "A_BACK_BAD %d" % len(back), flush=True)
+elif mode == "fionread":
+    blob = bytes((i * 31 + 7) & 255 for i in range(200000))
+    c.sendall(blob)
+    print("A_SENT", flush=True)
 time.sleep(1)
 '''
 
@@ -105,6 +114,25 @@ elif mode == "halfclose":
     eof = s.recv(1)                 # must be 0 (FIN), NOT an error
     print("B_SAW_EOF" if eof == b"" else "B_NO_EOF %r" % eof, flush=True)
     s.sendall(b"R" * 4096)          # write side must still work after FIN
+elif mode == "fionread":
+    import array, fcntl, termios
+    time.sleep(0.5)                 # let A's 200 KB fully queue
+    want = bytes((i * 31 + 7) & 255 for i in range(200000))
+    got = b""
+    t1 = time.time()
+    while len(got) < len(want) and time.time() - t1 < 20:
+        n = array.array("i", [0])
+        fcntl.ioctl(s.fileno(), termios.FIONREAD, n)
+        avail = n[0]
+        if avail <= 0:
+            time.sleep(0.01)
+            continue
+        chunk = s.recv(avail)
+        if len(chunk) != avail:
+            print("B_SHORT fion=%d recv=%d" % (avail, len(chunk)), flush=True)
+            break
+        got += chunk
+    print("B_FION_OK" if got == want else "B_FION_BAD %d" % len(got), flush=True)
 '''
 
 def start_relay(port):
@@ -180,6 +208,11 @@ oa, ob = run("halfclose", _NODE0 + 5, _NODE0 + 6)
 s3 = ("A_BACK_OK" in " ".join(oa)) and ("B_SAW_EOF" in " ".join(ob))
 print(f"[3 half-close] {'OK' if s3 else 'FAIL'} {oa} {ob}")
 ok &= s3
+
+oa, ob = run("fionread", _NODE0 + 7, _NODE0 + 8)
+s4 = "A_SENT" in " ".join(oa) and "B_FION_OK" in " ".join(ob)
+print(f"[4 fionread-gather] {'OK' if s4 else 'FAIL'} {oa} {ob}")
+ok &= s4
 
 print("FULLDUPLEX_ALL_PASS" if ok else "FULLDUPLEX FAIL")
 sys.exit(0 if ok else 1)
