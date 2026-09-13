@@ -46,6 +46,14 @@ int dt_alias_real(int vport, int proto) {
             return g_ta[i].real;
     return 0;
 }
+int dt_alias_vport_by_real(int realport, int proto) {
+    int i;
+    for (i = 0; i < DT_TA_MAX; i++)
+        if (g_ta[i].sock && g_ta[i].vport > 0 && g_ta[i].real == realport &&
+            (proto <= 0 || (int)g_ta[i].proto == proto))
+            return g_ta[i].vport;
+    return 0;
+}
 void dt_alias_bindv(long long sock) {
     int i;
     for (i = 0; i < DT_TA_MAX; i++)

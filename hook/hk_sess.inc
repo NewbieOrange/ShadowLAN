@@ -244,6 +244,21 @@ static int dt_acc_get(long long fd, struct sockaddr_in *out, int *rlport) {
     if (rlport) *rlport = bp;   /* TRUE bridge port: fd-reuse guard */
     return 1;
 }
+/* LOCAL identity of an accepted (bridged) socket: own vnode + the
+ * listen VPORT. On a machine hosting one of our nodes the listener is
+ * aliased beneath its vport (two nodes, one real stack), so the
+ * kernel-truth local port of accepted sockets is the alias real -
+ * presenting it would contradict the announce/getpeername view and
+ * apps that cross-check all three reject the session. */
+static void dt_acc_self_view(long long fd, struct sockaddr_in *sa) {
+    struct sockaddr_in o; int bp = 0;
+    if (!dt_acc_get(fd, &o, &bp)) return;
+    int vp = dt_alias_vport_by_real((int)ntohs(sa->sin_port), SOCK_STREAM);
+    if (vp) sa->sin_port = htons((unsigned short)vp);
+    unsigned myv = 0;
+    DLOCK(); myv = g_myvirt; DUNLOCK();
+    if (myv) sa->sin_addr.s_addr = htonl(myv);
+}
 static void dt_acc_forget(long long fd) {
     DLOCK();
     for (int j = 0; j < DT_MAXACC; j++)

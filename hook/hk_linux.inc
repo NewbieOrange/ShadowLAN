@@ -262,6 +262,11 @@ int getsockname(int s, struct sockaddr *a, socklen_t *l) {
     if (r == 0 && g_direct && a && l && *l >= (socklen_t)sizeof(struct sockaddr_in)) {
         struct sockaddr_in *sa = (struct sockaddr_in *)a;
         if (sa->sin_family == AF_INET) {
+            { int bp3 = 0; struct sockaddr_in o3;
+              if (dt_acc_get((long long)s, &o3, &bp3)) {
+                  dt_acc_self_view((long long)s, sa);   /* accepted: vnode + vport */
+                  return r;
+              } }
             int vp = dt_alias_vport((long long)s);
             if (vp > 0) {
                 sa->sin_port = htons((unsigned short)vp);

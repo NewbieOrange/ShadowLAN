@@ -702,8 +702,9 @@ static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self)
         rp.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
         return;   /* not our bridge: hands off */
     if (want_self) {
-        sa->sin_addr.s_addr = htonl(g_myvirt);  /* our own vnode */
-        /* port already correct (the listen port) */
+        dt_acc_self_view((long long)fd, sa);  /* own vnode + listen VPORT
+            (the listener may be aliased on a machine hosting two of our
+            nodes; the raw local port would contradict the announce) */
     } else {
         *sa = o;                                /* opener's vnode + port */
     }
