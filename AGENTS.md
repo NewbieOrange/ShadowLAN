@@ -399,6 +399,22 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Transport tuning + visibility (this cut): every tunnel TCP dial
+(per-stream + control) requests TCP_NODELAY and 4MB SO_SNDBUF/RCVBUF
+BEFORE connect (window scaling rides the SYN); relay accepted sockets
+get the same. App-tx/app-rx hook logs now stamp every >=4KB write
+(throttle only applies below that) and the hosted pump logs `hs in/out
+sid= n= tot=` for >=4KB reads — needed because the accepted-side game
+writes were previously invisible (bridge sockets bypass the stream
+hooks). Verified in-sandbox under the exact field topology (LAN_ONLY=1,
+local relay, same-box two-link nodes): a single 135,725B push lands in
+38ms with zero gaps - relay-side `pipe closed` counts matched both
+apps' totals to the byte. Field trickle of the same payload is
+therefore APP-side pacing (lobby pushes ride its 5s beacon rounds;
+LAN differs only in per-hop timing), not tunnel stalls. If a field run
+still starves a JOIN budget, the new unthrottled logs show exactly
+which hop paced.
+
 Relay `986b711` + `3a9e95c`, hook `6993b15` + `b8ffbf3` (unpushed at cut
 time): designated-host election RETIRED (ARP-style implicit fan-out,
 claim resolves; NODE_F_HOST = ordering stamp only); UDP-over-TCP links
