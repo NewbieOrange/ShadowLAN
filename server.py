@@ -865,12 +865,18 @@ class Relay:
                             # visible.
                             self.beaconers[writer] = time.monotonic()
                             src_node = self.writer_node.get(owner, 0)
-                            for w in self.all_links():
+                            sent_eps = set()
+                            for w, l in self.all_links_with_links():
                                 if w is writer or w.is_closing():
                                     continue
                                 wnode = self.writer_node.get(id(w))
                                 if src_node and wnode == src_node:
                                     continue
+                                ep = self.link_endpoint(l)
+                                if ep is not None:
+                                    if (wnode, ep) in sent_eps:
+                                        continue    # sibling link of one
+                                    sent_eps.add((wnode, ep))   # process: NIC-once
                                 if src_node and wnode is not None:
                                     await self.r_send(w, T_BCAST_FROM,
                                                       encode_bcast_from(src_node, dport, sport, raw))
@@ -1004,6 +1010,26 @@ class Relay:
                         (l["tcp_ip"], l["udp_port"]) == addr:
                     return nid
         return None
+
+    def link_endpoint(self, l):
+        """The physical delivery endpoint of one link: the tuple a
+        datagram actually travels to. Two links of one process (control
+        redial before the old socket was reaped) share it - any fan-out
+        that iterates links MUST dedupe by it or the machine gets the
+        same datagram N times (a NIC never does that)."""
+        if l.get("udp_tcp"):
+            return ("tcp", id(l["writer"]))
+        a = l.get("udp_addr")
+        if a and time.monotonic() - l.get("seen_udp", 0) >= self.KNOWN_TTL:
+            a = None
+        if a is None and l.get("udp_port") and l.get("tcp_ip"):
+            a = (l["tcp_ip"], l["udp_port"])
+        return a
+
+    def all_links_with_links(self):
+        for ent in self.nodes.values():
+            for w, l in ent["links"].items():
+                yield w, l
 
     def node_udp_addrs(self, nid):
         """Fresh UDP endpoints for every live link of node nid.

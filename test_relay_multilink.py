@@ -172,6 +172,26 @@ async def main():
     assert decode_bcast_from(p)[3] == b"SECOND"
     print("PASS[4] sibling link keeps the node alive", flush=True)
 
+    # ---- phase 5: control redial leaves a stale link with the SAME
+    # UDP endpoint; per-machine delivery must stay NIC-once (field bug:
+    # duplicate beacons made the game library fold phantom peers) ----
+    N4, N5 = 0x44444444, 0x55555555
+    r1, r2 = Link("redial-1"), Link("redial-2")
+    await r1.open(); await r1.register(N4, 7777)
+    await r2.open(); await r2.register(N4, 7777)     # same uport = same process
+    assert len(relay.nodes[N4]["links"]) == 2        # both live as links
+    await l4.send(T_BCAST, struct.pack("!HH", 47584, 47584) + b"ONCE")
+    async def grab(l):
+        try:
+            return await l.expect(T_BCAST_FROM, timeout=1.5)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            return None
+    res = await asyncio.gather(grab(r1), grab(r2))
+    got = [r for r in res if r is not None]
+    assert len(got) == 1, f"beacon delivered {len(got)}x to one machine"
+    print("PASS[5] same-endpoint links get NIC-once beacons", flush=True)
+    r1.close(); r2.close()
+
     print("MULTILINK_ALL_PASS", flush=True)
     for l in (l1, l3, l4):
         l.close()
