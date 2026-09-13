@@ -4,6 +4,9 @@ No TUN/TAP, no driver. Per-process socket-layer rewrite; only the injected
 game is affected. Needs `LAN_HOOK_SERVER` (a ShadowLAN relay), otherwise it
 is a pure passthrough. One source builds both the Windows DLL and the Linux
 `LD_PRELOAD` `.so` (same behavior; tested on Linux, shipped for Windows).
+Layout: `lan_hook.c` is the version stamp; `hk_core.c` holds the wire
+tables and policy; every other `hk_*.c` is its own translation unit
+(`hk_linux.c` on Linux, the four `hk_win*.c` files on Windows).
 
 ## Modes (automatic)
 

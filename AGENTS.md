@@ -13,11 +13,12 @@ pieces, all versioned together in this repo:
 - `server.py` — a pure-Python relay (TCP+UDP on ONE port) users deploy
   themselves (current deployment: `v4.router.chengzi.xyz:47777`, token
   set). **We cannot deploy it** — deliver the file + ask the user.
-- `hook/lan_hook.c` — one root TU + `hk_*.inc` fragments, two builds: Windows DLLs (`lan_hook64/32`
-  via mingw, injected with `hook/injector.exe`, IAT patching only, no asm)
-  and a Linux `LD_PRELOAD` `.so` (used by the test suite; field users are
-  on Windows). Rewrites socket calls of the game process tree so the
-  relay looks like the local NIC.
+- `hook/` — version stamp in `lan_hook.c` / `hk_version.h`; shared
+  tables in `hk_core.c`; one TU per `hk_*.c`. Two builds: Windows DLLs
+  (`lan_hook64/32` via mingw, injected with `hook/injector.exe`, IAT
+  patching only, no asm) and a Linux `LD_PRELOAD` `.so` (used by the
+  test suite; field users are on Windows). Rewrites socket calls of the
+  game process tree so the relay looks like the local NIC.
 - `wclient.py` — driverless Python client (proxy/bridge roles). No syscall
   visibility, so it has explicit `--host` mode; the hook auto-detects the
   same things (`listen()` ⇒ host claim, bound ports ⇒ serve).
@@ -37,12 +38,13 @@ Hard constraints from the user:
   `bcast_cache`/`BCAST_FRESH` replay added on 2026-09-13 was removed
   for this reason; the field run disproved its necessity anyway).
 
-## Wire protocol (2.0 generation, `common.py` + `DT_*/DU_*` in lan_hook.c)
+## Wire protocol (PVER 3 / UVER 3, `common.py` + `DT_*/DU_*` in `hk_core.h`)
 
 Framing on ALL TCP conns: `[u32 len][u8 type][payload]` (`common.HDR`, len
 covers type+payload). UDP tunnel datagrams: `'V','N',UVER,op,payload`.
-`PVER = UVER = 2`; **Python and C op tables must stay in lockstep** (both
-defined once: `common.py` header, `DT_*/DU_*` in `hk_policy.inc`).
+`PVER = 3`, `UVER = 3`; **Python and C op tables must stay in lockstep**
+(both defined once: `common.py` header, `DT_*/DU_*` in `hk_core.h`).
+Hook + relay ship together: a PVER-2 peer is dropped at registration.
 
 TCP control conn (one per hook process, ephemeral, auto-redial):
 
@@ -51,15 +53,14 @@ TCP control conn (one per hook process, ephemeral, auto-redial):
                    stamp for implicit fan-out ONLY — no election).
                    Registration is the ONLY versioned frame: gating it
                    gates everything routed by the node id (streams too).
-    T_ASSIGN=0x02  relay->peer: my_virt, net, bits, members + trailing
-                   !B link_id (1..255, MANDATORY, per-LINK; every link of
-                   a node gets its own ASSIGN carrying its own link_id;
-                   membership is per-NODE, not per-link)
-    T_STREQ carries the OPENER's vnode; the joinee maps the accepted
-    game socket's peer (accept out-param + getpeername) from the
-    bridge's 127.0.0.1 to that vnode — games cross-check it against
-    the announce source (dt_acc table, keyed by bridge ephemeral port,
-    fd-reuse verified).
+    T_ASSIGN=0x02  relay->peer: !I my_virt + !I net + !B bits + !H n
+                   + n*(!I node + !I virt). Length `11+8*n`. No tail.
+                   Membership is per-NODE, not per-link.
+    T_STREQ carries the OPENER's vnode (10 bytes: sid + gport + ovirt);
+    the joinee maps the accepted game socket's peer (accept out-param +
+    getpeername) from the bridge's 127.0.0.1 to that vnode — games
+    cross-check it against the announce source (dt_acc table, keyed by
+    bridge ephemeral port, fd-reuse verified).
     T_BCAST=0x03 / T_BCAST_FROM=0x04   discovery fanout
     T_UDP_MODE=0x05 / T_UDP_TUN=0x06   per-LINK UDP-over-TCP mode
 
@@ -84,17 +85,15 @@ at .1; `10.200.0.1` is the relay's pseudo-IP, relay pings are local).
 Source identity (UVER 3): the `cli_port` field of C2S/S2C/PDAT frames
 is the sender socket's BOUND VPORT - exactly what a real NIC stamps.
 Unbound sockets get the kernel's implicit-bind replicated at first send
-(dt_sport_presentation) and recorded as an identity row. v2 instead
-presented an internal slot mark (link_id*256+slot) as the source port:
-apps fold recvfrom sources into peer state and DIAL them - the mark was
-un-dialable from the app's seat, which poisoned GBE's peer tables
-(MEMBERS flip) and deadlocked SteamNetworkingSockets (post-join black
-screen, same-box field rounds). No mark exists on the wire in v3: S2C
+(dt_sport_presentation) and recorded as an identity row. A prior
+generation presented an internal slot mark (link_id*256+slot) as the
+source port: apps fold recvfrom sources into peer state and DIAL them -
+the mark was un-dialable from the app's seat, which poisoned GBE's peer
+tables (MEMBERS flip) and deadlocked SteamNetworkingSockets (post-join
+black screen, same-box field rounds). No mark exists on the wire: S2C
 receivers resolve the flow from (game_port, own port) against their own
-outbound flow table. link_id stays only as the relay's per-link
-bookkeeping/ASSIGN tail. Wire is PVER 2 + UVER 3; the mandatory ASSIGN
-tail means hook+relay ship TOGETHER (mismatched length = fatal 201
-fail-fast, intended).
+outbound flow table. The relay may keep an internal link id for logs;
+it is not on the wire.
 
 Semantics that matter:
 - `connect()` completes when a dest link CLAIMS the stream (STOK at
@@ -306,12 +305,12 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Version & release policy (user's rules — follow exactly)
 
-- Version lives in TWO places only: `common.VERSION` + lan_hook.c
-  `SHADOWLAN_VERSION`; they move together in a dedicated
-  `chore: bump version to X` commit.
+- Version lives in TWO places only: `common.VERSION` +
+  `hook/hk_version.h` `SHADOWLAN_VERSION` (included by `lan_hook.c`);
+  they move together in a dedicated `chore: bump version to X` commit.
 - **rc versions are NEVER committed** — local stamp only; keep those two
   lines dirty in the working tree between releases (current: none —
-  2.0.0 is released; the next local build starts 2.0.1-rc1).
+  2.0.0 is released; the next committed stamp is the 3.0.0 release).
   At release: change to the final number, commit the bump, build, ship.
 - **No rc references in git content either**: all change notes between
   releases live in ONE "Status snapshot (UNRELEASED)" section here; at
@@ -444,9 +443,21 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
-Protocol v3 (this cut): source port = bound vport, mark system DELETED
-(dt_mark/dt_unmark/g_link_id-arithmetic gone; frame bytes unchanged
-from v2 - only the meaning + UVER 3). This was the last same-box
+PVER 3 + hook modules (this cut): control registration is now PVER 3
+(old PVER-2 peers fail-fast at NODE). ASSIGN dropped the unused
+`link_id` tail (payload length `11+8*n`); `decode_streq` requires the
+10-byte opener-virt form; `dt_mark`/`dt_unmark`/`g_link_id` deleted;
+NODE token prefix renamed `dt_token_prefix`. UVER stays 3. Hook is
+real TUs: `hk_core` (ops, tables, DLOCK, policy) plus one `.c` per
+former `.inc` fragment; `lan_hook.c` is the version stamp only.
+Makefile `MOD` lists every `hk_*.c` (Linux skips `hk_win*`, Windows
+skips `hk_linux.c`). Product stamps stay dirty locally until the
+release bump. Hook + relay ship together.
+
+Source-port identity (prior unreleased cut): source port = bound vport,
+mark system DELETED (dt_mark/dt_unmark/g_link_id-arithmetic gone; frame
+bytes unchanged from the v2 UDP layout - only the meaning + UVER 3).
+This was the last same-box
 fidelity gap: with it fixed, the co-host yield guard and the any-proto
 bridge backstop were RETIRED - same-box double-node runs now behave
 exactly like two machines (forward+reverse channels both bridge;

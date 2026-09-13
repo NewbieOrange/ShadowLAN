@@ -93,7 +93,7 @@ Startup waits up to `LAN_HOOK_LEASE_WAIT` ms (default `3000`) for the relay's ad
 - `server.py` — dedicated relay only: membership, virtual-IP assignment, addressed + fallback routing
 - `wclient.py` — symmetric client: player proxy and/or `--host` bridge, node registration
 - `common.py` — shared framing
-- `hook/lan_hook.c` — universal hook (Windows DLLs + Linux `.so` test/LD_PRELOAD build)
+- `hook/` — universal hook (`hk_*.c` TUs; Windows DLLs + Linux `.so`)
 - `hook/injector.c` — Windows launcher (`injector.exe`)
 - `game.example.json` — config template
 
@@ -101,6 +101,7 @@ Startup waits up to `LAN_HOOK_LEASE_WAIT` ms (default `3000`) for the relay's ad
 
 ```sh
 make -C hook all        # DLLs + injector.exe (mingw) + lan_hook.so
+                        # compile defaults to -j$(nproc); pass -j1 to serialize
 ```
 
 On Windows with MinGW: `hook/build.bat`. Run hook tests with `make -C hook test`.
