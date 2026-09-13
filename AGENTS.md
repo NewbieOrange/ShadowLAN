@@ -405,6 +405,17 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Field join timeline closed (rc7 logs): joiner received the host's full
+270,986B lobby reply 77ms after the bridge (per-chunk hs out proves the
+pump caught the game's writes instantly; partial recvs rule out pump
+lag). The remaining ~16s = the HOST GAME writing the giant message's
+final 464B as 113B pieces on its own exact 5.0s rounds - head-of-line
+protobuf parse waits for that tail; a JOIN retry after it lands joins
+immediately. Trigger counts (LAN 12 vs vnet 1 lobby-dataupdates) also
+point at app-side peer bookkeeping, not transport. Nothing pending in
+hook/relay for the join path; exit-drain verified live (3x per machine,
+clean player-gone cascade).
+
 Kernel close/duplex fidelity (this cut): shutdown() implemented
 (SHUT_RD discards, SHUT_WR flushes + FINs the peer via new T_STSHUT
 control frame; reverse direction stays alive); close() now flushes the
