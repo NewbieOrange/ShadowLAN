@@ -625,7 +625,7 @@ static void dt_alias_drop(long long sock) {
  * failure degrades silently to the previous per-process behavior. */
 #define SLP_MAGIC 0x534c5032u
 #define SLP_MAX 192
-typedef struct { unsigned int pid; unsigned int _pad0;
+typedef struct { unsigned int pid; unsigned int node;
                  unsigned long long start;
                  int vport; int real;
                  unsigned char proto; unsigned char reuse;
@@ -636,11 +636,12 @@ typedef struct { unsigned int magic; unsigned int gen; slp_ent e[SLP_MAX]; } slp
 static int g_slp_fd = -1;
 static slp_t *g_slp = 0;
 static int slp_attach(void) {
-    char nm[64];
+    /* ONE machine-wide registry object; entries carry the node id.
+     * (A per-node name would leave a /dev/shm stub per random node id
+     * forever - the object is kernel-refcounted, the NAME is not.) */
     if (g_slp) return 1;
     if (!g_node) return 0;
-    snprintf(nm, sizeof nm, "/slp-%08x", (unsigned)g_node);
-    int fd = shm_open(nm, O_CREAT | O_RDWR, 0600);
+    int fd = shm_open("/slp-ports", O_CREAT | O_RDWR, 0600);
     if (fd < 0) return 0;
     if (ftruncate(fd, (off_t)sizeof(slp_t)) != 0) { close(fd); return 0; }
     void *p = mmap(0, sizeof(slp_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -752,7 +753,8 @@ static int slp_claim(int vport, int proto, int reuse, int real) {
         int i, found = -1;
         for (i = 0; i < SLP_MAX; i++) {
             slp_ent *x = &g_slp->e[i];
-            if (x->used && x->vport == vport && x->proto == (unsigned char)proto) {
+            if (x->used && x->node == (unsigned)g_node &&
+                x->vport == vport && x->proto == (unsigned char)proto) {
                 found = i; break;
             }
         }
@@ -770,6 +772,7 @@ static int slp_claim(int vport, int proto, int reuse, int real) {
             if (i < SLP_MAX) {
                 slp_ent *x = &g_slp->e[i];
                 x->used = 1; x->pid = (unsigned)current_pid();
+                x->node = (unsigned)g_node;
                 x->start = slp_self_start();
                 x->vport = vport; x->real = real;
                 x->proto = (unsigned char)proto; x->reuse = (unsigned char)reuse;
@@ -788,7 +791,8 @@ static void slp_release(int vport, int proto) {
         int i;
         for (i = 0; i < SLP_MAX; i++) {
             slp_ent *x = &g_slp->e[i];
-            if (x->used && x->vport == vport && x->proto == (unsigned char)proto
+            if (x->used && x->node == (unsigned)g_node &&
+                x->vport == vport && x->proto == (unsigned char)proto
                 && x->pid == (unsigned)current_pid()) {
                 x->used = 0; g_slp->gen++;
             }
@@ -812,7 +816,8 @@ static int slp_taken(int vport) {
     {
         int i;
         for (i = 0; i < SLP_MAX; i++)
-            if (g_slp->e[i].used && g_slp->e[i].vport == vport) { t = 1; break; }
+            if (g_slp->e[i].used && g_slp->e[i].node == (unsigned)g_node &&
+                g_slp->e[i].vport == vport) { t = 1; break; }
     }
     SLP_UNLOCK();
     return t;
