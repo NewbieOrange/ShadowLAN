@@ -28,7 +28,7 @@ T_UDP_MODE = 0x05    # declare UDP-over-TCP mode for this link (empty payload)
 T_UDP_TUN = 0x06     # TCP frame carrying one UDP-tunnel datagram (UDP-over-TCP mode)
 
 # T_NODE/U_NODE flags bits:
-NODE_F_HOST = 0x01   # this node hosts a game: claim designated-host
+NODE_F_HOST = 0x01   # host claim: per-link ordering stamp only, no election
 
 # ---- per-stream TCP ops (first frame(s) of a stream connection) ----------
 # opener dials the relay, sends T_STOPEN; the relay asks the destination

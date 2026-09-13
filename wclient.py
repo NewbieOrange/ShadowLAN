@@ -33,7 +33,6 @@ import os
 import random
 import socket
 import struct
-import sys
 import time
 
 if os.name == "nt":
@@ -47,7 +46,7 @@ from common import (
     T_BCAST, T_BCAST_FROM, T_NODE, NODE_F_HOST,
     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL, T_STOPEN,
     STF_HOST_FAILED,
-    U_GAME_C2S, U_GAME_S2C, U_NODE,
+    U_GAME_C2S, U_GAME_S2C,
     U_ICMP_REQ, U_ICMP_REP, UMAGIC, UVER,
     QueueProto,
     decode_udp_game, encode_udp_game,

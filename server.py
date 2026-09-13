@@ -29,7 +29,7 @@ from common import (
     T_BCAST, T_BCAST_FROM, T_NODE, T_ASSIGN,
     T_UDP_TUN, T_UDP_MODE,
     T_STOPEN, T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
-    STF_NO_ROUTE, STF_JOIN_TIMEOUT, STF_BAD_ID, STF_BUSY,
+    STF_NO_ROUTE, STF_BAD_ID, STF_BUSY,
     U_GAME_C2S, U_GAME_S2C, U_GAME_P2P, U_NODE, UMAGIC, UVER,
     U_ICMP_REQ, U_ICMP_REP,
     QueueProto,
@@ -37,8 +37,8 @@ from common import (
     decode_udp_node, decode_pdat,
     PVER, ctl_ver, decode_ctl_node, NODE_F_HOST,
     encode_assign, encode_bcast_from, encode_icmp, decode_icmp,
-    encode_stopen, decode_stopen, encode_streq, decode_streq,
-    encode_stjoin, decode_stjoin, encode_stsid, decode_stsid,
+    decode_stopen, encode_streq,
+    decode_stjoin, encode_stsid,
     encode_stfail, decode_stfail,
     ip_to_int, int_to_ip, parse_ports, tcp_read, tcp_send,
     ST_TIMEOUT_S, T_STSHUT,
@@ -330,7 +330,7 @@ class Relay:
                     "tcp_ip": tcp_ip, "udp_port": 0, "udp_addr": None,
                     "seen_udp": 0.0, "udp_tcp": False,
                     "link_id": free[0] if free else 255,
-                    # when this LINK last claimed designated-host status
+                    # when this LINK last stamped its host claim
                     # (T_NODE/U_NODE NODE_F_HOST). Ordering input for
                     # implicit fan-out only - never an exclusion: on a
                     # LAN every host is asked and the listener answers.
@@ -1133,7 +1133,7 @@ class Relay:
             if not dec:
                 return
             tok, node, _uport, flags = dec
-            # (the host-flagged U_NODE 'designated host UDP endpoint'
+            # (the old 'host UDP endpoint' pin from the retired election
             # pin was retired: every member's endpoint is learned from
             # its own traffic - on a LAN any host may be asked and only
             # the listener answers)
