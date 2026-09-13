@@ -58,7 +58,19 @@ u.bind(("0.0.0.0", port))                    # aliased dgram row lands first
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind(("0.0.0.0", port)); s.listen(2)       # aliased stream row
 print("ALIAS-LISTEN", flush=True)
-time.sleep(35)                                # forward attempts fail here
+t0 = time.time()
+while time.time() - t0 < 40:
+    try:
+        s.settimeout(3)
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    d = c.recv(64)
+    if d:
+        c.sendall(b"ECHO:" + d)
+    c.close()
 '''
 
 REVERSE = r'''
@@ -75,9 +87,9 @@ socket.setdefaulttimeout(20)
 t0 = time.time()
 try:
     s = socket.create_connection(("10.200.15.3", int(sys.argv[1])))
-    s.sendall(b"X")
-    r = s.recv(8)          # field-validated shape: open accepted, then
-    print("FWD-EOF %.1fs %r" % (time.time() - t0, r), flush=True)  # clean EOF, no data
+    s.sendall(b"FWDQUERY")
+    r = s.recv(16)
+    print("FWD-OK %.1fs %r" % (time.time() - t0, r), flush=True)
 except OSError as e:
     print("FWD-ERR %.1fs %s" % (time.time() - t0, e), flush=True)
 '''
@@ -112,9 +124,8 @@ check("R6a2 alias node listener up (both rows aliased)",
 
 fwd = subprocess.run([sys.executable, "-c", FORWARD, str(V)],
                      env=env(RELAY, _NODE0 + 1), capture_output=True, text=True, timeout=45)
-m = re.search(r"FWD-(EOF|ERR) (\d+\.\d+)", fwd.stdout)
-check("R6b forward channel delivers no session data, bounded (no split state, no hang)",
-      m is not None and float(m.group(2)) < 15.0,
+check("R6b forward channel bridges through the alias to the TCP listener (v3: identical to two machines)",
+      "FWD-OK" in fwd.stdout and "ECHO" in fwd.stdout,
       fwd.stdout.strip()[:80])
 
 rev = subprocess.Popen([sys.executable, "-c", REVERSE, str(V)],
