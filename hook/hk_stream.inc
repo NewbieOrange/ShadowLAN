@@ -1538,16 +1538,18 @@ static void dt_start(void) {
         unsigned long ev = (ne && ne[0]) ? strtoul(ne, NULL, 0) : 0;
         if (ev) {
             g_node = (unsigned)ev;
+            slp_set_node(g_node);
         } else {
             /* stable-ish random node id (loopback tests fork rarely collide) */
 #ifdef LINUX_BUILD
             dt_rand_seed();
-            dt_rand_state ^= (unsigned)dt_now_ms();
+            dt_rand_mix((unsigned)dt_now_ms());
 #else
             dt_rand_seed();
-            dt_rand_state ^= (unsigned)GetTickCount();
+            dt_rand_mix((unsigned)GetTickCount());
 #endif
             g_node = dt_rand() | 1;
+            slp_set_node(g_node);
         }
         {
             char nb[24];

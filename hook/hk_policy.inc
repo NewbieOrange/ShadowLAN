@@ -3,11 +3,7 @@
 /* ---------- shared policy ---------- */
 static int g_only_ports[64];
 static int g_nports = 0; /* 0 = all */
-#define SHADOWLAN_VERSION "2.0.1-rc13"
-static long long dt_now_ms(void);
-static void dt_stamp(char *out, size_t n);
 static void dt_fatal(int code, const char *msg);
-static int g_debug = 0;
 /* direct-tunnel mode: hook dials server itself (no wclient.py needed) */
 static char g_server[256] = {0};
 static int g_srvport = 47777;
@@ -223,39 +219,6 @@ static int g_vbits = 24;
 #define DT_MAXMEMB 256
 static struct { unsigned node, virt; } g_members[DT_MAXMEMB]; /* virt numeric */
 static int g_nmembers = 0;
-static unsigned dt_rand_state = 0;
-static void dt_rand_seed(void) {
-    /* NEVER leave the state 0: the default fallback would give every
-     * process the SAME random stream, and stream ids (the relay keys
-     * streams room-wide by sid) would collide between the viewer tool
-     * and the game - and between any two nodes whose processes seed in
-     * the same clock tick. Mix pid, ms clock, stack and heap addresses:
-     * uniqueness matters more than entropy. */
-    unsigned long long x = (unsigned long long)dt_rand_state;
-#ifdef LINUX_BUILD
-    x ^= (unsigned long long)(unsigned)getpid() * 0x9e3779b97f4a7c15ull;
-    x ^= (unsigned long long)(unsigned long)time(NULL) << 17;
-    x ^= (unsigned long long)(size_t)(void *)&x >> 4;      /* stack ASLR */
-    x ^= (unsigned long long)(size_t)(void *)malloc(1);    /* heap ASLR */
-#else
-    /* long is 32-bit on EVERY Windows ABI - accumulate in 64 bits so
-     * the high-fold below actually folds something */
-    x ^= (unsigned long long)GetCurrentProcessId() * 0x9e3779b97f4a7c15ull;
-    x ^= GetTickCount64() << 17;
-    x ^= (unsigned long long)(size_t)(void *)&x >> 4;
-    x ^= (unsigned long long)(size_t)(void *)HeapCreate(0, 0, 0);
-#endif
-    if (!x) x = 0x9e3779b97f4a7c15ull;
-    dt_rand_state = (unsigned)(x ^ (x >> 32));
-    if (!dt_rand_state) dt_rand_state = 0x9e3779b9u;
-}
-static unsigned dt_rand(void) {
-    unsigned x = dt_rand_state;
-    if (!x) { dt_rand_seed(); x = dt_rand_state; }
-    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-    dt_rand_state = x;
-    return x ? x : 1;
-}
 /* hosting claim: set when the local game serves (listen() hook). The
  * relay keeps it per LINK as an ordering stamp (freshest claim first) so
  * bridge migration is deterministic; it never gates or excludes anyone —
@@ -357,66 +320,9 @@ static CRITICAL_SECTION g_dcs; static int g_dcs_init = 0;
 #define DUNLOCK() LeaveCriticalSection(&g_dcs)
 #endif
 
-static void dt_msleep(int ms) {
-#ifdef LINUX_BUILD
-    usleep((useconds_t)ms * 1000);
-#else
-    Sleep(ms);
-#endif
-}
-static unsigned current_pid(void) {
-#ifdef LINUX_BUILD
-    return (unsigned)getpid();
-#else
-    return GetCurrentProcessId();
-#endif
-}
 /* forward decls: stream helpers defined in the per-stream section below */
 static struct dt_stream *dt_stream_by_sid(unsigned sid);
 /* wall-clock stamp for file logs: "MM-DD HH:MM:SS.mmm" */
-static void dt_stamp(char *out, size_t n) {
-#ifdef LINUX_BUILD
-    struct timeval tv;
-    struct tm tm;
-    gettimeofday(&tv, NULL);
-    localtime_r(&tv.tv_sec, &tm);
-    snprintf(out, n, "%02d-%02d %02d:%02d:%02d.%03d",
-             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (int)(tv.tv_usec / 1000));
-#else
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    snprintf(out, n, "%02d-%02d %02d:%02d:%02d.%03d",
-             (int)st.wMonth, (int)st.wDay, (int)st.wHour,
-             (int)st.wMinute, (int)st.wSecond, (int)st.wMilliseconds);
-#endif
-    out[n - 1] = 0;
-}
-static void dlog(const char *m) {
-    if (!g_debug) return;
-#ifdef LINUX_BUILD
-    { char ts[32]; dt_stamp(ts, sizeof(ts)); fprintf(stderr, "[%s lan_hook] %s\n", ts, m); }
-#else
-    OutputDebugStringA("lan_hook: ");
-    OutputDebugStringA(m);
-    OutputDebugStringA("\n");
-    {
-        static FILE *lf = NULL;
-        static int tried = 0;
-        if (!tried) {
-            tried = 1;
-            const char *p = getenv("LAN_HOOK_LOGFILE");
-            if (p && p[0]) lf = fopen(p, "a");
-        }
-        if (lf) {
-            char ts[32];
-            dt_stamp(ts, sizeof(ts));
-            fputs(ts, lf); fputs(" lan_hook: ", lf);
-            fputs(m, lf); fputc('\n', lf); fflush(lf);
-        }
-    }
-#endif
-}
 /* Fatal startup failure: the tunnel cannot work, so running on would
  * only produce a broken game. Log unconditionally, tell the user, and
  * terminate the process with a distinct exit code (200/201). Never
@@ -508,27 +414,3 @@ static int dt_icmp_pend_complete(unsigned id, unsigned seq,
  * handshake timeout (nothing listens, faithful). */
 #define DT_MAXLISTEN 32
 static int g_lports[DT_MAXLISTEN];
-/* Per-process virtual<->real port table: one row per hooked bind
- * (identity rows included), so listeners, fan-out, getsockname and the
- * loopback bridges all keep speaking the app's virtual port. Same-node
- * bind conflicts are arbitrated by the NODE ledger BEFORE the real
- * stack (kernel-collide); only a conflict owned by a DIFFERENT node on
- * this OS reaches here as an alias: the bind is re-issued ephemerally
- * under the kept vport. Kernel fidelity, not a trick: two real LAN
- * hosts never see each other's EADDRINUSE. */
-#define DT_TA_MAX 64     /* per-process vport<->real presentation table */
-static struct { long long sock; int vport; int real;
-                  unsigned char proto; unsigned char bindv; } g_ta[DT_TA_MAX];
-static void dt_alias_add(long long sock, int vport, int real, int proto) {
-    int i;
-    for (i = 0; i < DT_TA_MAX; i++)
-        if (g_ta[i].sock == sock) {
-            g_ta[i].vport = vport; g_ta[i].real = real;
-            g_ta[i].proto = (unsigned char)proto; return;
-        }
-    for (i = 0; i < DT_TA_MAX; i++)
-        if (!g_ta[i].sock) {
-            g_ta[i].sock = sock; g_ta[i].vport = vport; g_ta[i].real = real;
-            g_ta[i].proto = (unsigned char)proto; return;
-        }
-}

@@ -507,10 +507,6 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
         int want = ntohs(in.sin_port);
         if (want != 0) {
             int rv = slp_claim(want, proto, reuse, want);
-            if (g_debug) { char lb[128];
-                snprintf(lb, sizeof lb, "slp dbg pid=%u node=%u want=%d proto=%d reuse=%d rv=%d",
-                         (unsigned)GetCurrentProcessId(), (unsigned)g_node, want, proto, reuse, rv);
-                dlog(lb); }
             if (rv == -1) {
                 WSASetLastError(WSAEADDRINUSE);
                 r = SOCKET_ERROR; goto bindexit;

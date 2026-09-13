@@ -12,56 +12,26 @@
  * is affected.
  *
  * Windows: IAT patch (no asm blobs) + GetProcAddress/LoadLibrary guards.
- * Build (Linux, mingw installed):
- *   x86_64-w64-mingw32-gcc -shared -O2 -Wall -o lan_hook64.dll lan_hook.c lan_hook.def -lws2_32 -ldbghelp
- *   i686-w64-mingw32-gcc -shared -O2 -Wall -o lan_hook32.dll lan_hook.c lan_hook.def -lws2_32 -ldbghelp
- *   x86_64-w64-mingw32-gcc -O2 -Wall -o injector.exe injector.c -lpsapi
- * Linux self-test:
- *   gcc -shared -fPIC -DLINUX_BUILD -O2 -o lan_hook.so lan_hook.c -ldl -lpthread
+ *
+ * Layout: hk_util.c / hk_alias.c / hk_ledger.c are independent modules
+ * sharing ONLY the hk_api.h interface. Everything else - this root plus
+ * the hk_*.inc fragments - forms ONE translation unit (the core shares
+ * the static state graph; fragment order is load-bearing, see the note
+ * at the include list). Build from the hook directory: `make` (cross-
+ * builds both DLLs from Linux with mingw) or build.bat on Windows.
  */
-#ifdef LINUX_BUILD
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <pthread.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/file.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#else
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <tlhelp32.h>
-#include <psapi.h>
-#include <dbghelp.h>
-#include <iphlpapi.h>
-#include <icmpapi.h>
-#include <ctype.h>
-#include <setjmp.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#endif
 
+#include "hk_plat.h"
+#include "hk_api.h"
 
-/* Implementation split by concern. Single translation unit BY DESIGN:
- * these fragments share the static state graph (tables, locks, identity)
- * and are order-dependent - do not compile or reorder them standalone.
- * Platform guards are balanced per fragment. */
+/* Version stamp #1 of 2 (pair: common.py VERSION); both move together in
+ * a dedicated bump commit. rc stamps stay UNCOMMITTED. */
+#define SHADOWLAN_VERSION "2.0.0"
+
+/* Implementation split: hk_util/hk_alias/hk_ledger are independent TUs
+ * (interface: hk_api.h). The remaining .inc fragments form ONE
+ * translation unit with this root - they share the static state graph
+ * and are order-dependent; do not reorder or compile standalone. */
 #include "hk_policy.inc"
 #include "hk_ports.inc"
 #include "hk_sess.inc"

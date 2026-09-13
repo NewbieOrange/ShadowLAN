@@ -232,7 +232,7 @@ static void dt_on_close(long long gsock) {
         struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
-    slp_release_sock(gsock);
+    dt_alias_release_all(gsock);
     dt_alias_drop(gsock);
     dt_sig_locked(gsock); /* wake event waiters with CLOSE (noop on Linux) */
 #ifndef LINUX_BUILD

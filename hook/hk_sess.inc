@@ -32,14 +32,6 @@ struct dt_usess {
     long long last;
 };
 static struct dt_usess g_us[DT_MAXUSESS];
-static long long dt_now_ms(void) {
-#ifdef LINUX_BUILD
-    struct timeval tv; gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-#else
-    return (long long)GetTickCount();
-#endif
-}
 static struct dt_hosted *dt_hs_by_sid(unsigned sid) {
     for (int i = 0; i < DT_MAXHOST; i++)
         if (g_hs[i].used && g_hs[i].sid == sid) return &g_hs[i];
