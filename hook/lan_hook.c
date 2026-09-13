@@ -800,10 +800,20 @@ static int slp_claim(int vport, int proto, int reuse, int real) {
             }
             else rc = -1;                       /* kernel would collide */
         } else {
-            for (i = 0; i < SLP_MAX; i++)
-                if (!g_slp->e[i].used) break;
-            if (i < SLP_MAX) {
-                slp_ent *x = &g_slp->e[i];
+            /* allocation with a janitor pass: a dead holder's slot is
+             * free space too. Without this sweep the machine-wide
+             * registry fills with stale claims over many runs (-2 ->
+             * fail-open -> same-node duplicates alias through: the
+             * table-full bug found on a day of heavy test runs). */
+            int slot = -1, reap = -1, i2;
+            for (i2 = 0; i2 < SLP_MAX; i2++) {
+                slp_ent *x = &g_slp->e[i2];
+                if (!x->used) { slot = i2; break; }
+                if (reap < 0 && !slp_alive(x->pid, x->start)) reap = i2;
+            }
+            if (slot < 0) slot = reap;
+            if (slot >= 0) {
+                slp_ent *x = &g_slp->e[slot];
                 x->used = 1; x->pid = (unsigned)current_pid();
                 x->node = (unsigned)g_node;
                 x->start = slp_self_start();
