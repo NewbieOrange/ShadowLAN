@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -245,7 +246,8 @@ typedef SOCKET DTSOCK;
 #define DT_STJOIN 0x09    /* dest->relay: !I node + !I sid */
 #define DT_STJOINED 0x0A  /* dest->relay: !I sid (local bridge up) */
 #define DT_STOK   0x0B    /* relay->opener (confirmed) / relay->dest (claim): !I sid */
-#define DT_STFAIL 0x0C    /* relay->opener/dest, dest->relay: !I sid + !B reason */
+#define DT_STFAIL 0x0C
+#define DT_STSHUT 0x0D   /* half-close: my write side is done */    /* relay->opener/dest, dest->relay: !I sid + !B reason */
 #define STF_NO_ROUTE 1
 #define STF_JOIN_TIMEOUT 2
 #define STF_HOST_FAILED 3
@@ -328,7 +330,15 @@ struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in o
                    unsigned an_rx, an_tx; size_t ab_rx, ab_tx; long long a_log;
                    /* exit drain handshake: while flushing the pump leaves the
                     * out-queue to the exiting thread (sending = in-flight) */
-                   int flushing; int sending; };
+                   int flushing; int sending;
+                   int thread_done;  /* pump loop exited (owns teardown) */
+    int shut_done;    /* DT_STSHUT queued once after WR flush */
+    int ever_open;    /* reached ST_OPEN at least once: post-open
+                     * deaths are NOT connect errors (SO_ERROR) */
+                   int peer_fin;     /* relay delivered FIN: read side closed,
+                                      * writes stay alive (kernel half-close) */
+                   int wr_shut;      /* app called shutdown(SHUT_WR) */
+                   int rd_shut;      /* app called shutdown(SHUT_RD) */ };
 struct dt_udp { int used; long long gsock; struct dt_dgram *h, *t; int nq; int closed; int vport; };
 struct dt_slot { int used; long long gsock; int game_port; struct sockaddr_in orig; };
 struct dt_frame { unsigned char type; unsigned char *p; size_t n; struct dt_frame *next; };
@@ -871,10 +881,12 @@ static int dt_host_bridge(unsigned sid, int port) {
     s = (DTSOCK)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
     if (r_connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { r_close(s); return -1; }
+    { int fl = fcntl((int)s, F_GETFL, 0); fcntl((int)s, F_SETFL, fl | O_NONBLOCK); }
 #else
     s = (DTSOCK)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
     if (connect(s, (struct sockaddr *)&lo, sizeof(lo)) != 0) { closesocket(s); return -1; }
+    { u_long nb = 1; ioctlsocket(s, FIONBIO, &nb); }
 #endif
     struct sockaddr_in bn;
 #ifdef LINUX_BUILD
@@ -1195,6 +1207,7 @@ static void dt_obsv(const char *dir, long long s, const struct sockaddr *a,
 }
 #endif
 static struct dt_stream *dt_stream_by_sock(long long s) {
+    if (!s) return NULL;   /* gsock 0 = slot owned by a finished pump */
     for (int i = 0; i < DT_MAXSTREAM; i++)
         if (g_st[i].used && g_st[i].gsock == s) return &g_st[i];
     return NULL;
@@ -1480,6 +1493,7 @@ static void dt_dispatch_bcast(int port, int sport, const unsigned char *raw, siz
  *          [u32 len][u8 type][payload]  (same framing as the control
  *          connection; the relay swaps to raw after DT_STOK/DT_STJOINED).
  * -------------------------------------------------------------------- */
+#define DT_RSTMARK 255u                /* st->fail: peer sent RST */
 #define DT_ST_MAXIN  (1024 * 1024)    /* app-read backpressure cap */
 #define DT_ST_MAXOUT (4 * 1024 * 1024)
 
@@ -1920,7 +1934,7 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         }
         if (!gone) {
             if (r == 0 && type == DT_STOK && rn >= 4 && dt_get32(rp) == sid) {
-                st->state = ST_OPEN;
+                st->state = ST_OPEN; st->ever_open = 1;
                 dt_sig_locked(gsock);
             } else if (r == 0 && type == DT_STFAIL && rn >= 5 && dt_get32(rp) == sid) {
                 st->state = ST_DEAD; st->fail = rp[4];
@@ -1961,12 +1975,45 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         int mine = st->used && st->sid == sid;
         int has_out = mine && st->ototal > 0 && !st->flushing;
         int pause = !mine || st->in_paused;
+        int finr = mine && st->peer_fin;
         int dead = !mine || st->dead;
+        int shut_now = 0;
+        if (st->used && st->sid == sid && st->wr_shut && !st->shut_done
+                && st->ototal == 0) { st->shut_done = 1; shut_now = 1; }
         DUNLOCK();
-        if (dead) break;
+        if (shut_now) {           /* FIN toward the peer once flushed */
+            unsigned char sb[4]; dt_put32(sb, sid);
+            dt_tcp_queue(DT_STSHUT, sb, 4);
+        }
+        if (dead) {
+            /* close(): pending reads are discarded by the kernel but
+             * queued sends are flushed and FIN'd - do the same before
+             * retiring (bounded), then let the tail free the slot. */
+            for (;;) {
+                const unsigned char *p = NULL; size_t n = 0; DTSOCK fd2;
+                DLOCK();
+                if (st->used && st->sid == sid && st->oh && st->fd_live) {
+                    p = st->oh->p + st->oh->off;
+                    n = st->oh->n - st->oh->off;
+                    fd2 = st->fd;
+                }
+                DUNLOCK();
+                if (!p || !n) break;
+                if (dt_st_send_all_tmo(fd2, p, n, 150)) break;
+                DLOCK();
+                if (st->used && st->sid == sid && st->oh) {
+                    struct dt_chunk *c = st->oh;
+                    st->oh = c->next;
+                    if (!st->oh) st->ot = NULL;
+                    st->ototal -= (c->n - c->off);
+                }
+                DUNLOCK();
+            }
+            break;
+        }
         fd_set rf, wf;
         FD_ZERO(&rf); FD_ZERO(&wf);
-        if (!pause)
+        if (!pause && !finr)
 #ifdef LINUX_BUILD
             FD_SET((int)fd, &rf)
 #else
@@ -2070,26 +2117,30 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
                       ); dlog(lb); }
                 DLOCK();
                 if (st->used && st->sid == sid) {
-                    st->state = ST_DEAD; st->fail = 0;
+                    st->state = ST_DEAD;
+                    st->fail = DT_RSTMARK;   /* hard error: resets surface */
                     dt_sig_locked(gsock);
                 }
                 DUNLOCK();
                 break;
             }
             if (n == 0) {
+                /* peer FIN (half-close): our reads EOF after the queue
+                 * drains, but writes stay alive until the app closes -
+                 * do NOT kill the whole stream here */
                 DLOCK();
                 if (st->used && st->sid == sid) {
-                    st->state = ST_DEAD; st->fail = 0; /* peer closed / reset */
-                    dt_sig_locked(gsock);
+                    st->peer_fin = 1;
+                    /* edge wake, not level: EOF must not busy-poll the
+                     * merged select (a still-open socket would spin);
+                     * recv/poll read the flag when they look at state */
+                    if (st->h == NULL) dt_sig_locked(gsock);
                 }
                 DUNLOCK();
-                { char lb[190];
-                  snprintf(lb, sizeof(lb),
-                           "stream eof pid=%u gsock=%lld sid=%u in=%llu out=%llu",
-                           (unsigned)current_pid(), gsock, sid,
-                           (unsigned long long)in0, (unsigned long long)out0);
+                { char lb[96]; snprintf(lb, sizeof(lb),
+                    "stream fin pid=%u sid=%u", (unsigned)current_pid(), sid);
                   dlog(lb); }
-                break;
+                continue;
             }
             in0 += (size_t)n;
             DLOCK();
@@ -2115,8 +2166,9 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         }
     }
     DLOCK();
+    st->thread_done = 1;
     if (st->used && st->sid == sid) {
-        int app_closed = st->dead;
+        int app_closed = st->dead || st->wr_shut;
         st->state = ST_DEAD;
         if (app_closed) {
             st->used = 0;
@@ -2246,18 +2298,16 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
                  (unsigned)current_pid(), sid, gport);
         dlog(lb);
     }
-    /* raw pipe: relay <-> local game bridge (both directions, blocking
-     * sends so a slow local game backpressures the relay like a kernel
-     * would, and vice versa). */
-    unsigned char buf[65536];
-    /* game->relay hold slot: the relay conn is nonblocking, so bytes it
-     * cannot take right now must be kept and retried, and the game
-     * socket left unread until they are gone - the same order and
-     * backpressure a kernel send buffer gives on a real LAN. Dropping
-     * them on WSAEWOULDBLOCK corrupts the stream mid-message, which
-     * strands the peer's parser until some later write pushes the
-     * remainder out. */
-    size_t pend_n = 0, pend_o = 0;
+    /* raw pipe, two INDEPENDENT directions: each side gets its own hold
+     * slot and its own writable watch; a stalled reader on one side
+     * closes only that direction's window (we stop reading that fd) and
+     * never touches the other - the same full-duplex semantics a kernel
+     * gives. Both sockets are nonblocking: the pump must never park in
+     * a syscall, or the idle direction would block with it. */
+    unsigned char obuf[65536], ibuf[65536];
+    size_t op_n = 0, op_o = 0;   /* game -> relay hold (read from real) */
+    size_t ip_n = 0, ip_o = 0;   /* relay -> game hold (read from fd)   */
+    int fin_real = 0, fin_fd = 0, shut_sent = 0, eof_sent = 0;
     size_t in0 = 0, out0 = 0;
     DTSOCK real = DTSOCK_BAD;
     DLOCK();
@@ -2272,112 +2322,160 @@ static DWORD WINAPI dt_join_thread(LPVOID u)
         int dead = h ? h->dead : 1;
         DUNLOCK();
         if (dead) break;
+        if (fin_fd && fin_real) break;     /* both directions finished */
+        if (!shut_sent && fin_real && op_n == op_o) {
+            shut_sent = 1;                 /* game FIN'd: tell the relay */
+            unsigned char sb[4]; dt_put32(sb, sid);
+            dt_tcp_queue(DT_STSHUT, sb, 4);
+        }
+        if (fin_fd && !eof_sent && ip_n == ip_o) {
+            eof_sent = 1;                  /* peer FIN'd: FIN the app's
+                                            * socket once data is drained */
+#ifdef LINUX_BUILD
+            shutdown(real, SHUT_WR);
+#else
+            shutdown(real, SD_SEND);
+#endif
+        }
         fd_set rf, wf;
         FD_ZERO(&rf); FD_ZERO(&wf);
 #ifdef LINUX_BUILD
-        FD_SET((int)fd, &rf);
-        FD_SET((int)real, &rf);
-        if (pend_n > pend_o) FD_SET((int)fd, &wf);
+        int opend = op_n > op_o, ipend = ip_n > ip_o;
+        if (!ipend && !fin_fd) FD_SET((int)fd, &rf);   /* hold slot full: close the
+                                             * window upstream, kernel-style */
+        if (!opend && !fin_real) FD_SET((int)real, &rf);  /* gate: drain
+            before more game reads; fin_real = game already half-closed */
+        if (opend) FD_SET((int)fd, &wf);      /* gate: keep reading relay meanwhile */
+        if (ipend) FD_SET((int)real, &wf);
+        struct timeval tv = { 0, 25000 };
         int mx = (int)fd > (int)real ? (int)fd : (int)real;
-        struct timeval tv = { 0, 25000 };
-        int sr = select(mx + 1, &rf, pend_n > pend_o ? &wf : NULL, NULL, &tv);
+        int sr = select(mx + 1, &rf, (opend || ipend) ? &wf : NULL, NULL, &tv);
         if (sr <= 0) continue;
-#else
-        FD_SET(fd, &rf);
-        FD_SET(real, &rf);
-        if (pend_n > pend_o) FD_SET(fd, &wf);
-        struct timeval tv = { 0, 25000 };
-        int sr = select(0, &rf, pend_n > pend_o ? &wf : NULL, NULL, &tv);
-        if (sr <= 0) continue;
-#endif
-        /* drain pending first (and only then read more from the game) */
-#ifdef LINUX_BUILD
-        if (pend_n > pend_o && FD_ISSET((int)fd, &wf)) {
+        if (opend && FD_ISSET((int)fd, &wf)) {
             errno = 0;
-            ssize_t k = r_send(fd, buf + pend_o, pend_n - pend_o, 0);
-            if (k > 0) { pend_o += (size_t)k;
-                if (pend_o >= pend_n) pend_n = pend_o = 0; }
+            ssize_t k = r_send(fd, obuf + op_o, op_n - op_o, 0);
+            if (k > 0) { op_o += (size_t)k; if (op_o >= op_n) op_n = op_o = 0; }
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
         }
-        if (FD_ISSET((int)real, &rf) && pend_n == pend_o) {
+        if (ipend && FD_ISSET((int)real, &wf)) {
             errno = 0;
-            ssize_t n = r_recv(real, (char *)buf, (int)sizeof(buf), 0);
-            if (n <= 0) {
+            ssize_t k = r_send(real, ibuf + ip_o, ip_n - ip_o, 0);
+            if (k > 0) { ip_o += (size_t)k; if (ip_o >= ip_n) ip_n = ip_o = 0; }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+        }
+        if (!opend && FD_ISSET((int)real, &rf)) {
+            errno = 0;
+            ssize_t n = r_recv(real, (char *)obuf, (int)sizeof(obuf), 0);
+            if (n == 0) {   /* game shut down writes: half-close ours */
+                fin_real = 1;
+                continue;
+            }
+            if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 char lb[96];
-                snprintf(lb, sizeof(lb), "hosted pipe: game n=%zd err=%d",
-                         n, errno);
-                dlog(lb);
-                break;
+                snprintf(lb, sizeof(lb), "hosted pipe: game n=%zd err=%d", n, errno);
+                dlog(lb); break;
             }
             out0 += (size_t)n;
             { char lb[112];
               snprintf(lb, sizeof(lb), "hs out sid=%u n=%zd tot=%llu",
                        sid, n, (unsigned long long)out0); dlog(lb); }
-            pend_n = (size_t)n; pend_o = 0;
-            continue;   /* select() will report writability to flush it */
+            op_n = (size_t)n; op_o = 0;
         }
-        if (FD_ISSET((int)fd, &rf)) {
+        if (!ipend && FD_ISSET((int)fd, &rf)) {
             errno = 0;
-            ssize_t n = r_recv(fd, buf, sizeof(buf), 0);
+            ssize_t n = r_recv(fd, (char *)ibuf, (int)sizeof(ibuf), 0);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                { char lb[96]; snprintf(lb, sizeof(lb), "hosted pipe: relay recv err=%d", errno); dlog(lb); }
-                break;
+                char lb[96];
+                snprintf(lb, sizeof(lb), "hosted pipe: relay recv err=%d", errno);
+                dlog(lb); break;
             }
-            if (n == 0) {
-                char lb[64]; snprintf(lb, sizeof(lb), "hosted pipe: relay EOF"); dlog(lb);
-                break;
-            }
+            if (n == 0) { fin_fd = 1; continue; }
             in0 += (size_t)n;
             { char lb[112];
               snprintf(lb, sizeof(lb), "hs in sid=%u n=%zd tot=%llu",
                        sid, n, (unsigned long long)in0); dlog(lb); }
-            const unsigned char *p = buf;
-            while ((size_t)n > 0) {
-                ssize_t k = r_send(real, p, (size_t)n, 0);
-                if (k <= 0) { if (errno == EINTR) continue; break; }
-                p += (size_t)k; n -= (size_t)k;
-            }
+            ip_n = (size_t)n; ip_o = 0;
         }
 #else
-        if (pend_n > pend_o && FD_ISSET(fd, &wf)) {
-            int k = send(fd, (const char *)buf + pend_o, (int)(pend_n - pend_o), 0);
-            if (k > 0) { pend_o += (size_t)k;
-                if (pend_o >= pend_n) pend_n = pend_o = 0; }
+        int opend = op_n > op_o, ipend = ip_n > ip_o;
+        if (!ipend && !fin_fd) FD_SET(fd, &rf);
+        if (!opend && !fin_real) FD_SET(real, &rf);
+        if (opend) FD_SET(fd, &wf);
+        if (ipend) FD_SET(real, &wf);
+        struct timeval tv = { 0, 25000 };
+        int sr = select(0, &rf, (opend || ipend) ? &wf : NULL, NULL, &tv);
+        if (sr <= 0) continue;
+        if (opend && FD_ISSET(fd, &wf)) {
+            int k = send(fd, (const char *)obuf + op_o, (int)(op_n - op_o), 0);
+            if (k > 0) { op_o += (size_t)k; if (op_o >= op_n) op_n = op_o = 0; }
             else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
-        if (FD_ISSET(real, &rf) && pend_n == pend_o) {
-            int n = recv(real, (char *)buf, (int)sizeof(buf), 0);
-            if (n <= 0) {
+        if (ipend && FD_ISSET(real, &wf)) {
+            int k = send(real, (const char *)ibuf + ip_o, (int)(ip_n - ip_o), 0);
+            if (k > 0) { ip_o += (size_t)k; if (ip_o >= ip_n) ip_n = ip_o = 0; }
+            else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+        }
+        if (!opend && FD_ISSET(real, &rf)) {
+            int n = recv(real, (char *)obuf, (int)sizeof(obuf), 0);
+            if (n == 0) { fin_real = 1; continue; }
+            if (n < 0) {
                 char lb[96];
                 snprintf(lb, sizeof(lb), "hosted pipe: game n=%d err=%d",
                          n, WSAGetLastError());
-                dlog(lb);
-                break;
+                dlog(lb); break;
             }
             out0 += (size_t)n;
             { char lb[112];
               snprintf(lb, sizeof(lb), "hs out sid=%u n=%d tot=%llu",
                        sid, n, (unsigned long long)out0); dlog(lb); }
-            pend_n = (size_t)n; pend_o = 0;
-            continue;
+            op_n = (size_t)n; op_o = 0;
         }
-        if (FD_ISSET(fd, &rf)) {
-            int n = recv(fd, (char *)buf, (int)sizeof(buf), 0);
-            if (n <= 0) break;
+        if (!ipend && FD_ISSET(fd, &rf)) {
+            int n = recv(fd, (char *)ibuf, (int)sizeof(ibuf), 0);
+            if (n < 0) {
+                if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
+                break;
+            }
+            if (n == 0) { fin_fd = 1; continue; }
             in0 += (size_t)n;
             { char lb[112];
               snprintf(lb, sizeof(lb), "hs in sid=%u n=%d tot=%llu",
                        sid, n, (unsigned long long)in0); dlog(lb); }
-            const char *p = (const char *)buf;
-            while (n > 0) {
-                int k = send(real, p, n, 0);
-                if (k <= 0) break;
-                p += k; n -= k;
-            }
+            ip_n = (size_t)n; ip_o = 0;
         }
 #endif
+    }
+    /* final drain: kernel semantics - data already read from one side
+     * must reach the other before either direction dies */
+    {
+        long long t0 = dt_now_ms();
+        while ((ip_n > ip_o || op_n > op_o) && dt_now_ms() - t0 < 500) {
+            if (ip_n > ip_o) {
+#ifdef LINUX_BUILD
+                ssize_t k = r_send(real, ibuf + ip_o, ip_n - ip_o, 0);
+                if (k > 0) ip_o += (size_t)k;
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) ip_n = ip_o = 0;
+#else
+                int k = send(real, (const char *)ibuf + ip_o, (int)(ip_n - ip_o), 0);
+                if (k > 0) ip_o += (size_t)k;
+                else if (WSAGetLastError() != WSAEWOULDBLOCK) ip_n = ip_o = 0;
+#endif
+            }
+            if (op_n > op_o) {
+#ifdef LINUX_BUILD
+                ssize_t k = r_send(fd, obuf + op_o, op_n - op_o, 0);
+                if (k > 0) op_o += (size_t)k;
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) op_n = op_o = 0;
+#else
+                int k = send(fd, (const char *)obuf + op_o, (int)(op_n - op_o), 0);
+                if (k > 0) op_o += (size_t)k;
+                else if (WSAGetLastError() != WSAEWOULDBLOCK) op_n = op_o = 0;
+#endif
+            }
+            dt_msleep(2);
+        }
     }
     { char lb[190]; int hx_d;
       DLOCK();
@@ -3678,6 +3776,8 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
         st->state = ST_CONNECTING; st->fail = 0;
         st->in_paused = 0; st->connect_signaled = 0;
         st->flushing = 0; st->sending = 0;
+        st->thread_done = 0; st->peer_fin = 0; st->wr_shut = 0; st->rd_shut = 0;
+        st->shut_done = 0; st->ever_open = 0;
         st->fd = DTSOCK_BAD;
         st->oh = st->ot = NULL; st->ototal = 0;
         st->an_rx = st->an_tx = 0; st->ab_rx = st->ab_tx = 0; st->a_log = 0;
@@ -3757,12 +3857,14 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
 }
 /* App -> stream out-queue. Returns: len queued; 0 not our stream;
  * -1 stream dead (ECONNRESET); -2 our stream, out-queue full
- * (caller: nonblocking app -> EWOULDBLOCK, blocking app -> wait+retry). */
+ * (caller: nonblocking app -> EWOULDBLOCK, blocking app -> wait+retry);
+ * -3 write side shut down by the app (EPIPE). */
 static int dt_stream_send(long long gsock, const unsigned char *buf, size_t len) {
     unsigned lsid = 0; size_t ln = 0, tot = 0; int dolog = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (!st) { DUNLOCK(); return 0; }
+    if (st->wr_shut) { DUNLOCK(); return -3; }   /* EPIPE: we shut it down */
     if (st->dead || st->state == ST_DEAD) { DUNLOCK(); return -1; }
     if (st->ototal + len > DT_ST_MAXOUT) { DUNLOCK(); return -2; }
     if (len) {
@@ -3799,9 +3901,11 @@ static void dt_stream_send_err(int r) {
 #ifdef LINUX_BUILD
     if (r == -1) errno = ECONNRESET;
     else if (r == -2) errno = EAGAIN;
+    else if (r == -3) errno = EPIPE;
 #else
     if (r == -1) WSASetLastError(WSAECONNRESET);
     else if (r == -2) WSASetLastError(WSAEWOULDBLOCK);
+    else if (r == -3) WSASetLastError(WSAESHUTDOWN);
 #endif
 }
 static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len) {
@@ -3809,7 +3913,17 @@ static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len
     for (;;) {
         int r = dt_stream_send(s, buf, len);
         if (r >= 0) return r;
-        if (r == -1) { dt_stream_send_err(-1); return -1; }
+        if (r == -3) { dt_stream_send_err(-3); return -3; }
+        if (r == -1) {
+#ifdef LINUX_BUILD
+            /* kernel: send to a stream the peer reset => SIGPIPE + EPIPE
+             * (default-ignored here only if the app blocked it already) */
+            raise(SIGPIPE);
+            errno = EPIPE; return -1;
+#else
+            dt_stream_send_err(-1); return -1;
+#endif
+        }
         if (r == -2) {
             if (nonblock) { dt_stream_send_err(-2); return -2; }
             dt_msleep(5);
@@ -3836,7 +3950,8 @@ static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_
         long long now = dt_now_ms();
         if (ln >= 4096 || st->an_rx <= 3 || now - st->a_log > 1000) {
             st->a_log = now; dolog = 1; }
-    } else if (st && (st->dead || st->state == ST_DEAD)) r = -1;
+    } else if (st && (st->dead || st->state == ST_DEAD || st->peer_fin
+                     || st->rd_shut)) r = -1;
     DUNLOCK();
     if (dolog) {
         char lb[160];
@@ -3893,9 +4008,17 @@ static void dt_on_close(long long gsock) {
     struct dt_stream *st = dt_stream_by_sock(gsock);
     int stream_freed = 0;
     if (st) {
-        st->dead = 1;          /* stream thread finishes + frees the slot */
-        if (st->state != ST_CONNECTING) {
-            /* thread already exited (or never started): free now */
+        /* Kernel: close() flushes queued sends then FINs; reads die now.
+         * The pump owns the slot until its thread retires: hand it the
+         * close (dead=1) and let it drain oh, FIN, and free. Only the
+         * pre-thread window may free here. */
+        st->dead = 1;
+        if (st->state != ST_CONNECTING && st->fd_live) {
+            /* pump owns the wire: release the app identity so a recycled
+             * fd can bind a fresh stream; it flushes + frees by sid */
+            st->gsock = 0;
+        }
+        if (st->state == ST_CONNECTING && !st->fd_live) {
             st->used = 0; st->fd = DTSOCK_BAD;
             struct dt_chunk *c = st->h;
             while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
@@ -4063,7 +4186,15 @@ ssize_t recv(int s, void *buf, size_t len, int flags) {
             size_t on = 0;
             int r = dt_tcp_wait((long long)s, (unsigned char *)buf, len, &on, tmo, nb);
             if (r == 1) return (ssize_t)on;
-            if (r == -1) return 0; /* EOF */
+            if (r == -1) {
+                int rst = 0;
+                DLOCK();
+                struct dt_stream *s3 = dt_stream_by_sock((long long)s);
+                if (s3 && s3->fail == DT_RSTMARK) rst = 1;
+                DUNLOCK();
+                if (rst) { errno = ECONNRESET; return -1; }
+                return 0; /* clean EOF */
+            }
             errno = EAGAIN; return -1;
         }
     }
@@ -4120,6 +4251,66 @@ int listen(int s, int backlog) {
     return r;
 }
 static int (*real_getpeername_sym(void))(int, struct sockaddr*, socklen_t*);
+/* kernel half-close for tunnel streams: SHUT_RD discards unread bytes,
+ * SHUT_WR flushes queued sends then FINs the peer (the pump emits
+ * DT_STSHUT once the out-queue drains); the other direction keeps
+ * working until the peer or the app closes it. */
+int shutdown(int s, int how) {
+    static int (*real)(int, int) = 0;
+    if (!real) real = (int (*)(int, int))dlsym(RTLD_NEXT, "shutdown");
+    if (g_direct) {
+        int hit = 0, sig = 0;
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)s);
+        if (st) {
+            hit = 1;
+            if (how == SHUT_RD || how == SHUT_RDWR) {
+                st->rd_shut = 1;
+                struct dt_chunk *c = st->h;
+                while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+                st->h = st->t = NULL; st->total = 0; st->in_paused = 0;
+                sig = 1;
+            }
+            if (how == SHUT_WR || how == SHUT_RDWR) st->wr_shut = 1;
+            if (sig) dt_sig_locked((long long)s);
+        }
+        DUNLOCK();
+        if (hit) return 0;
+    }
+    return real(s, how);
+}
+/* SO_ERROR on a tunnel stream mirrors connect() state: pending
+ * EINPROGRESS, refused/timeout per the verdict, 0 once open - the
+ * nonblocking connect idiom (select writable + getsockopt) must not
+ * see the real socket's meaningless zero. */
+int getsockopt(int s, int level, int optname, void *optval, socklen_t *optlen) {
+    static int (*real)(int, int, int, void *, socklen_t *) = 0;
+    if (!real) real = (int (*)(int, int, int, void *, socklen_t *))
+        dlsym(RTLD_NEXT, "getsockopt");
+    if (g_direct && level == SOL_SOCKET && optname == SO_ERROR
+            && optval && optlen && *optlen >= (socklen_t)sizeof(int)) {
+        int err = -1;
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)s);
+        if (st) {
+            if (st->state == ST_CONNECTING)  err = 0;  /* kernel: SO_ERROR
+                * only carries the COMPLETION error; a connect still in
+                * flight reports zero (EINPROGRESS comes from connect) */
+            else if (st->state == ST_DEAD && !st->ever_open)
+                err = (st->fail == DT_RSTMARK) ? ECONNRESET
+                    : (st->fail == STF_JOIN_TIMEOUT) ? ETIMEDOUT : ECONNREFUSED;
+            else                             err = 0;   /* open, or died
+                                                          * after opening */
+        }
+        DUNLOCK();
+        if (err >= 0) {
+            memcpy(optval, &err, sizeof(err));
+            *optlen = sizeof(err);
+            return 0;
+        }
+    }
+    return real(s, level, optname, optval, optlen);
+}
 int getpeername(int s, struct sockaddr *a, socklen_t *l) {
     static int (*real_gp)(int, struct sockaddr*, socklen_t*) = 0;
     ensure_init();
@@ -4246,12 +4437,23 @@ int ioctl(int fd, unsigned long request, ...) {
 #include <signal.h>
 #include <sys/select.h>
 static int dt_select_scan(int nfds, fd_set *r, fd_set *w, fd_set *x);
+/* kernel: a socket still in connect() never reports writable; the
+ * merged scan adds the connect edge back exactly once at verdict */
+static int dt_fd_connecting(long long fd) {
+    int r = 0; DLOCK();
+    struct dt_stream *st = dt_stream_by_sock(fd);
+    if (st && st->state == ST_CONNECTING) r = 1;
+    DUNLOCK(); return r;
+}
 static int dt_poll_scan(struct pollfd *fds, nfds_t nfds) {
     int n = 0;
     for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].fd < 0) continue;
         if ((fds[i].events & POLLIN) && dt_fd_readable((long long)fds[i].fd))
             fds[i].revents |= POLLIN;
+        if (fds[i].revents & (POLLOUT | POLLWRNORM) &&
+                dt_fd_connecting(fds[i].fd))
+            fds[i].revents &= ~(POLLOUT | POLLWRNORM);   /* not yet connected */
         if (fds[i].events & (POLLOUT | POLLWRNORM)) {
             int data, dead, wr, cn;
             dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
@@ -4267,6 +4469,11 @@ static int dt_fd_readable_peek(long long fd) {
     int data, dead, wr, cn;
     dt_sock_state_full(fd, &data, &dead, &wr, &cn);
     return data || dead;
+}
+static void dt_mask_connecting(int nfds, fd_set *w0, fd_set *w) {
+    if (!w0 || !w) return;
+    for (int fd = 0; fd < nfds; fd++)
+        if (FD_ISSET(fd, w) && dt_fd_connecting((long long)fd)) FD_CLR(fd, w);
 }
 static int dt_wscan(int nfds, fd_set *w0, fd_set *wout) {
     int n = 0;
@@ -4365,14 +4572,19 @@ int pselect(int nfds, fd_set *r, fd_set *w, fd_set *x,
         int rr_ = real_pselect(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv, mask);
         if (rr_ < 0) return rr_;
         if (rr_ > 0) {
-            if (r) *r = rr; if (w) { *w = ww; dt_wscan(nfds, &w0, w); } if (x) *x = xx;
+            if (r) *r = rr;
+            if (w) { *w = ww; dt_mask_connecting(nfds, &w0, w);
+                     dt_wscan(nfds, &w0, w); }
+            if (x) *x = xx;
             if (r) for (int fd = 0; fd < nfds; fd++)
                 if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             int n = 0;
             if (r) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, r)) n++;
             if (w) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, w)) n++;
             if (x) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, x)) n++;
-            return n ? n : rr_;
+            if (n) return n;
+            /* every reported event was filtered (vacuous writable on a
+             * connecting socket): keep waiting, like the kernel would */
         }
         if (r && dt_select_scan(nfds, &r0, NULL, NULL)) {
             FD_ZERO(r); if (w) FD_ZERO(w); if (x) FD_ZERO(x);
@@ -4487,14 +4699,19 @@ int select(int nfds, fd_set *r, fd_set *w, fd_set *x, struct timeval *tmo) {
         int rr_ = real_select(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv);
         if (rr_ < 0) return rr_;
         if (rr_ > 0) {
-            if (r) *r = rr; if (w) { *w = ww; dt_wscan(nfds, &w0, w); } if (x) *x = xx;
+            if (r) *r = rr;
+            if (w) { *w = ww; dt_mask_connecting(nfds, &w0, w);
+                     dt_wscan(nfds, &w0, w); }
+            if (x) *x = xx;
             if (r) for (int fd = 0; fd < nfds; fd++)
                 if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
             int n = 0;
             if (r) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, r)) n++;
             if (w) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, w)) n++;
             if (x) for (int fd = 0; fd < nfds; fd++) if (FD_ISSET(fd, x)) n++;
-            return n ? n : rr_;
+            if (n) return n;
+            /* every reported event was filtered (vacuous writable on a
+             * connecting socket): keep waiting, like the kernel would */
         }
         if (r && dt_select_scan(nfds, &r0, NULL, NULL)) {
             FD_ZERO(r); if (w) FD_ZERO(w); if (x) FD_ZERO(x);
@@ -4822,6 +5039,14 @@ static int dt_win_stream_recv(SOCKET s, char *buf, int len, int flags) {
                                  (size_t)(len < 0 ? 0 : len), &on, 0, 1);
             if (r2 == 1) return (int)on;
         }
+        {
+            int rst = 0;
+            DLOCK();
+            struct dt_stream *s4 = dt_stream_by_sock((long long)s);
+            if (s4 && s4->fail == DT_RSTMARK) rst = 1;
+            DUNLOCK();
+            if (rst) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
+        }
         if (dead) { WSASetLastError(WSAECONNRESET); return SOCKET_ERROR; }
         return 0;
     }
@@ -5056,6 +5281,65 @@ int WSAAPI hk_bind(SOCKET s, const struct sockaddr *a, int l) {
     return r;
 }
 static void dt_gp_spoof(SOCKET fd, struct sockaddr_in *sa, int l, int want_self);
+/* kernel: a socket still in connect() never reports writable */
+static int dt_fd_connecting(long long fd) {
+    int r = 0; DLOCK();
+    struct dt_stream *st = dt_stream_by_sock(fd);
+    if (st && st->state == ST_CONNECTING) r = 1;
+    DUNLOCK(); return r;
+}
+static int (WSAAPI *p_shutdown)(SOCKET, int) = 0;
+int WSAAPI hk_shutdown(SOCKET s, int how) {
+    if (!p_shutdown)
+        p_shutdown = (int (WSAAPI *)(SOCKET, int))
+            GetProcAddress(hWS2 ? hWS2 : GetModuleHandleA("ws2_32.dll"), "shutdown");
+    if (g_direct) {
+        int hit = 0, sig = 0;
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)s);
+        if (st) {
+            hit = 1;
+            if (how == SD_RECEIVE || how == SD_BOTH) {
+                st->rd_shut = 1;
+                struct dt_chunk *c = st->h;
+                while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+                st->h = st->t = NULL; st->total = 0; st->in_paused = 0;
+                sig = 1;
+            }
+            if (how == SD_SEND || how == SD_BOTH) st->wr_shut = 1;
+            if (sig) dt_sig_locked((long long)s);
+        }
+        DUNLOCK();
+        if (hit) return 0;
+    }
+    return p_shutdown ? p_shutdown(s, how) : SOCKET_ERROR;
+}
+static int (WSAAPI *p_getsockopt)(SOCKET, int, int, char *, int *) = 0;
+int WSAAPI hk_getsockopt(SOCKET s, int level, int optname, char *optval, int *optlen) {
+    if (!p_getsockopt)
+        p_getsockopt = (int (WSAAPI *)(SOCKET, int, int, char *, int *))
+            GetProcAddress(hWS2 ? hWS2 : GetModuleHandleA("ws2_32.dll"), "getsockopt");
+    if (g_direct && level == SOL_SOCKET && optname == SO_ERROR
+            && optval && optlen && *optlen >= (int)sizeof(int)) {
+        int err = -1;
+        DLOCK();
+        struct dt_stream *st = dt_stream_by_sock((long long)s);
+        if (st) {
+            if (st->state == ST_CONNECTING)  err = 0;   /* see Linux note */
+            else if (st->state == ST_DEAD && !st->ever_open)
+                err = (st->fail == DT_RSTMARK) ? WSAECONNRESET
+                    : dt_stfail_wsae(st->fail);
+            else                             err = 0;
+        }
+        DUNLOCK();
+        if (err >= 0) {
+            memcpy(optval, &err, sizeof(err));
+            *optlen = sizeof(err);
+            return 0;
+        }
+    }
+    return p_getsockopt ? p_getsockopt(s, level, optname, optval, optlen) : SOCKET_ERROR;
+}
 int WSAAPI hk_getsockname(SOCKET s, struct sockaddr *a, int *l) {
     int r = p_getsockname ? p_getsockname(s, a, l) : SOCKET_ERROR;
     if (r == 0 && g_direct && a && a->sa_family == AF_INET) {
@@ -5314,6 +5598,10 @@ int WSAAPI hk_select(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct tim
         }
         if (w) {
             *w = wq;
+            for (u_int i = 0; i < w0.fd_count; i++)
+                if (FD_ISSET(w0.fd_array[i], w) &&
+                    dt_fd_connecting((long long)w0.fd_array[i]))
+                    FD_CLR(w0.fd_array[i], w);
             for (u_int i = 0; i < w0.fd_count; i++) {
                 int data, dead, wr, cn;
                 dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
@@ -5382,7 +5670,10 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
         for (ULONG i = 0; i < nfds; i++) {
             if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd))
                 fds[i].revents |= POLLRDNORM;
-            if (fds[i].events & (POLLOUT | POLLWRNORM)) {
+            if (fds[i].revents & (POLLOUT | POLLWRNORM) &&
+            dt_fd_connecting((long long)fds[i].fd))
+        fds[i].revents &= ~(POLLOUT | POLLWRNORM);
+        if (fds[i].events & (POLLOUT | POLLWRNORM)) {
                 int data, dead, wr, cn;
                 dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
                 if (wr || cn) fds[i].revents |= POLLOUT;
@@ -5615,6 +5906,8 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             if (!strcmp(n,"connect")) return (FARPROC)hk_connect;
             if (!strcmp(n,"bind")) return (FARPROC)hk_bind;
             if (!strcmp(n,"WSAConnect")) return (FARPROC)hk_WSAConnect;
+            if (!strcmp(n,"shutdown")) return (FARPROC)hk_shutdown;
+            if (!strcmp(n,"getsockopt")) return (FARPROC)hk_getsockopt;
             if (!strcmp(n,"getpeername")) return (FARPROC)hk_getpeername;
             if (!strcmp(n,"getsockname")) return (FARPROC)hk_getsockname;
             if (!strcmp(n,"closesocket")) return (FARPROC)hk_closesocket;
@@ -6239,6 +6532,8 @@ static void patch_iat_inner(HMODULE mod) {
                     else if (!strcmp(fn,"bind")) rep = (FARPROC)hk_bind;
                     else if (!strcmp(fn,"WSAConnect")) rep = (FARPROC)hk_WSAConnect;
                     else if (!strcmp(fn,"getpeername")) rep = (FARPROC)hk_getpeername;
+                    else if (!strcmp(fn,"shutdown")) rep = (FARPROC)hk_shutdown;
+                    else if (!strcmp(fn,"getsockopt")) rep = (FARPROC)hk_getsockopt;
                     else if (!strcmp(fn,"getsockname")) rep = (FARPROC)hk_getsockname;
                     else if (!strcmp(fn,"closesocket")) rep = (FARPROC)hk_closesocket;
                     else if (!strcmp(fn,"listen")) rep = (FARPROC)hk_listen;
