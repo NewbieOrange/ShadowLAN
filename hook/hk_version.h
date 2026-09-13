@@ -4,5 +4,5 @@
  * in a dedicated bump commit. rc stamps stay UNCOMMITTED. Included by
  * lan_hook.c (the documented stamp site) and every module that prints
  * the string. */
-#define SHADOWLAN_VERSION "2.0.0"
+#define SHADOWLAN_VERSION "3.0.0"
 #endif
