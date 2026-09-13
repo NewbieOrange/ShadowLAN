@@ -13,7 +13,7 @@ pieces, all versioned together in this repo:
 - `server.py` — a pure-Python relay (TCP+UDP on ONE port) users deploy
   themselves (current deployment: `v4.router.chengzi.xyz:47777`, token
   set). **We cannot deploy it** — deliver the file + ask the user.
-- `hook/lan_hook.c` — one C file, two builds: Windows DLLs (`lan_hook64/32`
+- `hook/lan_hook.c` — one root TU + `hk_*.inc` fragments, two builds: Windows DLLs (`lan_hook64/32`
   via mingw, injected with `hook/injector.exe`, IAT patching only, no asm)
   and a Linux `LD_PRELOAD` `.so` (used by the test suite; field users are
   on Windows). Rewrites socket calls of the game process tree so the
@@ -42,7 +42,7 @@ Hard constraints from the user:
 Framing on ALL TCP conns: `[u32 len][u8 type][payload]` (`common.HDR`, len
 covers type+payload). UDP tunnel datagrams: `'V','N',UVER,op,payload`.
 `PVER = UVER = 2`; **Python and C op tables must stay in lockstep** (both
-defined once: `common.py` header, `lan_hook.c` ~line 212).
+defined once: `common.py` header, `DT_*/DU_*` in `hk_policy.inc`).
 
 TCP control conn (one per hook process, ephemeral, auto-redial):
 
@@ -449,6 +449,20 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   claimed vports. test_bindfidelity guards the whole matrix.
 
 ## Status snapshot (UNRELEASED)
+
+TU refactor (post-split sweep): hk_util.c (clock/log/stamp/sleep/pid/rng),
+hk_alias.c (vport<->real table; slp_release_sock became dt_alias_release_all
+so the table owner iterates its own rows - alias->ledger is one-way now)
+and hk_ledger.c (claim registry; node id PUSHED via slp_set_node, module
+reads no core globals; claim verdict dlogs on both platforms) compile as
+independent TUs behind hk_api.h; the tangled core stays one TU (root +
+fragments, order-dependent, shared statics - documented at the include
+list). Interface names all dt_/slp_-prefixed (verified zero libc .dynsym
+collisions; LD_PRELOAD-safe). Gotchas logged: GNU make silently REJECTS a
+pattern rule whose extra prerequisites (headers) are missing - the error
+names the target, not the missing header; and `make clean` + test-all
+missing injector.exe in its deps = test_late build() -> LATE_SKIP -> suite
+FAIL (deps now closed). Gate 20/20 incl. Wine; core still -Wextra clean.
 
 Post-rc11 sweep (field-confirmed state): dead code gone
 (dt_fd_readable_peek, Windows slp_starttime, stream_freed accumulator),
