@@ -458,7 +458,32 @@ a new connection implies the old is dead - GBE's REPLACED logic
 depends on it at ~0ms RTT. The v2-era 'do NOT correct dt_host_bridge
 to SOCK_STREAM' decree is OVERTURNED by the mark fix - that policy
 existed only to keep the poisoned forward channel from being used.
-Field round needed: rc20 same-box should join AND reach gameplay.
+Same-box field round still needed after the source-identity cut.
+
+Own-vnode TCP hairpin (this cut): must use THIS process's alias real
+port, not the vport number. Same-box JoinLobby timed out because the
+joiner's self-dial of 10.200.0.3:47584 was rewritten to
+127.0.0.1:47584 - the HOST's real listener. Host accepted it
+(acc-hook learn=0), the session library replaced the tunneled peer
+socket. Two real machines (or Tailscale) never share a kernel port,
+so a NIC hairpin cannot cross vnodes. dt_host_bridge already rewrote
+this way; dt_on_connect did not. test_aliasbridge R6e: aliased node
+connect(own vnode:V) is accepted by the aliaser, never the owner.
+Cross-machine: no alias row => hairpin still uses the vport
+(real == vport).
+
+Stream recv gather (this cut): FIONREAD reports the full in-queue
+(st->total) but dt_stream_pop returned only the first chunk. Kernel
+TCP: recv(N) when N bytes are already queued returns N. The reference
+lobby stack does ioctl(FIONREAD) then recv(exactly that) and never
+shrinks a short read - a first-chunk pop leaves an oversized buffer
+whose length prefix never completes, so a later JOIN sitting behind a
+271KB friends dump is never parsed (host app-rx'd the 72B, zero
+UNBUFFER / no LOBBY MESSAGE). Same-box field after the hairpin fix
+was this. test_fullduplex scenario 4. Accept-door learn also stopped
+using "first live hosted row": a self-dial loopback accept stole the
+opener vnode (hairpin learn=1). Match is accept-peer == hosted bridge
+ephemeral only.
 
 Co-host guard (replaces slot-luck): dt_on_streq now yields the inbound
 forward claim WHENEVER its own listener for that vport is aliased
