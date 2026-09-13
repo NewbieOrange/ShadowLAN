@@ -291,7 +291,9 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 - **No rc references in git content either**: all change notes between
   releases live in ONE "Status snapshot (UNRELEASED)" section here; at
   release, rename that section (and the stamps) to the final version.
-  Commit titles and bodies never mention rc numbers.
+  Commit TITLES never mention rc numbers or which snapshot/version they
+  cut ("docs: X notes in UNRELEASED snapshot" -> "docs: X notes");
+  bodies may be specific.
 - **Every local build/package you hand to the user must increment the rc
   number** (rc1 -> rc2 -> ...) — never rebuild under a stale stamp, or
   field logs and `dist/` artifacts become indistinguishable. Exception:
