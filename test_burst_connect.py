@@ -7,7 +7,6 @@ must NOT be held up by the first port's handshake.
 Run: python3 test_burst_connect.py   (starts its own relay on 127.0.0.1)
 """
 import asyncio
-import struct
 import sys
 
 sys.path.insert(0, ".")
@@ -15,7 +14,8 @@ from server import Relay
 from common import (HDR, T_NODE, T_ASSIGN, T_STOPEN, T_STREQ, T_STJOIN,
                     T_STJOINED, T_STOK, T_STFAIL, STF_NO_ROUTE,
                     STF_JOIN_TIMEOUT,
-                    encode_ctl_node)
+                    encode_ctl_node, encode_stopen, encode_stjoin,
+                    encode_stsid, decode_streq)
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from testutil import free_port as _free_port, tmp_path as _tmp_path
@@ -56,17 +56,17 @@ async def main():
 
     # stream 1: D -> H:8000, left UNCLAIMED (no listener at H)
     o1r, o1w = await dial()
-    await frame(o1w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xAAAA, 8000))
+    await frame(o1w, T_STOPEN, encode_stopen(ND, NH, 0xAAAA, 8000))
     await expect(rh, T_STREQ)             # relay fanned 8000; host stays mute
 
     # stream 2: D -> H:8001 immediately; host IS willing for this one
     o2r, o2w = await dial()
-    await frame(o2w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xBBBB, 8001))
+    await frame(o2w, T_STOPEN, encode_stopen(ND, NH, 0xBBBB, 8001))
     burst_fanned = True
     sid2 = None
     try:
         b = await expect(rh, T_STREQ, timeout=0.7)
-        sid2 = struct.unpack("!I", b[1:5])[0]
+        sid2 = decode_streq(b[1:])[0]
     except asyncio.TimeoutError:
         burst_fanned = False
     print(f"[probe] STREQ for port 8001 fanned while 8000 unclaimed: {burst_fanned}")
@@ -74,9 +74,9 @@ async def main():
     joined_fast = False
     if burst_fanned:
         j1r, j1w = await dial()
-        await frame(j1w, T_STJOIN, struct.pack("!II", NH, sid2))
+        await frame(j1w, T_STJOIN, encode_stjoin(NH, sid2))
         await expect(j1r, T_STOK)
-        await frame(j1w, T_STJOINED, struct.pack("!I", sid2))
+        await frame(j1w, T_STJOINED, encode_stsid(sid2))
         try:
             await expect(o2r, T_STOK, timeout=1.5)
             joined_fast = True

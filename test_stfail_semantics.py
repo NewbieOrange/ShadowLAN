@@ -12,15 +12,15 @@ A kernel answers connect() quickly and HONESTLY:
   - burst dials to different ports    -> independent (backlog semantics)
 """
 import asyncio
-import struct
 import sys
 
 sys.path.insert(0, ".")
 import server
 from server import Relay
 from common import (HDR, T_NODE, T_ASSIGN, T_STOPEN, T_STREQ, T_STJOIN,
-                    T_STJOINED, T_STOK, T_STFAIL, STF_NO_ROUTE,
-                    STF_HOST_FAILED, encode_ctl_node)
+                    T_STJOINED, T_STOK, T_STFAIL, T_STSHUT, STF_NO_ROUTE,
+                    STF_HOST_FAILED, encode_ctl_node, encode_stopen,
+                    encode_stjoin, encode_stsid, decode_streq)
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from testutil import free_port as _free_port, tmp_path as _tmp_path
@@ -87,7 +87,7 @@ async def main():
         # -- 1: nobody claims -> framed refusal with NO_ROUTE at budget
         o1r, o1w = await dial()
         socks.append(o1w)
-        await frame(o1w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xAAAA, 8000))
+        await frame(o1w, T_STOPEN, encode_stopen(ND, NH, 0xAAAA, 8000))
         await expect(rh, T_STREQ)
         b = await expect(o1r, T_STFAIL, timeout=8)
         results["1-no-route-at-budget"] = b[5] == STF_NO_ROUTE
@@ -100,12 +100,12 @@ async def main():
         # not after it.
         o2r, o2w = await dial()
         socks.append(o2w)
-        await frame(o2w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xBBBB, 8001))
+        await frame(o2w, T_STOPEN, encode_stopen(ND, NH, 0xBBBB, 8001))
         b2 = await expect(rh, T_STREQ)
-        sid2 = struct.unpack("!I", b2[1:5])[0]
+        sid2 = decode_streq(b2[1:])[0]  # body includes the type byte
         j2r, j2w = await dial()
         socks.append(j2w)
-        await frame(j2w, T_STJOIN, struct.pack("!II", NH, sid2))
+        await frame(j2w, T_STJOIN, encode_stjoin(NH, sid2))
         await expect(j2r, T_STOK)          # claim read
         await expect(o2r, T_STOK)          # confirmed at claim
         j2w.close()                        # joiner vanishes (no STJOINED)
@@ -117,18 +117,18 @@ async def main():
         # -- 3: burst independence (8005 claims while 8004 is pending)
         o4r, o4w = await dial()
         socks.append(o4w)
-        await frame(o4w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xDDDD, 8004))
+        await frame(o4w, T_STOPEN, encode_stopen(ND, NH, 0xDDDD, 8004))
         await expect(rh, T_STREQ)                    # 8004 ignored
         o5r, o5w = await dial()
         socks.append(o5w)
-        await frame(o5w, T_STOPEN, struct.pack("!IIIH", ND, NH, 0xEEEE, 8005))
+        await frame(o5w, T_STOPEN, encode_stopen(ND, NH, 0xEEEE, 8005))
         b5 = await expect(rh, T_STREQ)               # 8005 fans anyway
-        sid5 = struct.unpack("!I", b5[1:5])[0]
+        sid5 = decode_streq(b5[1:])[0]
         j5r, j5w = await dial()
         socks.append(j5w)
-        await frame(j5w, T_STJOIN, struct.pack("!II", NH, sid5))
+        await frame(j5w, T_STJOIN, encode_stjoin(NH, sid5))
         await expect(j5r, T_STOK)
-        await frame(j5w, T_STJOINED, struct.pack("!I", sid5))
+        await frame(j5w, T_STJOINED, encode_stsid(sid5))
         try:
             await expect(o5r, T_STOK, timeout=2.0)
             ok4 = True
@@ -136,11 +136,28 @@ async def main():
             ok4 = False
         print(f"[3] burst: 8005 confirmed while 8004 pending: {ok4}")
         results["3-burst-independent"] = ok4
+
+        # -- 4: implicit (dest_node=0) claimer half-close must FIN the opener
+        o6r, o6w = await dial()
+        socks.append(o6w)
+        await frame(o6w, T_STOPEN, encode_stopen(ND, 0, 0xFFFF, 8006))
+        b6 = await expect(rh, T_STREQ)
+        sid6 = decode_streq(b6[1:])[0]
+        j6r, j6w = await dial()
+        socks.append(j6w)
+        await frame(j6w, T_STJOIN, encode_stjoin(NH, sid6))
+        await expect(j6r, T_STOK)
+        await expect(o6r, T_STOK)
+        await frame(j6w, T_STJOINED, encode_stsid(sid6))
+        await frame(wh, T_STSHUT, encode_stsid(sid6))
+        eof6 = await wait_eof(o6r)
+        print(f"[4] implicit joinee STSHUT -> opener EOF: {eof6}")
+        results["4-implicit-stshut"] = eof6
     finally:
         server.ST_TIMEOUT_S = 10.0
         closer(*socks)
         srv.cancel()
-    all_ok = all(results.values()) and len(results) == 3
+    all_ok = all(results.values()) and len(results) == 4
     print("STFAIL_ALL_PASS" if all_ok else f"STFAIL_FAIL {results}")
     return 0 if all_ok else 1
 

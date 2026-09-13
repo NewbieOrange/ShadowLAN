@@ -18,15 +18,14 @@ import asyncio
 import os
 import struct
 import sys
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from testutil import free_port as _free_port, tmp_path as _tmp_path
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import free_port as _free_port
 from server import Relay
 from common import (HDR, T_NODE, T_BCAST, T_BCAST_FROM, T_ASSIGN, T_STOPEN,
                     T_STREQ, T_STJOIN, T_STJOINED, T_STOK, T_STFAIL,
-                    STF_BUSY, encode_ctl_node, decode_bcast_from, tcp_read)
+                    STF_BUSY, encode_ctl_node, decode_assign, decode_bcast_from,
+                    decode_streq, encode_stopen, encode_stjoin, encode_stsid,
+                    tcp_read)
 
 PUB = _free_port()
 N1, N2, N3 = 0x11111111, 0x22222222, 0x33333333
@@ -76,7 +75,8 @@ class Link:
             pass
 
 def my_virt(assign_payload):
-    return struct.unpack("!I", assign_payload[:4])[0]
+    d = decode_assign(assign_payload)
+    return d[0] if d else 0
 
 async def stream_dial():
     r, w = await asyncio.open_connection("127.0.0.1", PUB)
@@ -110,7 +110,6 @@ async def main():
     v_1, v_2 = my_virt(a1), my_virt(a2)
     assert v_1 == v_2 and v_1 != 0, (v_1, v_2)
     assert len(relay.nodes[N1]["links"]) == 2
-    from common import decode_assign
     d1, d2 = decode_assign(a1), decode_assign(a2)
     assert d1 and d2 and d1[0] == d2[0] == v_1
     assert d1[3] and d2[3]  # membership present on both ASSIGNs
@@ -133,26 +132,25 @@ async def main():
 
     # ---- phase 3: STREQ to all links; first join wins; dup -> BUSY ----
     or_, ow = await stream_dial()             # opener per-stream TCP
-    await stream_frame(ow, T_STOPEN, struct.pack("!IIIH", N3, N1, SID, 47584))
+    await stream_frame(ow, T_STOPEN, encode_stopen(N3, N1, SID, 47584))
     q1 = await l1.expect(T_STREQ)
     q2 = await l2.expect(T_STREQ)
-    (s1, g1), (s2, g2) = struct.unpack("!IH", q1[:6]), struct.unpack("!IH", q2[:6])
-    assert s1 == s2 == SID and g1 == g2 == 47584
+    d1s, d2s = decode_streq(q1), decode_streq(q2)
+    assert d1s and d2s and d1s[:2] == d2s[:2] == (SID, 47584)
     # opener's virtual address rides along so the joinee can present it
     # as the accepted socket's peer (getpeername spoofing)
-    assert len(q1) == 10 and struct.unpack("!I", q1[6:10])[0] == v_4, q1.hex()
+    assert d1s[2] == d2s[2] == v_4, q1.hex()
     j1r, j1w = await stream_dial()            # winning joiner (link L1's proc)
-    await stream_frame(j1w, T_STJOIN, struct.pack("!II", N1, SID))
+    await stream_frame(j1w, T_STJOIN, encode_stjoin(N1, SID))
     body = await stream_expect(j1r, T_STOK)   # claim verdict: winner
-    assert struct.unpack("!I", body[1:5])[0] == SID
-    await stream_frame(j1w, T_STJOINED, struct.pack("!I", SID))
+    assert body[1:] == encode_stsid(SID)
+    await stream_frame(j1w, T_STJOINED, encode_stsid(SID))
     body = await stream_expect(or_, T_STOK)   # opener's confirmed connect
-    assert struct.unpack("!I", body[1:5])[0] == SID
+    assert body[1:] == encode_stsid(SID)
     j2r, j2w = await stream_dial()            # duplicate joiner (link L2's proc)
-    await stream_frame(j2w, T_STJOIN, struct.pack("!II", N1, SID))
+    await stream_frame(j2w, T_STJOIN, encode_stjoin(N1, SID))
     body = await stream_expect(j2r, T_STFAIL) # refused: already claimed
-    assert struct.unpack("!I", body[1:5])[0] == SID and body[5] == STF_BUSY, \
-        body.hex()
+    assert body[1:5] == encode_stsid(SID) and body[5] == STF_BUSY, body.hex()
     # the winner's pipe still works after the dup was refused
     ow.write(b"ping")
     await ow.drain()
