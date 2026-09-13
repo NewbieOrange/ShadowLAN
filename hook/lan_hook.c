@@ -325,7 +325,10 @@ struct dt_stream { int used; long long gsock; unsigned sid; struct sockaddr_in o
                    int fd_live;        /* thread published its relay fd */
                    struct dt_chunk *oh, *ot; size_t ototal;  /* app out-queue */
                    /* field diagnostics: app-facing byte counters + log throttle */
-                   unsigned an_rx, an_tx; size_t ab_rx, ab_tx; long long a_log; };
+                   unsigned an_rx, an_tx; size_t ab_rx, ab_tx; long long a_log;
+                   /* exit drain handshake: while flushing the pump leaves the
+                    * out-queue to the exiting thread (sending = in-flight) */
+                   int flushing; int sending; };
 struct dt_udp { int used; long long gsock; struct dt_dgram *h, *t; int nq; int closed; int vport; };
 struct dt_slot { int used; long long gsock; int game_port; struct sockaddr_in orig; };
 struct dt_frame { unsigned char type; unsigned char *p; size_t n; struct dt_frame *next; };
@@ -1693,6 +1696,85 @@ static void dt_st_close_fd(DTSOCK fd) {
 #endif
 }
 /* fail an opener stream locally (no relay involved) */
+/* Kernel close semantics: bytes the app queued for send are flushed on
+ * process exit (the OS drains a socket before tearing it down). Our
+ * stream out-queue lives in the target process, so an exit would drop
+ * whatever the app wrote last - e.g. its goodbye frames - and the peer
+ * would see a silence-timeout instead of a clean close. Drain, with a
+ * bounded budget, then close so the peer receives EOF exactly like a
+ * real socket shutdown. Called from the exit hooks below; all pump
+ * threads are stopped first so the queues have a single owner. */
+static void dt_flush_streams(void) {
+    int i;
+    long long t0 = dt_now_ms();
+    dlog("exit drain");
+    /* 1) control-queue frames (beacon/leave/UDP-over-TCP goodbyes):
+     * only the control thread may write the control conn - wait for it
+     * to flush what the app already handed us. */
+    for (;;) {
+        int pend;
+        DLOCK(); pend = g_sqh != NULL; DUNLOCK();
+        if (!pend || dt_now_ms() - t0 > 300) break;
+        dt_msleep(15);
+    }
+    /* 2) per-stream out-queues. Takeover is cooperative: flushing stops
+     * the pump from starting new sends, sending marks an in-flight one,
+     * so every byte on the wire keeps its order - drain-then-close,
+     * exactly what the kernel does with a socket buffer. */
+    for (i = 0; i < DT_MAXSTREAM; i++) {
+        struct dt_stream *st = &g_st[i];
+        int claimable = 0;
+        for (;;) {   /* a stream mid-handshake may still complete inside
+                      * the budget: its queued bytes deserve the wire */
+            DLOCK();
+            claimable = st->used && st->fd_live && st->oh &&
+                        (st->state == ST_OPEN ||
+                         (st->state == ST_CONNECTING
+                          && dt_now_ms() - t0 < 600));
+            if (st->used && st->oh && st->state == ST_DEAD) { DUNLOCK(); break; }
+            if (claimable) st->flushing = 1;
+            DUNLOCK();
+            if (claimable || dt_now_ms() - t0 > 900) break;
+            dt_msleep(15);
+        }
+        if (!claimable) continue;
+        for (;;) {
+            const unsigned char *p = NULL; size_t n = 0; size_t off0 = 0;
+            DTSOCK fd;
+            DLOCK();
+            while (st->sending && dt_now_ms() - t0 < 900) { DUNLOCK(); dt_msleep(10); DLOCK(); }
+            fd = st->fd;
+            if (st->used && !st->sending && st->oh) {
+                p = st->oh->p + st->oh->off; n = st->oh->n - st->oh->off;
+                off0 = st->oh->off;
+                if (n) st->sending = 1;
+            }
+            DUNLOCK();
+            if (!p || !n) break;
+            int ok = dt_st_send_all_tmo(fd, p, n, 150) == 0;
+            DLOCK();
+            st->sending = 0;
+            if (st->used && ok && n) {
+                struct dt_chunk *c = st->oh;
+                if (c) {
+                    c->off = c->n;   /* sent whole (or gave up mid: keep
+                                      * ordering by dropping the rest -
+                                      * the socket is dying anyway) */
+                    st->oh = c->next;
+                    if (!st->oh) st->ot = NULL;
+                    st->ototal -= (c->n - off0);
+                }
+            }
+            DUNLOCK();
+            if (!ok || dt_now_ms() - t0 > 900) break;
+        }
+        DLOCK();
+        if (st->used) st->flushing = 0;
+        DUNLOCK();
+    }
+    /* fds stay open: process teardown FINs them after the bytes above */
+}
+
 static void dt_st_fail_local(struct dt_stream *st, unsigned reason) {
     DLOCK();
     if (st->used && st->state != ST_DEAD) {
@@ -1877,7 +1959,7 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
         if (!g_tun_run) break;
         DLOCK();
         int mine = st->used && st->sid == sid;
-        int has_out = mine && st->ototal > 0;
+        int has_out = mine && st->ototal > 0 && !st->flushing;
         int pause = !mine || st->in_paused;
         int dead = !mine || st->dead;
         DUNLOCK();
@@ -1924,8 +2006,9 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
             for (;;) {
                 unsigned char *sp = NULL; size_t sn = 0;
                 DLOCK();
-                if (st->used && st->sid == sid && st->oh) {
+                if (st->used && st->sid == sid && st->oh && !st->flushing) {
                     sp = st->oh->p + st->oh->off; sn = st->oh->n - st->oh->off;
+                    if (sn) st->sending = 1;
                 }
                 DUNLOCK();
                 if (!sp || !sn) break;
@@ -1951,6 +2034,7 @@ static DWORD WINAPI dt_stream_thread(LPVOID u)
                 }
                 out0 += (size_t)k;
                 DLOCK();
+                st->sending = 0;
                 if (st->used && st->sid == sid && st->oh) {
                     st->oh->off += (size_t)k;
                     st->ototal -= (size_t)k;
@@ -2704,9 +2788,37 @@ static DWORD WINAPI dt_udp_thread(LPVOID u) {
 #endif
 }
 
+#ifdef LINUX_BUILD
+static void dt_atexit_flush(void) { dt_flush_streams(); }
+/* intercept even hard exits: the kernel flushes socket buffers on
+ * process teardown for the real stack, so both exit doors must drain */
+static void dt_exit_guard(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    dt_atexit_flush();
+}
+void exit(int code) {
+    static void (*real)(int) = 0;
+    if (!real) real = (void (*)(int))dlsym(RTLD_NEXT, "exit");
+    dt_exit_guard();
+    if (real) real(code);
+    _Exit(code);
+}
+void _exit(int code) {
+    static void (*real)(int) = 0;
+    if (!real) real = (void (*)(int))dlsym(RTLD_NEXT, "_exit");
+    dt_exit_guard();
+    if (real) real(code);
+    for (;;) ;
+}
+#endif
 static void dt_start(void) {
     if (g_tun_started || !g_direct) return;
     g_tun_started = 1; g_tun_run = 1;
+#ifdef LINUX_BUILD
+    atexit(dt_atexit_flush);  /* kernel-like exit drain of queued sends */
+#endif
     g_init_t0 = dt_now_ms(); /* watchdog baseline: threads start below */
     g_fakeip = inet_addr("192.168.7.1");
     if (!g_node) {
@@ -3536,6 +3648,7 @@ static struct dt_stream *dt_stream_alloc(long long gsock,
         st->h = st->t = NULL; st->total = 0; st->dead = 0;
         st->state = ST_CONNECTING; st->fail = 0;
         st->in_paused = 0; st->connect_signaled = 0;
+        st->flushing = 0; st->sending = 0;
         st->fd = DTSOCK_BAD;
         st->oh = st->ot = NULL; st->ototal = 0;
         st->an_rx = st->an_tx = 0; st->ab_rx = st->ab_tx = 0; st->a_log = 0;
@@ -4418,6 +4531,23 @@ static PFN_WSACloseEvent p_WSACloseEvent = 0;
 static HMODULE g_hself = 0;
 static PFN_GetProcAddress p_GetProcAddress = 0;
 static HMODULE hWS2 = 0, hKernel = 0;
+typedef void (WINAPI *PFN_ExitProcess)(UINT);
+static PFN_ExitProcess p_ExitProcess = 0;
+static BOOL (WINAPI *p_TerminateProcess)(HANDLE, UINT) = 0;
+void WINAPI hk_ExitProcess(UINT code) {
+    dt_flush_streams();
+    if (!p_ExitProcess)
+        p_ExitProcess = (PFN_ExitProcess)
+            GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitProcess");
+    if (p_ExitProcess) p_ExitProcess(code);
+}
+BOOL WINAPI hk_TerminateProcess(HANDLE h, UINT code) {
+    if (!p_TerminateProcess)
+        p_TerminateProcess = (BOOL (WINAPI *)(HANDLE, UINT))
+            GetProcAddress(GetModuleHandleA("kernel32.dll"), "TerminateProcess");
+    if (h == GetCurrentProcess()) dt_flush_streams();  /* self-close: drain */
+    return p_TerminateProcess ? p_TerminateProcess(h, code) : FALSE;
+}
 BOOL WINAPI hk_CreateProcessA(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
                               LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID,
                               LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -5486,6 +5616,8 @@ FARPROC WINAPI hk_GetProcAddress(HMODULE m, LPCSTR n) {
             }
         }
         if (m == hKernel) {
+            if (!strcmp(n,"ExitProcess")) return (FARPROC)hk_ExitProcess;
+            if (!strcmp(n,"TerminateProcess")) return (FARPROC)hk_TerminateProcess;
             if (!strcmp(n,"CreateProcessA")) return (FARPROC)hk_CreateProcessA;
             if (!strcmp(n,"CreateProcessW")) return (FARPROC)hk_CreateProcessW;
             if (!strcmp(n,"LoadLibraryA")) return (FARPROC)hk_LoadLibraryA;
@@ -6111,6 +6243,10 @@ static void patch_iat_inner(HMODULE mod) {
                     rep = (FARPROC)hk_LoadLibraryExA;
                 } else if (isk32 && !strcmp(fn,"LoadLibraryExW")) {
                     rep = (FARPROC)hk_LoadLibraryExW;
+                } else if (isk32 && !strcmp(fn,"ExitProcess")) {
+                    rep = (FARPROC)hk_ExitProcess;
+                } else if (isk32 && !strcmp(fn,"TerminateProcess")) {
+                    rep = (FARPROC)hk_TerminateProcess;
                 } else if (isk32 && !strcmp(fn,"CreateProcessA")) {
                     rep = (FARPROC)hk_CreateProcessA;
                 } else if (isk32 && !strcmp(fn,"CreateProcessW")) {
