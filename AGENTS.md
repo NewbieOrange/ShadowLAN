@@ -463,7 +463,14 @@ sid/heap seed was weaker than designed on both DLL builds; now a real
 'unused' imports needs WORD-ANCHORED usage counts (line-count grep
 swallowed encode_stsid -> _implicit_grant NameError -> perdest spun its
 10s-retry loop looking like a hang), and never pipe runtests through
-tail (buffers until EOF; write to a file). Full gate 20/20 parallel.
+tail (buffers until EOF; write to a file). Full gate 20/20 parallel. Then the registry's own bug: stale
+claims accumulate (SIGKILL'd suites never release) and only key-matched
+takeover reclaimed them - a day of runs filled all 192 slots and the
+fail-open (-2) path silently re-allowed same-node duplicate binds.
+slp_claim now does a janitor pass at allocation (dead-owner slot =
+free slot; full tables pay one bounded liveness scan per claim).
+bindfidelity runs stacked-green against an intentionally full registry;
+gate 20/20 again.
 
 Shared-port fidelity final cut: the ledger's UDP rule is now exactly
 the kernel's (SO_REUSEADDR on both sides), the Wine clash fixture was
