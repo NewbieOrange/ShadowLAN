@@ -38,8 +38,8 @@ Play broadcast-only LAN co-op games online, on Windows **and** Linux. One dedica
 
 1. Each node registers with the relay (`NODE` + token room) and gets a stable virtual IP. All processes of one game tree register the same node id (inherited `LAN_HOOK_NODE`), so a tree is exactly one virtual machine.
 2. Discovery broadcasts fan out with sender identity; games see distinct servers at distinct IPs.
-3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node (per-dest flows, so identical LAN triples to different hosts don't collide); implicit (unaddressed) traffic falls back to designated-host → beaconer → per-sender sticky-replier routing. A new host claim only steers NEW implicit joins — live streams keep flowing to their original targets. Node-targeted traffic reaches every live link of the node; a stream JOIN is claimed by exactly one sibling (`OK`/`BUSY` answer before the local bridge).
-4. The hosting node bridges tunnel traffic to its local game at `127.0.0.1` — via `wclient --host`, or the hook, which auto-claims when the game calls `listen()`.
+3. Joins go to explicit destinations: addressed TCP opens and UDP datagrams route by node (per-dest flows, so identical LAN triples to different hosts don't collide); implicit (unaddressed) traffic is fan-out like LAN ARP - every live member is asked and exactly the process that listens claims the stream (claims resolve freshest-host-claim first, beacon freshness second; losers get BUSY before bridging). A host claim only steers ordering of NEW implicit joins — live streams keep flowing to their original targets. Node-targeted traffic reaches every live link of the node; a stream JOIN is claimed by exactly one sibling (`OK`/`BUSY` answer before the local bridge).
+4. The hosting node bridges tunnel traffic to its local game at `127.0.0.1` — via `wclient --host`, or the hook, which stamps the host claim when the game calls `listen()`.
 
 ## Quickstart
 

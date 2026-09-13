@@ -9,8 +9,10 @@ is a pure passthrough. One source builds both the Windows DLL and the Linux
 
 - **Player:** LAN/broadcast destinations tunnel to the relay; beacons come
   back attributed per sender, so browsers list distinct servers.
-- **Host:** when the game calls `listen()`, the hook claims designated-host
-  on the relay and bridges inbound players to the game over loopback.
+- **Host:** when the game calls `listen()`, the hook stamps a host claim
+  on the relay (an ordering hint, not an election) and bridges inbound
+  players to the game over loopback: implicit joins are fan-out questions
+  to every machine, and only the process that listens claims the stream.
   No flags needed — hosting in-game is enough.
 - **P2P mesh:** the relay assigns every node a virtual LAN IP
   (`--subnet`, default `10.200.0.0/24`). The hook routes `sendto`/`connect`

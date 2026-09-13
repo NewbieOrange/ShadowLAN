@@ -450,6 +450,21 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Post-rc11 sweep (field-confirmed state): dead code gone
+(dt_fd_readable_peek, Windows slp_starttime, stream_freed accumulator),
+retired-election wording purged from comments/READMEs, g_ta gets
+DT_TA_MAX, select/poll misleading-indentation reformatted (now zero
+compiler warnings on -Wextra for the Linux build), helper imports
+consolidated, runtests prints per-suite wall times. Substantive fix
+found by the audit: dt_rand_seed accumulated in 'unsigned long' =
+32-bit on EVERY Windows ABI, so the (x>>32) fold was UB/no-op - the
+sid/heap seed was weaker than designed on both DLL builds; now a real
+64-bit accumulator. CAUTION logged the hard way twice more: pruning
+'unused' imports needs WORD-ANCHORED usage counts (line-count grep
+swallowed encode_stsid -> _implicit_grant NameError -> perdest spun its
+10s-retry loop looking like a hang), and never pipe runtests through
+tail (buffers until EOF; write to a file). Full gate 20/20 parallel.
+
 Shared-port fidelity final cut: the ledger's UDP rule is now exactly
 the kernel's (SO_REUSEADDR on both sides), the Wine clash fixture was
 corrected to test the faithful matrix instead of the old alias-around
