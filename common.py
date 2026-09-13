@@ -21,7 +21,7 @@ VERSION = "2.0.0"
 # a claim without identity would be unroutable, and claims refresh with
 # the keepalives anyway.
 T_NODE = 0x01        # payload: !H tlen + token + !I node_id + !H udp_port + !B flags
-T_ASSIGN = 0x02      # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt) + !B link_id
+T_ASSIGN = 0x02      # relay->peer: !I my_virt + !I net + !B bits + !H n + n*(!I node + !I virt)
 T_BCAST = 0x03       # payload: !H disc_port + !H src_port + raw (unattributed)
 T_BCAST_FROM = 0x04  # relay->peer: !I src_node + !H disc_port + !H src_port + raw
 T_UDP_MODE = 0x05    # declare UDP-over-TCP mode for this link (empty payload)
@@ -60,12 +60,10 @@ STF_BUSY = 5      # stream id already in use
 # gating registration gates the whole session. UDP frames are
 # connectionless and self-describing, so they carry UVER in every
 # datagram header instead.
-PVER = 0x02
+PVER = 0x03
 UMAGIC = b"VN"
-UVER = 3          # UDP datagram framing v3 (sole version): source port =
-                  # sender's bound vport (the dial-back identity); the
-                  # internal return-routing mark is its own fixed u16
-                  # field. Co-ships with the hooks, like PVER.
+UVER = 3          # UDP datagram framing: source port = sender's bound
+                  # vport (the dial-back identity a real NIC stamps).
 U_GAME_C2S = 0x01
 U_GAME_S2C = 0x02
 U_GAME_P2P = 0x03  # payload: !I dest_node + std triple+raw
@@ -131,13 +129,8 @@ class QueueProto(asyncio.DatagramProtocol):
 
 
 def encode_udp_game(mtype, game_port, cli_ip, cli_port, raw):
-    """Game datagram (C2S/S2C). v3: cli_port is the SENDER socket's
-    bound vport - the dial-back identity a real NIC stamps (v2 carried
-    an internal slot number there, which apps folded and could not
-    re-dial: field SNS black screen). Byte layout unchanged from v2;
-    UVER marks the meaning. No mark field exists in v3: return routing
-    rides (game_port, ip, cli_port) - the receiver locates its socket
-    by the triple it itself used."""
+    """Game datagram (C2S/S2C). cli_port is the sender socket's bound
+    vport. Return routing rides (game_port, ip, cli_port)."""
     ipb = cli_ip.encode()
     return (UMAGIC + bytes([UVER, mtype])
             + struct.pack("!HH", game_port, len(ipb)) + ipb
@@ -205,37 +198,29 @@ def decode_udp_node(data):
     return decode_node(data[4:])
 
 
-def encode_assign(my_virt: int, net: int, bits: int, members,
-                  link_id: int = 0) -> bytes:
-    """members: iterable of (node_id, virt_ip_int). link_id is the
-    MANDATORY per-LINK slot base index (1..255): hooks number
-    client-socket marks as link_id*256 + slot across the full u16 space,
-    so sibling links of one node never collide in the relay's
-    return-path binding and games may use any port themselves."""
+def encode_assign(my_virt: int, net: int, bits: int, members) -> bytes:
+    """members: iterable of (node_id, virt_ip_int)."""
     members = list(members)
     out = [struct.pack("!IIBH", my_virt & 0xFFFFFFFF, net & 0xFFFFFFFF,
                        bits & 0xFF, len(members))]
     for node, virt in members:
         out.append(struct.pack("!II", node & 0xFFFFFFFF, virt & 0xFFFFFFFF))
-    out.append(struct.pack("!B", link_id & 0xFF))
     return b"".join(out)
 
 
 def decode_assign(payload: bytes):
-    """T_ASSIGN payload -> (my_virt, net, bits, [(node, virt)], link_id)
-    or None. The trailing link_id byte is mandatory."""
+    """T_ASSIGN payload -> (my_virt, net, bits, [(node, virt)]) or None."""
     try:
-        if len(payload) < 12:
+        if len(payload) < 11:
             return None
         my_virt, net, bits, n = struct.unpack("!IIBH", payload[:11])
-        if len(payload) != 12 + 8 * n:
+        if len(payload) != 11 + 8 * n:
             return None
-        link_id = payload[11 + 8 * n]
         members = []
         for i in range(n):
             node, virt = struct.unpack("!II", payload[11 + 8 * i:19 + 8 * i])
             members.append((node, virt))
-        return my_virt, net, bits, members, link_id
+        return my_virt, net, bits, members
     except struct.error:
         return None
 
@@ -262,14 +247,11 @@ def encode_streq(sid: int, gport: int, ovirt: int = 0) -> bytes:
 
 
 def decode_streq(payload: bytes):
-    """-> (sid, gport, opener_virt) or None. 6-byte legacy frames decode
-    with opener_virt=0 (joiner then leaves getpeername uns spoofed)."""
+    """-> (sid, gport, opener_virt) or None."""
     try:
-        if len(payload) not in (6, 10):
+        if len(payload) != 10:
             return None
-        sid, gport = struct.unpack("!IH", payload[:6])
-        ovirt = struct.unpack("!I", payload[6:10])[0] if len(payload) == 10 else 0
-        return sid, gport, ovirt
+        return struct.unpack("!IHI", payload)
     except struct.error:
         return None
 

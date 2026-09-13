@@ -62,7 +62,7 @@ class Relay:
     KNOWN_TTL = 120        # known UDP endpoint freshness
     LEARN_TTL = 60         # (src, game_port) -> replier freshness (per-sender sticky)
     FLOW_TTL = 120         # per-dest triple -> player routing freshness
-    NODE_GRACE = 5         # token relays: NODE-or-HELLO deadline per conn
+    NODE_GRACE = 5         # token relays: NODE deadline per conn
     NODE_TTL = 600         # forget disconnected nodes (writer gone) after this
     # per-writer control queue: drop droppable frames (beacons, UDP-over-
     # TCP datagrams) instead of blocking the room on a stalled reader
@@ -89,13 +89,10 @@ class Relay:
         # virtual-IP membership: node_id -> dict(virt, seen_tcp, links)
         # where links maps control-writer -> per-link state
         #   dict(tcp_ip, udp_port, udp_addr, seen_udp, udp_tcp, link_id).
-        # link_id: per-node unique slot base index (1..255) handed to the
-        # hook in ASSIGN; hook marks become link_id*256+slot across the
-        # FULL u16 space (legacy 50000 band only at base 0), so sibling
-        # links never collide AND games may use any port themselves.
-        # One node may hold SEVERAL links (processes sharing one identity
-        # via the hook's shared state); node-targeted traffic fans out to
-        # every live link.
+        # link_id is relay-internal only (logs / uniqueness); it is not
+        # on the wire. One node may hold SEVERAL links (processes sharing
+        # one identity via the hook's shared state); node-targeted traffic
+        # fans out to every live link.
         self.nodes = {}
         self.writer_node = {}  # id(writer) -> node_id
         self.known_udp = {}  # addr -> last seen (fan-out candidates)
@@ -234,11 +231,10 @@ class Relay:
     async def send_assign(self, writer):
         node = self.writer_node.get(id(writer))
         ent = self.nodes.get(node, {}) if node else {}
-        lid = ent.get("links", {}).get(writer, {}).get("link_id", 0)
         try:
             await self.r_send(writer, T_ASSIGN,
                               encode_assign(ent.get("virt", 0), self.subnet_net,
-                                            24, self.members(), lid))
+                                            24, self.members()))
         except (ConnectionResetError, BrokenPipeError, RuntimeError):
             pass
 
