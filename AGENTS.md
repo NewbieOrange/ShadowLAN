@@ -405,6 +405,21 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+Kernel close/duplex fidelity (this cut): shutdown() implemented
+(SHUT_RD discards, SHUT_WR flushes + FINs the peer via new T_STSHUT
+control frame; reverse direction stays alive); close() now flushes the
+queued out-queue before retiring the stream; peer FIN half-closes both
+pumps instead of killing them; FIN vs RST distinguished (recv: 0 vs
+ECONNRESET; Linux send-on-reset raises SIGPIPE); getsockopt(SO_ERROR)
+emulates connect completion (0 while pending - the kernel carries only
+completion errors - refused/timeout/reset after); select/poll suppress
+the vacuous writable of a still-connecting socket and deliver the
+connect edge once at verdict; hosted-pump relay-read gate fixed (the
+hold slot could be overwritten mid-drain, silently dropping up to a
+64KB window). New test_fullduplex covers all of it; exitdrain uses an
+isolated subnet. T_STSHUT: relay+hook ship together (old peers just
+never half-close - degrades, no corruption).
+
 Hosted-pump integrity (this cut): the joinee pipe used to abandon the
 remainder of a game read when the relay connection would block
 (nonblocking send + bare break) - a silently corrupted stream strands
