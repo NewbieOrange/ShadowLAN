@@ -450,6 +450,15 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 
 ## Status snapshot (UNRELEASED)
 
+rc15 field round (same-box): alias bridge fix verified working end to
+end (271KB lobby + heartbeats crossed byte-exact), but the host game's
+ACCEPTED sockets still leaked the listener's alias real port via
+getsockname -> identity triple disagreed -> app closed the session and
+RST the retries. New dt_acc_self_view presents (own vnode, listen
+vport) on both platforms (test_aliasbridge R6b guards the triple).
+The WAN topology can never hit this (no aliasing); only one-machine
+double-node runs do.
+
 Field join fix (same-box): dt_alias_real was vport-first-match, so with
 a node hosting BOTH games on one OS (every bind aliased) the TCP stream
 bridge dialed the UDP alias row (refused -> reason=3, hosted open fail,
