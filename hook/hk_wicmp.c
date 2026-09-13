@@ -1,6 +1,6 @@
-/* hk_wicmp.inc - ICMP echo API (IcmpSendEcho family) (Windows only)
- * Part of lan_hook.c; see the note there before editing. */
-#ifndef LINUX_BUILD
+#include "hk_mod.h"
+
+/* hk_wicmp.c - IcmpSendEcho family */
 /* ---- ICMP echo API (Windows IcmpSendEcho family) -----------------------
  * Synchronous ping APIs own no socket, so echo requests are tracked in
  * a pending table keyed by synthetic (id, seq) and completed by
@@ -8,18 +8,20 @@
  * subnet-broadcast collects until timeout/buffer-full, like the real
  * stack. IcmpSendEcho2's event is signaled; its APC routine is NOT
  * queued (documented limitation: wait on the event instead). ---- */
-typedef DWORD (WINAPI *PFN_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD,
-    PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
-typedef DWORD (WINAPI *PFN_IcmpSendEcho2)(HANDLE, HANDLE, FARPROC, PVOID,
-    IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
-static PFN_IcmpSendEcho p_IcmpSendEcho = 0;
-static PFN_IcmpSendEcho2 p_IcmpSendEcho2 = 0;
+PFN_IcmpSendEcho p_IcmpSendEcho = 0;
+PFN_IcmpSendEcho2 p_IcmpSendEcho2 = 0;
 #define DT_MAXPEND 32
 #define DT_MAXREPS 8
-struct dt_icmp_pend { int used; unsigned id, seq; HANDLE ev;
-                      unsigned from[DT_MAXREPS]; int nrep;
-                      unsigned char data[1400]; size_t dlen;
-                      long long t0, last; };
+struct dt_icmp_pend {
+    int used;
+    unsigned id, seq;
+    HANDLE ev;
+    unsigned from[DT_MAXREPS];
+    int nrep;
+    unsigned char data[1400];
+    size_t dlen;
+    long long t0, last;
+};
 static struct dt_icmp_pend g_pend[DT_MAXPEND];
 static unsigned dt_icmp_synth_id(void) {
     static volatile LONG ctr = 0;
@@ -34,7 +36,10 @@ static int dt_icmp_pend_alloc(unsigned id, unsigned seq, HANDLE ev) {
     DLOCK();
     for (i = 0; i < DT_MAXPEND; i++) {
         if (!g_pend[i].used && idx < 0) idx = i;
-        if (g_pend[i].used && g_pend[i].last < oldest) { oldest = g_pend[i].last; oldi = i; }
+        if (g_pend[i].used && g_pend[i].last < oldest) {
+            oldest = g_pend[i].last;
+            oldi = i;
+        }
     }
     if (idx < 0 && oldi >= 0 && now - oldest > 60000) {
         if (g_pend[oldi].ev) CloseHandle(g_pend[oldi].ev);
@@ -43,8 +48,12 @@ static int dt_icmp_pend_alloc(unsigned id, unsigned seq, HANDLE ev) {
     }
     if (idx >= 0) {
         memset(&g_pend[idx], 0, sizeof(g_pend[idx]));
-        g_pend[idx].used = 1; g_pend[idx].id = id; g_pend[idx].seq = seq;
-        g_pend[idx].ev = ev; g_pend[idx].t0 = now; g_pend[idx].last = now;
+        g_pend[idx].used = 1;
+        g_pend[idx].id = id;
+        g_pend[idx].seq = seq;
+        g_pend[idx].ev = ev;
+        g_pend[idx].t0 = now;
+        g_pend[idx].last = now;
     }
     DUNLOCK();
     return idx;
@@ -59,9 +68,8 @@ static void dt_icmp_pend_free(int idx) {
     DUNLOCK();
 }
 /* inbound REP completion: record responder, wake waiter. Returns hits. */
-static int dt_icmp_pend_complete(unsigned id, unsigned seq,
-                                 const unsigned char *data, size_t dlen,
-                                 unsigned from_virt) {
+int dt_icmp_pend_complete(unsigned id, unsigned seq, const unsigned char *data, size_t dlen,
+                          unsigned from_virt) {
     int i, hit = 0;
     HANDLE evs[DT_MAXPEND];
     int nev = 0;
@@ -70,7 +78,10 @@ static int dt_icmp_pend_complete(unsigned id, unsigned seq,
         int k, dup = 0;
         if (!g_pend[i].used || g_pend[i].id != id || g_pend[i].seq != seq) continue;
         for (k = 0; k < g_pend[i].nrep; k++)
-            if (g_pend[i].from[k] == from_virt) { dup = 1; break; }
+            if (g_pend[i].from[k] == from_virt) {
+                dup = 1;
+                break;
+            }
         if (!dup && g_pend[i].nrep < DT_MAXREPS) {
             size_t cn = dlen < sizeof(g_pend[i].data) ? dlen : sizeof(g_pend[i].data);
             if (g_pend[i].nrep == 0 && cn) memcpy(g_pend[i].data, data, cn);
@@ -124,8 +135,8 @@ static DWORD dt_icmp_emit(int idx, PVOID repbuf, DWORD repsize, long long rtt_ms
     return (DWORD)n;
 }
 /* shared IcmpSendEcho(2) body */
-static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
-                          PVOID repbuf, DWORD repsize, DWORD timeout) {
+static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize, PVOID repbuf,
+                          DWORD repsize, DWORD timeout) {
     unsigned long da = (unsigned long)dst; /* IPAddr is network order */
     unsigned relay1 = 0, node = 0;
     unsigned id, seq;
@@ -134,8 +145,7 @@ static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
     long long t0;
     DWORD n = 0;
     static volatile LONG seqctr = 0;
-    if (!g_direct || !p_IcmpSendEcho)
-        goto passthrough;
+    if (!g_direct || !p_IcmpSendEcho) goto passthrough;
     if (ipv4_is_local(da)) goto passthrough;
     if (ntohl(da) == g_myvirt) is_self = 1;
     else if (dt_is_vnet_bcast(da)) is_bcast = 1;
@@ -147,18 +157,26 @@ static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
             if (!node) goto passthrough; /* real-LAN destination */
         }
     }
-    if (repsize < sizeof(ICMP_ECHO_REPLY)) { SetLastError(IP_BUF_TOO_SMALL); return 0; }
+    if (repsize < sizeof(ICMP_ECHO_REPLY)) {
+        SetLastError(IP_BUF_TOO_SMALL);
+        return 0;
+    }
     id = dt_icmp_synth_id();
     seq = (unsigned)(InterlockedIncrement(&seqctr) & 0xFFFF);
     ev = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (!ev) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    if (!ev) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     t0 = dt_now_ms();
     if (is_self && !is_bcast) {
         /* pinging ourselves: answer inline, no tunnel, no wait */
         unsigned char rep[1500];
         size_t rn, rl = reqsize;
         unsigned myv;
-        DLOCK(); myv = g_myvirt; DUNLOCK();
+        DLOCK();
+        myv = g_myvirt;
+        DUNLOCK();
         if (rl > sizeof(rep) - 8) rl = sizeof(rep) - 8;
         rn = dt_icmp_build_rep(rep, id, seq, (const unsigned char *)req, rl);
         idx = dt_icmp_pend_alloc(id, seq, NULL);
@@ -173,16 +191,20 @@ static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
         return n;
     }
     idx = dt_icmp_pend_alloc(id, seq, ev);
-    if (idx < 0) { CloseHandle(ev); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-    wev = ev; ev = NULL; /* owned by the slot now */
+    if (idx < 0) {
+        CloseHandle(ev);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    wev = ev;
+    ev = NULL; /* owned by the slot now */
     if (is_bcast) {
         int i, nm = 0;
         unsigned nodes[DT_MAXMEMB];
         unsigned myv;
         DLOCK();
         myv = g_myvirt;
-        for (i = 0; i < g_nmembers && nm < DT_MAXMEMB; i++)
-            nodes[nm++] = g_members[i].node;
+        for (i = 0; i < g_nmembers && nm < DT_MAXMEMB; i++) nodes[nm++] = g_members[i].node;
         DUNLOCK();
         for (i = 0; i < nm; i++) {
             unsigned virt = dt_node_virt(nodes[i]);
@@ -202,8 +224,8 @@ static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
                 w = WaitForSingleObject(wev, left > 250 ? 250 : (DWORD)left);
                 (void)w;
                 DLOCK();
-                fits = ((size_t)(g_pend[idx].nrep + 1) *
-                        (sizeof(ICMP_ECHO_REPLY) + reqsize) <= repsize);
+                fits = ((size_t)(g_pend[idx].nrep + 1) * (sizeof(ICMP_ECHO_REPLY) + reqsize) <=
+                        repsize);
                 DUNLOCK();
                 if (!fits) break;
             }
@@ -228,28 +250,26 @@ static DWORD dt_icmp_echo(HANDLE h, IPAddr dst, const void *req, WORD reqsize,
     }
 passthrough:
     if (p_IcmpSendEcho)
-        return p_IcmpSendEcho(h, dst, (LPVOID)req, reqsize, NULL,
-                              repbuf, repsize, timeout);
+        return p_IcmpSendEcho(h, dst, (LPVOID)req, reqsize, NULL, repbuf, repsize, timeout);
     SetLastError(ERROR_INVALID_FUNCTION);
     return 0;
 }
 DWORD WINAPI hk_IcmpSendEcho(HANDLE h, IPAddr dst, LPVOID req, WORD reqsize,
-                             PIP_OPTION_INFORMATION opts, LPVOID repbuf,
-                             DWORD repsize, DWORD timeout) {
+                             PIP_OPTION_INFORMATION opts, LPVOID repbuf, DWORD repsize,
+                             DWORD timeout) {
     (void)opts;
     return dt_icmp_echo(h, dst, req, reqsize, repbuf, repsize, timeout);
 }
-DWORD WINAPI hk_IcmpSendEcho2(HANDLE h, HANDLE hev, FARPROC apc, PVOID ctx,
-                              IPAddr dst, LPVOID req, WORD reqsize,
-                              PIP_OPTION_INFORMATION opts, LPVOID repbuf,
+DWORD WINAPI hk_IcmpSendEcho2(HANDLE h, HANDLE hev, FARPROC apc, PVOID ctx, IPAddr dst, LPVOID req,
+                              WORD reqsize, PIP_OPTION_INFORMATION opts, LPVOID repbuf,
                               DWORD repsize, DWORD timeout) {
     DWORD n;
-    (void)apc; (void)ctx; (void)opts;
+    (void)apc;
+    (void)ctx;
+    (void)opts;
     /* APC routines are not queued (documented): the event is the
      * completion signal; callers waiting on it work unchanged. */
     n = dt_icmp_echo(h, dst, req, reqsize, repbuf, repsize, timeout);
     if (hev) SetEvent(hev);
     return n;
 }
-
-#endif

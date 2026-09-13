@@ -1,37 +1,49 @@
-/* hk_route.inc - connect routing / dial (shared)
- * Part of lan_hook.c; see the note there before editing. */
+#include "hk_mod.h"
+
+/* hk_route.c - hairpin, connect/send/recv/close */
 
 /* Connecting-side presentation for a NIC-style hairpin (own-vnode
  * dial completed through loopback). getpeername must keep speaking
  * the vnode:vport the app dialed, not 127.0.0.1:alias-real. */
 #define DT_MAXHP 32
-static struct { long long sock; struct sockaddr_in dest; } g_hp[DT_MAXHP];
+static struct {
+    long long sock;
+    struct sockaddr_in dest;
+} g_hp[DT_MAXHP];
 static void dt_hairpin_remember(long long sock, const struct sockaddr_in *dest) {
     int i;
     DLOCK();
     for (i = 0; i < DT_MAXHP; i++)
         if (!g_hp[i].sock || g_hp[i].sock == sock) {
-            g_hp[i].sock = sock; g_hp[i].dest = *dest; break;
+            g_hp[i].sock = sock;
+            g_hp[i].dest = *dest;
+            break;
         }
     DUNLOCK();
 }
 static void dt_hairpin_forget_locked(long long sock) {
     int i;
     for (i = 0; i < DT_MAXHP; i++)
-        if (g_hp[i].sock == sock) { g_hp[i].sock = 0; break; }
+        if (g_hp[i].sock == sock) {
+            g_hp[i].sock = 0;
+            break;
+        }
 }
 
-static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
+int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
 #ifdef SL_CONNECT_TRACE
-    { char lb[128]; unsigned long a = ntohl(dst->sin_addr.s_addr);
-      snprintf(lb, sizeof(lb), "on_connect gsock=%lld -> %lu.%lu.%lu.%lu:%d type=%d",
-               gsock, (a >> 24) & 255, (a >> 16) & 255, (a >> 8) & 255, a & 255,
-               (int)ntohs(dst->sin_port), dt_sock_type(gsock));
-      dlog(lb); }
+    {
+        char lb[128];
+        unsigned long a = ntohl(dst->sin_addr.s_addr);
+        snprintf(lb, sizeof(lb), "on_connect gsock=%lld -> %lu.%lu.%lu.%lu:%d type=%d", gsock,
+                 (a >> 24) & 255, (a >> 16) & 255, (a >> 8) & 255, a & 255,
+                 (int)ntohs(dst->sin_port), dt_sock_type(gsock));
+        dlog(lb);
+    }
 #endif
-    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0;   /* same-host: real stack */
+    if (ipv4_is_local(dst->sin_addr.s_addr)) return 0; /* same-host: real stack */
     if (dt_sock_type(gsock) != SOCK_STREAM) return 0;
-    if (dt_reject_wire4(dst)) return 3;  /* LAN_ONLY: no route to host */
+    if (dt_reject_wire4(dst)) return 3; /* LAN_ONLY: no route to host */
     DLOCK();
     struct dt_stream *ex = dt_stream_by_sock(gsock);
     DUNLOCK();
@@ -62,20 +74,22 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
 #ifdef LINUX_BUILD
         dt_reals();
         rr = r_connect((int)gsock, (struct sockaddr *)&lo, sizeof(lo));
-        if (rr != 0 && errno != EINPROGRESS && errno != EALREADY
-                && errno != EISCONN && errno != EWOULDBLOCK) return -1;
+        if (rr != 0 && errno != EINPROGRESS && errno != EALREADY && errno != EISCONN &&
+            errno != EWOULDBLOCK)
+            return -1;
 #else
         rr = connect((SOCKET)gsock, (struct sockaddr *)&lo, sizeof(lo));
-        if (rr != 0 && WSAGetLastError() != WSAEWOULDBLOCK
-                && WSAGetLastError() != WSAEALREADY
-                && WSAGetLastError() != WSAEISCONN) return -1;
+        if (rr != 0 && WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEALREADY &&
+            WSAGetLastError() != WSAEISCONN)
+            return -1;
 #endif
         dt_hairpin_remember(gsock, dst);
-        { char lb[160];
-          snprintf(lb, sizeof(lb),
-                   "hairpin pid=%u sock=%lld -> 127.0.0.1:%d (vport=%d)",
-                   (unsigned)current_pid(), gsock, real > 0 ? real : vp, vp);
-          dlog(lb); }
+        {
+            char lb[160];
+            snprintf(lb, sizeof(lb), "hairpin pid=%u sock=%lld -> 127.0.0.1:%d (vport=%d)",
+                     (unsigned)current_pid(), gsock, real > 0 ? real : vp, vp);
+            dlog(lb);
+        }
         return 4;
     }
     int is_vnode = vnode != 0;
@@ -93,30 +107,64 @@ static int dt_on_connect(long long gsock, const struct sockaddr_in *dst) {
  * -1 stream dead (ECONNRESET); -2 our stream, out-queue full
  * (caller: nonblocking app -> EWOULDBLOCK, blocking app -> wait+retry);
  * -3 write side shut down by the app (EPIPE). */
-static int dt_stream_send(long long gsock, const unsigned char *buf, size_t len) {
-    unsigned lsid = 0; size_t ln = 0, tot = 0; int dolog = 0;
+int dt_stream_send(long long gsock, const unsigned char *buf, size_t len) {
+    unsigned lsid = 0;
+    size_t ln = 0, tot = 0;
+    int dolog = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    if (!st) { DUNLOCK(); return 0; }
-    if (st->wr_shut) { DUNLOCK(); return -3; }   /* EPIPE: we shut it down */
-    if (st->dead || st->state == ST_DEAD) { DUNLOCK(); return -1; }
-    if (st->ototal + len > DT_ST_MAXOUT) { DUNLOCK(); return -2; }
+    if (!st) {
+        DUNLOCK();
+        return 0;
+    }
+    if (st->wr_shut) {
+        DUNLOCK();
+        return -3;
+    } /* EPIPE: we shut it down */
+    if (st->dead || st->state == ST_DEAD) {
+        DUNLOCK();
+        return -1;
+    }
+    if (st->ototal + len > DT_ST_MAXOUT) {
+        DUNLOCK();
+        return -2;
+    }
     if (len) {
         struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
-        if (!c) { DUNLOCK(); return -2; }
+        if (!c) {
+            DUNLOCK();
+            return -2;
+        }
         c->p = (unsigned char *)malloc(len);
-        if (!c->p) { free(c); DUNLOCK(); return -2; }
+        if (!c->p) {
+            free(c);
+            DUNLOCK();
+            return -2;
+        }
         memcpy(c->p, buf, len);
-        c->n = len; c->off = 0; c->next = NULL;
-        if (st->ot) st->ot->next = c; else st->oh = c;
-        st->ot = c; st->ototal += len;
-        st->ab_tx += len; st->an_tx++;
-        tot = st->ab_tx; lsid = st->sid; ln = len;
+        c->n = len;
+        c->off = 0;
+        c->next = NULL;
+        if (st->ot) st->ot->next = c;
+        else st->oh = c;
+        st->ot = c;
+        st->ototal += len;
+        st->ab_tx += len;
+        st->an_tx++;
+        tot = st->ab_tx;
+        lsid = st->sid;
+        ln = len;
         long long now = dt_now_ms();
         if (ln >= 4096 || st->an_tx <= 3 || now - st->a_log > 1000) {
-            st->a_log = now; dolog = 1; }
+            st->a_log = now;
+            dolog = 1;
+        }
     }
-    { DTSOCK ww = st->wake_w; DUNLOCK(); dt_wake_write(ww); }
+    {
+        DTSOCK ww = st->wake_w;
+        DUNLOCK();
+        dt_wake_write(ww);
+    }
     if (dolog) {
         char lb[160];
         snprintf(lb, sizeof(lb), "app tx pid=%u gsock=%lld sid=%u n=%zu tot=%zu",
@@ -131,7 +179,7 @@ static int dt_stream_send(long long gsock, const unsigned char *buf, size_t len)
  * send() and Windows send()/WSASend() hooks. Returns: len queued,
  * 0 not our stream, -1 dead (ECONNRESET set), -2 full (EWOULDBLOCK set
  * for nonblocking apps; blocking apps never see -2). */
-static void dt_stream_send_err(int r) {
+void dt_stream_send_err(int r) {
 #ifdef LINUX_BUILD
     if (r == -1) errno = ECONNRESET;
     else if (r == -2) errno = EAGAIN;
@@ -142,24 +190,32 @@ static void dt_stream_send_err(int r) {
     else if (r == -3) WSASetLastError(WSAESHUTDOWN);
 #endif
 }
-static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len) {
+int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len) {
     int nonblock = dt_is_nonblock(s);
     for (;;) {
         int r = dt_stream_send(s, buf, len);
         if (r >= 0) return r;
-        if (r == -3) { dt_stream_send_err(-3); return -3; }
+        if (r == -3) {
+            dt_stream_send_err(-3);
+            return -3;
+        }
         if (r == -1) {
 #ifdef LINUX_BUILD
             /* kernel: send to a stream the peer reset => SIGPIPE + EPIPE
              * (default-ignored here only if the app blocked it already) */
             raise(SIGPIPE);
-            errno = EPIPE; return -1;
+            errno = EPIPE;
+            return -1;
 #else
-            dt_stream_send_err(-1); return -1;
+            dt_stream_send_err(-1);
+            return -1;
 #endif
         }
         if (r == -2) {
-            if (nonblock) { dt_stream_send_err(-2); return -2; }
+            if (nonblock) {
+                dt_stream_send_err(-2);
+                return -2;
+            }
             dt_msleep(5);
             continue;
         }
@@ -171,8 +227,12 @@ static int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len
  * reports st->total; apps that ioctl then recv(exactly that) (the
  * reference lobby stack does, and never shrinks a short read) treat a
  * first-chunk-only pop as a torn length prefix and never parse again. */
-static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_t *outn) {
-    int r = 0; size_t ln = 0; unsigned lsid = 0; int dolog = 0; size_t tot = 0;
+int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_t *outn) {
+    int r = 0;
+    size_t ln = 0;
+    unsigned lsid = 0;
+    int dolog = 0;
+    size_t tot = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st && st->h) {
@@ -181,23 +241,34 @@ static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_
             size_t n = st->h->n - st->h->off;
             if (n > blen - got) n = blen - got;
             memcpy(buf + got, st->h->p + st->h->off, n);
-            st->h->off += n; st->total -= n; got += n;
+            st->h->off += n;
+            st->total -= n;
+            got += n;
             if (st->h->off >= st->h->n) {
-                struct dt_chunk *o = st->h; st->h = o->next; if (!st->h) st->t = NULL;
-                free(o->p); free(o);
+                struct dt_chunk *o = st->h;
+                st->h = o->next;
+                if (!st->h) st->t = NULL;
+                free(o->p);
+                free(o);
             }
         }
-        *outn = got; r = 1;
+        *outn = got;
+        r = 1;
         if (st->in_paused && st->total < DT_ST_MAXIN / 2) {
             st->in_paused = 0;
-            dt_wake_write(st->wake_w);   /* window reopened: read again now */
+            dt_wake_write(st->wake_w); /* window reopened: read again now */
         }
-        ln = got; lsid = st->sid; st->ab_rx += got; st->an_rx++; tot = st->ab_rx;
+        ln = got;
+        lsid = st->sid;
+        st->ab_rx += got;
+        st->an_rx++;
+        tot = st->ab_rx;
         long long now = dt_now_ms();
         if (ln >= 4096 || st->an_rx <= 3 || now - st->a_log > 1000) {
-            st->a_log = now; dolog = 1; }
-    } else if (st && (st->dead || st->state == ST_DEAD || st->peer_fin
-                     || st->rd_shut)) r = -1;
+            st->a_log = now;
+            dolog = 1;
+        }
+    } else if (st && (st->dead || st->state == ST_DEAD || st->peer_fin || st->rd_shut)) r = -1;
     DUNLOCK();
     if (dolog) {
         char lb[160];
@@ -207,34 +278,45 @@ static int dt_stream_pop(long long gsock, unsigned char *buf, size_t blen, size_
     }
     return r;
 }
-static int dt_getpeer(long long gsock, struct sockaddr_in *out) {
-    int ok = 0; DLOCK();
+int dt_getpeer(long long gsock, struct sockaddr_in *out) {
+    int ok = 0;
+    DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    if (st) { *out = st->orig; ok = 1; }
-    else {
+    if (st) {
+        *out = st->orig;
+        ok = 1;
+    } else {
         int i;
         for (i = 0; i < DT_MAXHP; i++)
-            if (g_hp[i].sock == gsock) { *out = g_hp[i].dest; ok = 1; break; }
+            if (g_hp[i].sock == gsock) {
+                *out = g_hp[i].dest;
+                ok = 1;
+                break;
+            }
     }
-    DUNLOCK(); return ok;
+    DUNLOCK();
+    return ok;
 }
 /* peek for poll/select hooks: tunnel data pending? (no consume) */
-static int dt_udp_has(long long gsock) {
-
-    int r = 0; DLOCK();
+int dt_udp_has(long long gsock) {
+    int r = 0;
+    DLOCK();
     struct dt_udp *e = dt_udp_entry(gsock, 0);
     r = (e && !e->closed && e->h) ? 1 : 0;
-    DUNLOCK(); return r;
+    DUNLOCK();
+    return r;
 }
-static int dt_stream_has(long long gsock) {
-    int r = 0; DLOCK();
+int dt_stream_has(long long gsock) {
+    int r = 0;
+    DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st) r = (st->h || st->dead || st->state == ST_DEAD) ? 1 : 0; /* dead = readable EOF */
-    DUNLOCK(); return r;
+    DUNLOCK();
+    return r;
 }
 /* one-shot connect-completed (FD_CONNECT): mark reported (Windows
  * WSAEnum path). inline: referenced only there, no unused warning elsewhere. */
-static inline void dt_stream_mark_connect(long long gsock) {
+void dt_stream_mark_connect(long long gsock) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st) st->connect_signaled = 1;
@@ -243,18 +325,20 @@ static inline void dt_stream_mark_connect(long long gsock) {
 /* Timeout sockets park in poll()/select() BEFORE ever calling recvfrom,
  * so the wait hooks must register DGRAM interest too — otherwise fan-out
  * finds no entry and tunnel broadcasts are dropped. */
-static void dt_udp_ensure(long long gsock) {
+void dt_udp_ensure(long long gsock) {
     if (!dt_is_udp_like(gsock)) return;
-    DLOCK(); dt_udp_entry(gsock, 1); DUNLOCK();
+    DLOCK();
+    dt_udp_entry(gsock, 1);
+    DUNLOCK();
 }
-static int dt_fd_readable(long long gsock) {
+int dt_fd_readable(long long gsock) {
     dt_udp_ensure(gsock);
     return dt_udp_has(gsock) || dt_stream_has(gsock);
 }
 /* Timeout sockets park in poll()/select() BEFORE ever calling recvfrom,
  * so the wait hooks must register DGRAM interest too — otherwise fan-out
  * finds no entry and tunnel broadcasts are dropped. */
-static void dt_on_close(long long gsock) {
+void dt_on_close(long long gsock) {
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
     if (st) {
@@ -263,25 +347,46 @@ static void dt_on_close(long long gsock) {
          * close (dead=1) and let it drain, FIN, and free. Only the
          * pre-thread window may free here. */
         st->dead = 1;
-        if (st->fd_live) dt_wake_write(st->wake_w);  /* run flush now */
+        if (st->fd_live) dt_wake_write(st->wake_w); /* run flush now */
         if (st->state != ST_CONNECTING && st->fd_live) {
             /* pump owns the wire: release the app identity so a recycled
              * fd can bind a fresh stream; it flushes + frees by sid */
             st->gsock = 0;
         }
         if (st->state == ST_CONNECTING && !st->fd_live) {
-            st->used = 0; st->fd = DTSOCK_BAD;
+            st->used = 0;
+            st->fd = DTSOCK_BAD;
             struct dt_chunk *c = st->h;
-            while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+            while (c) {
+                struct dt_chunk *n = c->next;
+                free(c->p);
+                free(c);
+                c = n;
+            }
             c = st->oh;
-            while (c) { struct dt_chunk *n = c->next; free(c->p); free(c); c = n; }
+            while (c) {
+                struct dt_chunk *n = c->next;
+                free(c->p);
+                free(c);
+                c = n;
+            }
             st->h = st->t = st->oh = st->ot = NULL;
             st->total = st->ototal = 0;
         }
     }
     struct dt_udp *e = dt_udp_entry(gsock, 0);
-    if (e) { e->closed = 1; e->used = 0;
-        struct dt_dgram *d = e->h; while (d) { struct dt_dgram *n = d->next; free(d->p); free(d); d = n; } e->h = e->t = NULL; }
+    if (e) {
+        e->closed = 1;
+        e->used = 0;
+        struct dt_dgram *d = e->h;
+        while (d) {
+            struct dt_dgram *n = d->next;
+            free(d->p);
+            free(d);
+            d = n;
+        }
+        e->h = e->t = NULL;
+    }
     for (int i = 0; i < DT_MAXSLOT; i++)
         if (g_sl[i].used && g_sl[i].gsock == gsock) g_sl[i].used = 0;
     dt_hairpin_forget_locked(gsock);
@@ -303,11 +408,12 @@ static void dt_on_close(long long gsock) {
 
 /* Blocking pop for hooked TCP stream bytes.
  * Returns 1 got data (*outn>0), 0 timeout/empty-nonblock, -1 dead/closed. */
-static int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen,
-                       size_t *outn, int timeout_ms, int nonblock) {
+int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen, size_t *outn, int timeout_ms,
+                int nonblock) {
     long long t0 = 0;
 #ifdef LINUX_BUILD
-    struct timeval tv0; gettimeofday(&tv0, NULL);
+    struct timeval tv0;
+    gettimeofday(&tv0, NULL);
     t0 = (long long)tv0.tv_sec * 1000 + tv0.tv_usec / 1000;
 #else
     t0 = (long long)GetTickCount();
@@ -318,7 +424,8 @@ static int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen,
         if (nonblock) return 0;
         long long now;
 #ifdef LINUX_BUILD
-        struct timeval tv; gettimeofday(&tv, NULL);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
         now = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 #else
         now = (long long)GetTickCount();
@@ -326,7 +433,8 @@ static int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen,
         if (timeout_ms >= 0 && now - t0 >= timeout_ms) return 0;
         /* stop early if socket was closed under us */
         {
-            int alive = 0; DLOCK();
+            int alive = 0;
+            DLOCK();
             struct dt_stream *st = dt_stream_by_sock(gsock);
             alive = (st != NULL);
             DUNLOCK();
@@ -335,4 +443,3 @@ static int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen,
         dt_msleep(10);
     }
 }
-

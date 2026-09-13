@@ -1,0 +1,29 @@
+# Matches the hook's existing habits: 4-space, attached braces,
+# short if/for on one line, include order left alone (platform #ifdefs).
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortBlocksOnASingleLine: Always
+PointerAlignment: Right
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: false
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: None
+AlignConsecutiveAssignments: None
+BinPackParameters: true
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: true
+ContinuationIndentWidth: 4
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+ForEachMacros: []
+StatementMacros: ['DLOCK', 'DUNLOCK']

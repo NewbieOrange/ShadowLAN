@@ -15,12 +15,16 @@
 typedef void (*run_fn)(int, int);
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: test_late.exe host|client|clash [qport aport] [xport]\n"); return 2; }
+    if (argc < 2) {
+        fprintf(stderr, "usage: test_late.exe host|client|clash [qport aport] [xport]\n");
+        return 2;
+    }
     int qport = argc > 2 ? atoi(argv[2]) : 45711;
     int aport = argc > 3 ? atoi(argv[3]) : 45712;
     int xport = argc > 4 ? atoi(argv[4]) : 0;
     setvbuf(stdout, NULL, _IONBF, 0);
-    WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
+    WSADATA wd;
+    WSAStartup(MAKEWORD(2, 2), &wd);
     if (!strcmp(argv[1], "clash")) {
         /* faithful shared-UDP-port semantics for one machine: binds
          * coexist only with SO_REUSEADDR on BOTH sockets, and every
@@ -37,12 +41,26 @@ int main(int argc, char **argv) {
         int on = 1;
         setsockopt(s1, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
         setsockopt(s2, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
-        if (bind(s1, (struct sockaddr *)&p, sizeof(p))) { printf("clash s1 fail %d\n", WSAGetLastError()); return 1; }
-        if (bind(s2, (struct sockaddr *)&p, sizeof(p))) { printf("clash s2 fail %d\n", WSAGetLastError()); return 1; }
-        { SOCKET s3 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-          if (bind(s3, (struct sockaddr *)&p, sizeof(p)) == 0) { printf("clash s3 bound WITHOUT reuse against holders\n"); return 1; }
-          if (WSAGetLastError() != WSAEADDRINUSE) { printf("clash s3 wrong err %d\n", WSAGetLastError()); return 1; }
-          closesocket(s3); }
+        if (bind(s1, (struct sockaddr *)&p, sizeof(p))) {
+            printf("clash s1 fail %d\n", WSAGetLastError());
+            return 1;
+        }
+        if (bind(s2, (struct sockaddr *)&p, sizeof(p))) {
+            printf("clash s2 fail %d\n", WSAGetLastError());
+            return 1;
+        }
+        {
+            SOCKET s3 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (bind(s3, (struct sockaddr *)&p, sizeof(p)) == 0) {
+                printf("clash s3 bound WITHOUT reuse against holders\n");
+                return 1;
+            }
+            if (WSAGetLastError() != WSAEADDRINUSE) {
+                printf("clash s3 wrong err %d\n", WSAGetLastError());
+                return 1;
+            }
+            closesocket(s3);
+        }
         struct sockaddr_in chk;
         int cl = sizeof(chk);
         getsockname(s2, (struct sockaddr *)&chk, &cl); /* must read as qport */
@@ -69,8 +87,9 @@ int main(int argc, char **argv) {
          * only network is the tunnel). */
         int iso = 0;
         char ev[8];
-        if (GetEnvironmentVariableA("LAN_HOOK_LAN_ONLY", ev, sizeof(ev)) > 0
-            && ev[0] && ev[0] != '0') iso = 1;
+        if (GetEnvironmentVariableA("LAN_HOOK_LAN_ONLY", ev, sizeof(ev)) > 0 && ev[0] &&
+            ev[0] != '0')
+            iso = 1;
         int found = 0, count = 0, idx_ok = 0, prefix_ok = 0;
         ULONG len = 0;
         GetAdaptersAddresses(AF_INET, 0, 0, 0, &len);
@@ -82,66 +101,77 @@ int main(int argc, char **argv) {
                 count++;
                 for (u = p->FirstUnicastAddress; u; u = u->Next) {
                     char *s2;
-                    if (!u->Address.lpSockaddr ||
-                        u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                    if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET)
+                        continue;
                     s2 = inet_ntoa(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr);
                     if (s2 && !strncmp(s2, "10.200.", 7)) {
                         found = 1;
                         prefix_ok = (u->OnLinkPrefixLength == 24);
                         idx_ok = (p->IfIndex == 0x7F000001u);
                         printf("ifprobe iface idx=%lu addr=%s prefix=%u\n",
-                               (unsigned long)p->IfIndex, s2,
-                               (unsigned)u->OnLinkPrefixLength);
+                               (unsigned long)p->IfIndex, s2, (unsigned)u->OnLinkPrefixLength);
                     }
                 }
             }
         }
         free(ad);
         {
-        int found2 = 0, count2 = 0;
-        ULONG l2 = 0;
-        GetAdaptersInfo(NULL, &l2);
-        if (l2) {
-            IP_ADAPTER_INFO *i2 = (IP_ADAPTER_INFO *)malloc(l2 + 1024);
-            if (i2 && GetAdaptersInfo(i2, &l2) == 0) {
-                IP_ADAPTER_INFO *q;
-                for (q = i2; q; q = q->Next) {
-                    count2++;
-                    if (!strncmp(q->IpAddressList.IpAddress.String, "10.200.", 7)) {
-                        found2 = 1;
-                        printf("ifprobe2 desc=%s addr=%s mask=%s\n",
-                               q->Description, q->IpAddressList.IpAddress.String,
-                               q->IpAddressList.IpMask.String);
+            int found2 = 0, count2 = 0;
+            ULONG l2 = 0;
+            GetAdaptersInfo(NULL, &l2);
+            if (l2) {
+                IP_ADAPTER_INFO *i2 = (IP_ADAPTER_INFO *)malloc(l2 + 1024);
+                if (i2 && GetAdaptersInfo(i2, &l2) == 0) {
+                    IP_ADAPTER_INFO *q;
+                    for (q = i2; q; q = q->Next) {
+                        count2++;
+                        if (!strncmp(q->IpAddressList.IpAddress.String, "10.200.", 7)) {
+                            found2 = 1;
+                            printf("ifprobe2 desc=%s addr=%s mask=%s\n", q->Description,
+                                   q->IpAddressList.IpAddress.String,
+                                   q->IpAddressList.IpMask.String);
+                        }
                     }
                 }
+                free(i2);
             }
-            free(i2);
-        }
-        printf("ifprobe count=%d found=%d count2=%d found2=%d idx=%d prefix=%d\n",
-               count, found, count2, found2, idx_ok, prefix_ok);
-        fflush(stdout);
-        if (!found || !found2) { printf("IF_MISS\n"); return 1; }
-        if (iso) {
-            if (count == 1 && count2 == 1 && idx_ok && prefix_ok) {
-                printf("IF_ISO_OK\n"); return 0;
+            printf("ifprobe count=%d found=%d count2=%d found2=%d idx=%d prefix=%d\n", count, found,
+                   count2, found2, idx_ok, prefix_ok);
+            fflush(stdout);
+            if (!found || !found2) {
+                printf("IF_MISS\n");
+                return 1;
             }
-            printf("IF_ISO_BAD count=%d count2=%d idx=%d prefix=%d\n",
-                   count, count2, idx_ok, prefix_ok);
-            return 1;
-        }
-        printf("IF_OK\n");
-        return 0;
+            if (iso) {
+                if (count == 1 && count2 == 1 && idx_ok && prefix_ok) {
+                    printf("IF_ISO_OK\n");
+                    return 0;
+                }
+                printf("IF_ISO_BAD count=%d count2=%d idx=%d prefix=%d\n", count, count2, idx_ok,
+                       prefix_ok);
+                return 1;
+            }
+            printf("IF_OK\n");
+            return 0;
         }
     }
     if (!strcmp(argv[1], "host")) {
         Sleep(4000); /* well past LanHookInit: this load is "late" */
-        char dir[MAX_PATH]; GetModuleFileNameA(NULL, dir, sizeof(dir));
-        char *bs = strrchr(dir, '\\'); if (bs) bs[1] = 0;
+        char dir[MAX_PATH];
+        GetModuleFileNameA(NULL, dir, sizeof(dir));
+        char *bs = strrchr(dir, '\\');
+        if (bs) bs[1] = 0;
         strcat(dir, "test_lateplug.dll");
         HMODULE h = LoadLibraryA(dir);
-        if (!h) { printf("load failed %lu\n", GetLastError()); return 1; }
+        if (!h) {
+            printf("load failed %lu\n", GetLastError());
+            return 1;
+        }
         run_fn r = (run_fn)(void *)GetProcAddress(h, "run");
-        if (!r) { printf("no run export\n"); return 1; }
+        if (!r) {
+            printf("no run export\n");
+            return 1;
+        }
         /* shim check: our virtual address must appear as a local one */
         {
             ULONG len = 0;
@@ -153,13 +183,17 @@ int main(int argc, char **argv) {
                 if (ad && GetAdaptersAddresses(AF_INET, 0, 0, ad, &len) == 0) {
                     IP_ADAPTER_ADDRESSES *p;
                     for (p = ad; p && !found; p = p->Next)
-                        for (PIP_ADAPTER_UNICAST_ADDRESS u = p->FirstUnicastAddress;
-                             u; u = u->Next) {
+                        for (PIP_ADAPTER_UNICAST_ADDRESS u = p->FirstUnicastAddress; u;
+                             u = u->Next) {
                             char *s;
                             if (!u->Address.lpSockaddr ||
-                                u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                                u->Address.lpSockaddr->sa_family != AF_INET)
+                                continue;
                             s = inet_ntoa(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr);
-                            if (s && !strncmp(s, "10.200.", 7)) { found = 1; printf("iface %s\n", s); }
+                            if (s && !strncmp(s, "10.200.", 7)) {
+                                found = 1;
+                                printf("iface %s\n", s);
+                            }
                         }
                 }
             }
@@ -167,7 +201,8 @@ int main(int argc, char **argv) {
             free(ad);
         }
         fflush(stdout);
-        printf("plugin loaded late, serving\n"); fflush(stdout);
+        printf("plugin loaded late, serving\n");
+        fflush(stdout);
         r(qport, aport); /* blocks ~10s answering queries */
         return 0;
     }
@@ -181,7 +216,10 @@ int main(int argc, char **argv) {
     ab.sin_family = AF_INET;
     ab.sin_addr.s_addr = INADDR_ANY;
     ab.sin_port = htons((unsigned short)aport);
-    if (bind(a, (struct sockaddr *)&ab, sizeof(ab))) { printf("bind fail %d\n", WSAGetLastError()); return 1; }
+    if (bind(a, (struct sockaddr *)&ab, sizeof(ab))) {
+        printf("bind fail %d\n", WSAGetLastError());
+        return 1;
+    }
     unsigned long nb = 1;
     ioctlsocket(a, FIONBIO, &nb);
     struct sockaddr_in qb;
@@ -190,7 +228,10 @@ int main(int argc, char **argv) {
     qb.sin_addr.s_addr = INADDR_ANY;
     qb.sin_port = htons((unsigned short)qport); /* like a real lobby tool */
     setsockopt(q, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
-    if (bind(q, (struct sockaddr *)&qb, sizeof(qb))) { printf("qbind fail %d\n", WSAGetLastError()); return 1; }
+    if (bind(q, (struct sockaddr *)&qb, sizeof(qb))) {
+        printf("qbind fail %d\n", WSAGetLastError());
+        return 1;
+    }
     ioctlsocket(q, FIONBIO, &nb);
     setsockopt(q, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
     struct sockaddr_in dst;

@@ -12,7 +12,11 @@ static volatile int g_stop = 0;
 
 __declspec(dllexport) void run(int query_port, int answer_port) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) { printf("plug socket fail %d\n", WSAGetLastError()); fflush(stdout); return; }
+    if (s == INVALID_SOCKET) {
+        printf("plug socket fail %d\n", WSAGetLastError());
+        fflush(stdout);
+        return;
+    }
     int on = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
     struct sockaddr_in a;
@@ -21,8 +25,10 @@ __declspec(dllexport) void run(int query_port, int answer_port) {
     a.sin_addr.s_addr = INADDR_ANY;
     a.sin_port = htons((unsigned short)query_port);
     if (bind(s, (struct sockaddr *)&a, sizeof(a))) {
-        printf("plug bind fail %d\n", WSAGetLastError()); fflush(stdout);
-        closesocket(s); return;
+        printf("plug bind fail %d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(s);
+        return;
     }
     unsigned long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
@@ -32,7 +38,7 @@ __declspec(dllexport) void run(int query_port, int answer_port) {
     to.sin_addr.s_addr = INADDR_BROADCAST;
     to.sin_port = htons((unsigned short)answer_port);
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
-    for (int i = 0; i < 3600 && !g_stop; i++) {   /* serve ~90s */
+    for (int i = 0; i < 3600 && !g_stop; i++) { /* serve ~90s */
         char buf[256];
         struct sockaddr_in from;
         int fl = sizeof(from);
@@ -53,7 +59,9 @@ __declspec(dllexport) void run(int query_port, int answer_port) {
     closesocket(s);
 }
 
-__declspec(dllexport) void stopper(void) { g_stop = 1; }
+__declspec(dllexport) void stopper(void) {
+    g_stop = 1;
+}
 
 BOOL APIENTRY DllMain(HMODULE h, DWORD why, LPVOID r) {
     (void)r;

@@ -1,6 +1,6 @@
-/* hk_wininst.inc - IAT patching, env publish, LanHookInit, DllMain (Windows only)
- * Part of lan_hook.c; see the note there before editing. */
-#ifndef LINUX_BUILD
+#include "hk_mod.h"
+
+/* hk_wininst.c - IAT patch, env publish, LanHookInit */
 
 /* Guarded entry points: a bad module is skipped, never fatal. */
 /* Patching is re-entrant across threads (init, LoadLibrary hooks on app
@@ -18,8 +18,7 @@ static void patch_iat(HMODULE mod) {
     EnterCriticalSection(&g_pcs);
     if (mod != g_hself) {
         char path[MAX_PATH] = {0};
-        if (GetModuleFileNameA(mod, path, sizeof(path) - 1) &&
-            !module_allowed(path)) {
+        if (GetModuleFileNameA(mod, path, sizeof(path) - 1) && !module_allowed(path)) {
             dbg("lan_hook: module not in allowlist, skipped\n");
             LeaveCriticalSection(&g_pcs);
             return;
@@ -33,9 +32,13 @@ static void patch_iat(HMODULE mod) {
     g_seh_armed = 1;
     patch_iat_inner(mod);
     g_seh_armed = 0;
-    {   /* remember: the sweep only revisits modules it has never seen */
+    { /* remember: the sweep only revisits modules it has never seen */
         int i, have = 0;
-        for (i = 0; i < g_nseen; i++) if (g_seen[i] == mod) { have = 1; break; }
+        for (i = 0; i < g_nseen; i++)
+            if (g_seen[i] == mod) {
+                have = 1;
+                break;
+            }
         if (!have && g_nseen < DT_MAXSEEN) g_seen[g_nseen++] = mod;
     }
     LeaveCriticalSection(&g_pcs);
@@ -43,27 +46,37 @@ static void patch_iat(HMODULE mod) {
 
 static void patch_all(int force) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE) { patch_iat(GetModuleHandleA(NULL)); return; }
-    MODULEENTRY32 me; me.dwSize = sizeof(me);
+    if (snap == INVALID_HANDLE_VALUE) {
+        patch_iat(GetModuleHandleA(NULL));
+        return;
+    }
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
     int n = 0;
     /* skip our own module: tunnel threads must call the real Winsock */
     if (Module32First(snap, &me)) do {
-        if (me.hModule == g_hself || me.hModule == NULL) continue;
-        if (!force) {
-            int i, have = 0;
-            EnterCriticalSection(&g_pcs);
-            for (i = 0; i < g_nseen; i++) if (g_seen[i] == me.hModule) { have = 1; break; }
-            LeaveCriticalSection(&g_pcs);
-            if (have) continue;
-        }
-        patch_iat(me.hModule);
-        n++;
-    } while (Module32Next(snap, &me));
+            if (me.hModule == g_hself || me.hModule == NULL) continue;
+            if (!force) {
+                int i, have = 0;
+                EnterCriticalSection(&g_pcs);
+                for (i = 0; i < g_nseen; i++)
+                    if (g_seen[i] == me.hModule) {
+                        have = 1;
+                        break;
+                    }
+                LeaveCriticalSection(&g_pcs);
+                if (have) continue;
+            }
+            patch_iat(me.hModule);
+            n++;
+        } while (Module32Next(snap, &me));
     CloseHandle(snap);
     if (force || n > 0) {
         char lb[96];
-        snprintf(lb, sizeof(lb), force ? "lan_hook: patched %d modules\n"
-                                       : "lan_hook: late-patched %d new modules\n", n);
+        snprintf(lb, sizeof(lb),
+                 force ? "lan_hook: patched %d modules\n"
+                       : "lan_hook: late-patched %d new modules\n",
+                 n);
         dbg(lb);
     }
 }
@@ -83,12 +96,30 @@ static DWORD WINAPI dt_sweep_thread(LPVOID u) {
 }
 
 /* LoadLibrary hooks: patch newcomers too. */
-static PFN_LoadLibraryA p_LoadLibraryA = 0; static PFN_LoadLibraryW p_LoadLibraryW = 0;
-static PFN_LoadLibraryExA p_LoadLibraryExA = 0; static PFN_LoadLibraryExW p_LoadLibraryExW = 0;
-HMODULE WINAPI hk_LoadLibraryA(LPCSTR n) { HMODULE h = p_LoadLibraryA(n); if (h && h != g_hself) patch_iat(h); return h; }
-HMODULE WINAPI hk_LoadLibraryW(LPCWSTR n) { HMODULE h = p_LoadLibraryW(n); if (h && h != g_hself) patch_iat(h); return h; }
-HMODULE WINAPI hk_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExA(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
-HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { HMODULE h = p_LoadLibraryExW(n,f,fl); if (h && h != g_hself) patch_iat(h); return h; }
+PFN_LoadLibraryA p_LoadLibraryA = 0;
+PFN_LoadLibraryW p_LoadLibraryW = 0;
+PFN_LoadLibraryExA p_LoadLibraryExA = 0;
+PFN_LoadLibraryExW p_LoadLibraryExW = 0;
+HMODULE WINAPI hk_LoadLibraryA(LPCSTR n) {
+    HMODULE h = p_LoadLibraryA(n);
+    if (h && h != g_hself) patch_iat(h);
+    return h;
+}
+HMODULE WINAPI hk_LoadLibraryW(LPCWSTR n) {
+    HMODULE h = p_LoadLibraryW(n);
+    if (h && h != g_hself) patch_iat(h);
+    return h;
+}
+HMODULE WINAPI hk_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) {
+    HMODULE h = p_LoadLibraryExA(n, f, fl);
+    if (h && h != g_hself) patch_iat(h);
+    return h;
+}
+HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) {
+    HMODULE h = p_LoadLibraryExW(n, f, fl);
+    if (h && h != g_hself) patch_iat(h);
+    return h;
+}
 
 /* Sub-process hooking: a launcher tool that
  * spawns the real game gets the hook carried into each child automatically.
@@ -96,14 +127,8 @@ HMODULE WINAPI hk_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { HMODULE h = p_
  * launching unhooked rather than breaking the game. Filter with
  * LAN_HOOK_CHILDREN=a.exe,b.exe (substring list, empty = all children);
  * LAN_HOOK_NOCHILD=1 disables child injection entirely. */
-typedef BOOL (WINAPI *PFN_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
-    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR,
-    LPSTARTUPINFOA, LPPROCESS_INFORMATION);
-typedef BOOL (WINAPI *PFN_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
-    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR,
-    LPSTARTUPINFOW, LPPROCESS_INFORMATION);
-static PFN_CreateProcessA p_CreateProcessA = 0;
-static PFN_CreateProcessW p_CreateProcessW = 0;
+PFN_CreateProcessA p_CreateProcessA = 0;
+PFN_CreateProcessW p_CreateProcessW = 0;
 
 static int child_wanted(const char *image) {
     const char *e = getenv("LAN_HOOK_NOCHILD");
@@ -120,8 +145,12 @@ static int child_wanted(const char *image) {
             if (!*t) continue;
             const char *a = image;
             for (; *a; a++) {
-                const char *x = a; const char *y = t;
-                while (*y && tolower((unsigned char)*x) == tolower((unsigned char)*y)) { x++; y++; }
+                const char *x = a;
+                const char *y = t;
+                while (*y && tolower((unsigned char)*x) == tolower((unsigned char)*y)) {
+                    x++;
+                    y++;
+                }
                 if (!*y) return 1;
             }
         }
@@ -139,10 +168,16 @@ static void child_image(const char *app, const char *cmd, char *out, size_t n) {
         out[n - 1] = 0;
         return;
     }
-    if (!cmd) { out[0] = 0; return; }
+    if (!cmd) {
+        out[0] = 0;
+        return;
+    }
     src = cmd;
     while (*src == ' ') src++;
-    if (*src == '"') { quoted = 1; src++; }
+    if (*src == '"') {
+        quoted = 1;
+        src++;
+    }
     {
         size_t i = 0;
         for (; *src && i + 1 < n; src++) {
@@ -172,7 +207,10 @@ static void inject_child(PROCESS_INFORMATION *pi) {
     k = GetModuleHandleA("kernel32.dll");
     fn = (LPTHREAD_START_ROUTINE)GetProcAddress(k, "LoadLibraryA");
     th = CreateRemoteThread(pi->hProcess, NULL, 0, fn, mem, 0, NULL);
-    if (!th) { VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE); return; }
+    if (!th) {
+        VirtualFreeEx(pi->hProcess, mem, 0, MEM_RELEASE);
+        return;
+    }
     if (WaitForSingleObject(th, 30000) != WAIT_OBJECT_0) {
         dbg("lan_hook: child LoadLibrary timed out, continuing unhooked\n");
         CloseHandle(th);
@@ -203,7 +241,8 @@ static void inject_child(PROCESS_INFORMATION *pi) {
                         uintptr_t rva = (uintptr_t)localInit - (uintptr_t)g_hself;
                         LPTHREAD_START_ROUTINE rInit =
                             (LPTHREAD_START_ROUTINE)((uintptr_t)mods[i] + rva);
-                        HANDLE th2 = CreateRemoteThread(pi->hProcess, NULL, 0, rInit, NULL, 0, NULL);
+                        HANDLE th2 =
+                            CreateRemoteThread(pi->hProcess, NULL, 0, rInit, NULL, 0, NULL);
                         if (th2) {
                             DWORD st = 1;
                             if (WaitForSingleObject(th2, 30000) == WAIT_OBJECT_0)
@@ -249,7 +288,7 @@ static LPVOID dt_env_with_node(LPVOID env, DWORD flags) {
                 q += 14;
                 MultiByteToWideChar(CP_UTF8, 0, num, -1, q, 16);
                 q += wcslen(q);
-                q[0] = 0;   /* string terminator + block terminator */
+                q[0] = 0; /* string terminator + block terminator */
                 q[1] = 0;
             }
             return blk;
@@ -269,7 +308,7 @@ static LPVOID dt_env_with_node(LPVOID env, DWORD flags) {
             memcpy(blk, p, n);
             {
                 int w = snprintf(blk + n, 32, "LAN_HOOK_NODE=%s", num);
-                blk[n + (size_t)w + 1] = 0;   /* double-null terminate */
+                blk[n + (size_t)w + 1] = 0; /* double-null terminate */
             }
             return blk;
         }
@@ -277,9 +316,8 @@ static LPVOID dt_env_with_node(LPVOID env, DWORD flags) {
 }
 
 BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
-                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags,
-                              LPVOID env, LPCSTR dir, LPSTARTUPINFOA si,
-                              LPPROCESS_INFORMATION pi) {
+                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags, LPVOID env,
+                              LPCSTR dir, LPSTARTUPINFOA si, LPPROCESS_INFORMATION pi) {
     char image[MAX_PATH] = {0};
     BOOL wantSuspend;
     BOOL ok;
@@ -292,8 +330,7 @@ BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
     wantSuspend = (flags & CREATE_SUSPENDED) != 0;
     {
         LPVOID cenv = dt_env_with_node(env, flags);
-        ok = p_CreateProcessA(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
-                              cenv, dir, si, pi);
+        ok = p_CreateProcessA(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED, cenv, dir, si, pi);
         if (cenv != env) free(cenv);
     }
     if (!ok) return FALSE;
@@ -303,9 +340,8 @@ BOOL WINAPI hk_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES pa,
 }
 
 BOOL WINAPI hk_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
-                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags,
-                              LPVOID env, LPCWSTR dir, LPSTARTUPINFOW si,
-                              LPPROCESS_INFORMATION pi) {
+                              LPSECURITY_ATTRIBUTES ta, BOOL inh, DWORD flags, LPVOID env,
+                              LPCWSTR dir, LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi) {
     char image[MAX_PATH] = {0};
     char appA[MAX_PATH] = {0}, cmdA[8192] = {0};
     BOOL wantSuspend;
@@ -321,8 +357,7 @@ BOOL WINAPI hk_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
     wantSuspend = (flags & CREATE_SUSPENDED) != 0;
     {
         LPVOID cenv = dt_env_with_node(env, flags);
-        ok = p_CreateProcessW(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED,
-                              cenv, dir, si, pi);
+        ok = p_CreateProcessW(app, cmd, pa, ta, inh, flags | CREATE_SUSPENDED, cenv, dir, si, pi);
         if (cenv != env) free(cenv);
     }
     if (!ok) return FALSE;
@@ -334,34 +369,38 @@ BOOL WINAPI hk_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
 static void patch_loader_iat_inner(void) {
     /* patch kernel32 LoadLibrary imports in exe so future DLLs get hooked */
     HMODULE exe = GetModuleHandleA(NULL);
-    BYTE *base = (BYTE*)exe;
+    BYTE *base = (BYTE *)exe;
     {
-        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-        IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR*)(base +
-            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        IMAGE_IMPORT_DESCRIPTOR *desc =
+            (IMAGE_IMPORT_DESCRIPTOR *)(base + nt->OptionalHeader
+                                                   .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                                                   .VirtualAddress);
         for (; desc->Name; desc++) {
-            char *dll = (char*)(base + desc->Name);
+            char *dll = (char *)(base + desc->Name);
             if (_stricmp(dll, "kernel32.dll")) continue;
-            IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
-            IMAGE_THUNK_DATA *orig = desc->OriginalFirstThunk ? (IMAGE_THUNK_DATA*)(base + desc->OriginalFirstThunk) : 0;
+            IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
+            IMAGE_THUNK_DATA *orig = desc->OriginalFirstThunk
+                                         ? (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk)
+                                         : 0;
             HMODULE hExp = GetModuleHandleA("kernel32.dll");
             for (; iat->u1.Function; iat++, orig ? orig++ : 0) {
                 char *fn = 0;
                 char ordname[40];
                 IMAGE_THUNK_DATA *lu = orig ? orig : iat;
                 if (IMAGE_SNAP_BY_ORDINAL(lu->u1.Ordinal)) {
-                    const char *rn = export_name_for_ordinal(
-                        hExp, IMAGE_ORDINAL(lu->u1.Ordinal));
+                    const char *rn = export_name_for_ordinal(hExp, IMAGE_ORDINAL(lu->u1.Ordinal));
                     if (!rn) continue;
                     strncpy(ordname, rn, sizeof(ordname) - 1);
                     ordname[sizeof(ordname) - 1] = 0;
                     fn = ordname;
                 } else {
-                    IMAGE_IMPORT_BY_NAME *nm = (IMAGE_IMPORT_BY_NAME*)(base + lu->u1.AddressOfData);
+                    IMAGE_IMPORT_BY_NAME *nm =
+                        (IMAGE_IMPORT_BY_NAME *)(base + lu->u1.AddressOfData);
                     if (!nm) continue;
-                    fn = (char*)nm->Name;
+                    fn = (char *)nm->Name;
                 }
                 FARPROC rep = 0;
                 if (!strcmp(fn, "LoadLibraryA")) rep = (FARPROC)hk_LoadLibraryA;
@@ -370,9 +409,9 @@ static void patch_loader_iat_inner(void) {
                 else if (!strcmp(fn, "LoadLibraryExW")) rep = (FARPROC)hk_LoadLibraryExW;
                 if (rep) {
                     DWORD old = 0;
-                    if (VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+                    if (VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &old)) {
                         iat->u1.Function = (ULONG_PTR)rep;
-                        VirtualProtect(&iat->u1.Function, sizeof(void*), old, &old);
+                        VirtualProtect(&iat->u1.Function, sizeof(void *), old, &old);
                     }
                 }
             }
@@ -396,8 +435,7 @@ static void patch_loader_iat(void) {
  * LoadLibrary succeeds. Returns 0 on success. */
 __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     static volatile LONG done = 0;
-    if (InterlockedCompareExchange(&done, 1, 0) != 0)
-        return 0; /* already initialized */
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return 0; /* already initialized */
     (void)unused;
     flog_open();
     flog("LanHookInit: enter");
@@ -409,7 +447,10 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
         return 2;
     }
     g_init_armed = 1;
-    if (!g_dcs_init) { InitializeCriticalSection(&g_dcs); g_dcs_init = 1; }
+    if (!g_dcs_init) {
+        InitializeCriticalSection(&g_dcs);
+        g_dcs_init = 1;
+    }
     flog("LanHookInit: resolving imports");
     hWS2 = GetModuleHandleA("ws2_32.dll");
     if (!hWS2) hWS2 = LoadLibraryA("ws2_32.dll");
@@ -428,7 +469,8 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     {
         HMODULE hIPH = LoadLibraryA("iphlpapi.dll");
         if (hIPH) {
-            p_GetAdaptersAddresses = (PFN_GetAdaptersAddresses)GetProcAddress(hIPH, "GetAdaptersAddresses");
+            p_GetAdaptersAddresses =
+                (PFN_GetAdaptersAddresses)GetProcAddress(hIPH, "GetAdaptersAddresses");
             p_GetAdaptersInfo = (PFN_GetAdaptersInfo)GetProcAddress(hIPH, "GetAdaptersInfo");
             p_IcmpSendEcho = (PFN_IcmpSendEcho)GetProcAddress(hIPH, "IcmpSendEcho");
             p_IcmpSendEcho2 = (PFN_IcmpSendEcho2)GetProcAddress(hIPH, "IcmpSendEcho2");
@@ -444,7 +486,8 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     p_ioctlsocket = (PFN_ioctlsocket)GetProcAddress(hWS2, "ioctlsocket");
     p_WSAEventSelect = (PFN_WSAEventSelect)GetProcAddress(hWS2, "WSAEventSelect");
     p_WSAEnumNetworkEvents = (PFN_WSAEnumNetworkEvents)GetProcAddress(hWS2, "WSAEnumNetworkEvents");
-    p_WSAWaitForMultipleEvents = (PFN_WSAWaitForMultipleEvents)GetProcAddress(hWS2, "WSAWaitForMultipleEvents");
+    p_WSAWaitForMultipleEvents =
+        (PFN_WSAWaitForMultipleEvents)GetProcAddress(hWS2, "WSAWaitForMultipleEvents");
     p_WSACreateEvent = (PFN_WSACreateEvent)GetProcAddress(hWS2, "WSACreateEvent");
     p_WSACloseEvent = (PFN_WSACloseEvent)GetProcAddress(hWS2, "WSACloseEvent");
     p_GetProcAddress = (PFN_GetProcAddress)GetProcAddress(hKernel, "GetProcAddress");
@@ -459,9 +502,14 @@ __declspec(dllexport) DWORD WINAPI LanHookInit(LPVOID unused) {
     flog("LanHookInit: policy ready");
     dt_log_options();
     {
-        WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
+        WSADATA wd;
+        WSAStartup(MAKEWORD(2, 2), &wd);
     }
-    if (g_direct) { dbg("lan_hook: starting tunnel\n"); flog("LanHookInit: starting tunnel"); dt_start(); }
+    if (g_direct) {
+        dbg("lan_hook: starting tunnel\n");
+        flog("LanHookInit: starting tunnel");
+        dt_start();
+    }
     dbg("lan_hook: patching modules\n");
     flog("LanHookInit: patching modules");
     InitializeCriticalSection(&g_pcs);
@@ -491,5 +539,3 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID r) {
     }
     return TRUE;
 }
-
-#endif

@@ -46,10 +46,11 @@ static HMODULE find_remote(HANDLE hProcess, const char *dllfull) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: injector.exe [--server HOST] [--port PORT] [--token SECRET]\n"
-        "                    [--ports LIST] [--udp-over-tcp] [-e KEY=VAL]... [--debug] [--]\n"
-        "                    <hook.dll> <game.exe> [game args...]\n"
-        "example: injector.exe --server 203.0.113.10 --port 47777 --token SECRET -- lan_hook64.dll game.exe -windowed\n");
+            "usage: injector.exe [--server HOST] [--port PORT] [--token SECRET]\n"
+            "                    [--ports LIST] [--udp-over-tcp] [-e KEY=VAL]... [--debug] [--]\n"
+            "                    <hook.dll> <game.exe> [game args...]\n"
+            "example: injector.exe --server 203.0.113.10 --port 47777 --token SECRET -- "
+            "lan_hook64.dll game.exe -windowed\n");
 }
 
 static int starts_with(const char *s, const char *pre) {
@@ -64,7 +65,10 @@ int main(int argc, char **argv) {
     int opts_done = 0;
     for (; i < argc && !opts_done; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "--")) { i++; break; }
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
         if (!strcmp(a, "--server") && i + 1 < argc) server = argv[++i];
         else if (starts_with(a, "--server=")) server = a + 9;
         else if (!strcmp(a, "--port") && i + 1 < argc) port = argv[++i];
@@ -77,12 +81,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--debug")) debug = 1;
         else if (!strcmp(a, "-e") && i + 1 < argc) {
             char *kv = argv[++i], *eq = strchr(kv, '=');
-            if (!eq) { fprintf(stderr, "-e needs KEY=VAL\n"); return 2; }
+            if (!eq) {
+                fprintf(stderr, "-e needs KEY=VAL\n");
+                return 2;
+            }
             *eq = 0;
             SetEnvironmentVariableA(kv, eq + 1);
         } else if (starts_with(a, "-e") && strlen(a) > 2) {
             char *kv = _strdup(a + 2), *eq = strchr(kv, '=');
-            if (!eq) { fprintf(stderr, "-e needs KEY=VAL\n"); return 2; }
+            if (!eq) {
+                fprintf(stderr, "-e needs KEY=VAL\n");
+                return 2;
+            }
             *eq = 0;
             SetEnvironmentVariableA(kv, eq + 1);
             free(kv);
@@ -101,20 +111,28 @@ int main(int argc, char **argv) {
     if (udptcp) SetEnvironmentVariableA("LAN_HOOK_UDP_OVER_TCP", "1");
     if (debug) SetEnvironmentVariableA("LAN_HOOK_DEBUG", "1");
 
-    if (argc - i < 2) { usage(); return 2; }
+    if (argc - i < 2) {
+        usage();
+        return 2;
+    }
     const char *dll = argv[i++];
     /* remaining argv[i..] is game + game args (may start with '-') */
     char cmd[8192] = {0};
     for (int j = i; j < argc; j++) {
         if (j > i) strcat(cmd, " ");
-        if (strchr(argv[j], ' ')) { strcat(cmd, "\""); strcat(cmd, argv[j]); strcat(cmd, "\""); }
-        else strcat(cmd, argv[j]);
+        if (strchr(argv[j], ' ')) {
+            strcat(cmd, "\"");
+            strcat(cmd, argv[j]);
+            strcat(cmd, "\"");
+        } else strcat(cmd, argv[j]);
     }
     char dllfull[MAX_PATH];
     GetFullPathNameA(dll, sizeof(dllfull), dllfull, NULL);
 
-    STARTUPINFOA si; PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
     if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
         fprintf(stderr, "CreateProcess failed %lu\n", GetLastError());
@@ -122,18 +140,34 @@ int main(int argc, char **argv) {
     }
     size_t n = strlen(dllfull) + 1;
     LPVOID mem = VirtualAllocEx(pi.hProcess, NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!mem) { fprintf(stderr, "VirtualAllocEx %lu\n", GetLastError()); TerminateProcess(pi.hProcess, 1); return 1; }
+    if (!mem) {
+        fprintf(stderr, "VirtualAllocEx %lu\n", GetLastError());
+        TerminateProcess(pi.hProcess, 1);
+        return 1;
+    }
     if (!WriteProcessMemory(pi.hProcess, mem, dllfull, n, NULL)) {
-        fprintf(stderr, "WriteProcessMemory %lu\n", GetLastError()); TerminateProcess(pi.hProcess, 1); return 1;
+        fprintf(stderr, "WriteProcessMemory %lu\n", GetLastError());
+        TerminateProcess(pi.hProcess, 1);
+        return 1;
     }
     HMODULE k = GetModuleHandleA("kernel32.dll");
     LPTHREAD_START_ROUTINE fn = (LPTHREAD_START_ROUTINE)GetProcAddress(k, "LoadLibraryA");
     HANDLE th = CreateRemoteThread(pi.hProcess, NULL, 0, fn, mem, 0, NULL);
-    if (!th) { fprintf(stderr, "CreateRemoteThread %lu\n", GetLastError()); TerminateProcess(pi.hProcess, 1); return 1; }
+    if (!th) {
+        fprintf(stderr, "CreateRemoteThread %lu\n", GetLastError());
+        TerminateProcess(pi.hProcess, 1);
+        return 1;
+    }
     WaitForSingleObject(th, INFINITE);
-    DWORD code = 0; GetExitCodeThread(th, &code);
-    CloseHandle(th); VirtualFreeEx(pi.hProcess, mem, 0, MEM_RELEASE);
-    if (!code) { fprintf(stderr, "remote LoadLibrary failed\n"); TerminateProcess(pi.hProcess, 1); return 1; }
+    DWORD code = 0;
+    GetExitCodeThread(th, &code);
+    CloseHandle(th);
+    VirtualFreeEx(pi.hProcess, mem, 0, MEM_RELEASE);
+    if (!code) {
+        fprintf(stderr, "remote LoadLibrary failed\n");
+        TerminateProcess(pi.hProcess, 1);
+        return 1;
+    }
     /* Stage 2: run LanHookInit on a normal remote thread (outside the
      * loader lock). The remote base comes from module enumeration:
      * thread exit codes are DWORD and would truncate a 64-bit HMODULE.
@@ -145,13 +179,13 @@ int main(int argc, char **argv) {
             HMODULE remote = find_remote(pi.hProcess, dllfull);
             if (localInit && remote) {
                 uintptr_t rva = (uintptr_t)localInit - (uintptr_t)local;
-                LPTHREAD_START_ROUTINE rInit =
-                    (LPTHREAD_START_ROUTINE)((uintptr_t)remote + rva);
-                HANDLE th2 = CreateRemoteThread(pi.hProcess, NULL, 0, rInit,
-                                                NULL, 0, NULL);
+                LPTHREAD_START_ROUTINE rInit = (LPTHREAD_START_ROUTINE)((uintptr_t)remote + rva);
+                HANDLE th2 = CreateRemoteThread(pi.hProcess, NULL, 0, rInit, NULL, 0, NULL);
                 if (!th2) {
-                    fprintf(stderr, "warning: LanHookInit remote thread failed %lu (hook loaded but idle)\n",
-                            GetLastError());
+                    fprintf(
+                        stderr,
+                        "warning: LanHookInit remote thread failed %lu (hook loaded but idle)\n",
+                        GetLastError());
                 } else {
                     WaitForSingleObject(th2, INFINITE);
                     DWORD st = 1;
@@ -164,15 +198,15 @@ int main(int argc, char **argv) {
                                 st == 200 ? "cannot reach relay"
                                           : "no virtual-IP lease from relay");
                         TerminateProcess(pi.hProcess, st);
-                        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        CloseHandle(pi.hProcess);
                         return (int)st;
                     } else if (st == 2)
-                        fprintf(stderr, "warning: LanHookInit hit a guarded fault; "
+                        fprintf(stderr,
+                                "warning: LanHookInit hit a guarded fault; "
                                 "see lan_hook_<pid>.dmp next to the game and the hook log\n");
-                    else if (st != 0)
-                        fprintf(stderr, "warning: LanHookInit returned %lu\n", st);
-                    else
-                        printf("hook initialized\n");
+                    else if (st != 0) fprintf(stderr, "warning: LanHookInit returned %lu\n", st);
+                    else printf("hook initialized\n");
                 }
             } else {
                 fprintf(stderr, "warning: old DLL without LanHookInit (hook loaded but idle)\n");
@@ -186,12 +220,14 @@ int main(int argc, char **argv) {
          * so read the live OS environment for display. The child always
          * inherits the values set above regardless. */
         char srv[256] = "(unset)", prt[32] = "47777", tok[16] = "(unset)";
-        if (GetEnvironmentVariableA("LAN_HOOK_SERVER", srv, sizeof(srv)) == 0) strcpy(srv, "(unset)");
+        if (GetEnvironmentVariableA("LAN_HOOK_SERVER", srv, sizeof(srv)) == 0)
+            strcpy(srv, "(unset)");
         if (GetEnvironmentVariableA("LAN_HOOK_PORT", prt, sizeof(prt)) == 0) strcpy(prt, "47777");
         if (GetEnvironmentVariableA("LAN_HOOK_TOKEN", tok, sizeof(tok)) != 0) strcpy(tok, "set");
-        printf("injected %s -> pid %lu server=%s port=%s token=%s\n",
-               dllfull, (unsigned long)pi.dwProcessId, srv, prt, tok);
+        printf("injected %s -> pid %lu server=%s port=%s token=%s\n", dllfull,
+               (unsigned long)pi.dwProcessId, srv, prt, tok);
     }
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return 0;
 }
