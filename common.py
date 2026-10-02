@@ -13,7 +13,7 @@ import struct
 
 # TCP stream framing: [u32 len][u8 type][payload]
 HDR = struct.Struct("!I")
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 # ---- control-connection ops (one contiguous block) ----------------------
 # Registration is a SINGLE frame: identity (node id), reachability (UDP
