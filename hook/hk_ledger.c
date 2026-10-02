@@ -42,40 +42,56 @@ typedef struct {
 
 #ifdef LINUX_BUILD
 static int g_slp_fd = -1;
-static slp_t *g_slp = 0;
+static slp_t *volatile g_slp = 0;
+/* flock() excludes other open file descriptions, i.e. other PROCESSES;
+ * threads of one process share g_slp_fd and would all "hold" it at
+ * once. The mutex serializes them (and the one-time attach: two racing
+ * attaches used to swap g_slp_fd under a holder, whose unlock then hit
+ * the wrong fd and leaked the lock forever - every later bind hung). */
+static pthread_mutex_t g_slp_mu = PTHREAD_MUTEX_INITIALIZER;
 static int slp_attach(void) {
     /* ONE machine-wide registry object; entries carry the node id.
      * (A per-node name would leave a /dev/shm stub per random node id
      * forever - the object is kernel-refcounted, the NAME is not.) */
     if (g_slp) return 1;
     if (!g_slp_node) return 0;
-    int fd = shm_open("/slp-ports", O_CREAT | O_RDWR, 0600);
-    if (fd < 0) return 0;
-    if (ftruncate(fd, (off_t)sizeof(slp_t)) != 0) {
-        close(fd);
-        return 0;
+    pthread_mutex_lock(&g_slp_mu);
+    if (g_slp) {
+        pthread_mutex_unlock(&g_slp_mu);
+        return 1;
     }
-    void *p = mmap(0, sizeof(slp_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    int fd = shm_open("/slp-ports", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    void *p = MAP_FAILED;
+    if (fd >= 0 && ftruncate(fd, (off_t)sizeof(slp_t)) == 0)
+        p = mmap(0, sizeof(slp_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
-        close(fd);
+        if (fd >= 0) close(fd);
+        pthread_mutex_unlock(&g_slp_mu);
         return 0;
     }
-    g_slp_fd = fd;
-    g_slp = (slp_t *)p;
-    if (g_slp->magic != SLP_MAGIC) {
-        g_slp->magic = SLP_MAGIC;
-        g_slp->gen = 0;
-        memset(g_slp->e, 0, sizeof g_slp->e);
+    slp_t *s = (slp_t *)p;
+    flock(fd, LOCK_EX);
+    if (s->magic != SLP_MAGIC) {
+        s->gen = 0;
+        memset(s->e, 0, sizeof s->e);
+        s->magic = SLP_MAGIC;
     }
+    flock(fd, LOCK_UN);
+    g_slp_fd = fd;
+    __atomic_store_n(&g_slp, s, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_slp_mu);
     return 1;
 }
+/* callers lock only after seeing g_slp set; it is never unset */
 #define SLP_LOCK()                                                                                 \
     do {                                                                                           \
-        if (g_slp_fd >= 0) flock(g_slp_fd, LOCK_EX);                                               \
+        pthread_mutex_lock(&g_slp_mu);                                                             \
+        flock(g_slp_fd, LOCK_EX);                                                                  \
     } while (0)
 #define SLP_UNLOCK()                                                                               \
     do {                                                                                           \
-        if (g_slp_fd >= 0) flock(g_slp_fd, LOCK_UN);                                               \
+        flock(g_slp_fd, LOCK_UN);                                                                  \
+        pthread_mutex_unlock(&g_slp_mu);                                                           \
     } while (0)
 #else
 static HANDLE g_slp_mx = 0;
