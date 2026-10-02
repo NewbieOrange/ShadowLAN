@@ -900,14 +900,17 @@ class Relay:
                     survivors = self.live_links(node)
                     if not survivors:
                         asyncio.create_task(self.broadcast_assign())
-                    # only when the whole node goes dark close its
-                    # per-stream TCPs; the other end sees EOF and cleans
-                    # up on its side. Streams of a node that still has a
-                    # live sibling link stay up.
+                    # When the whole node goes dark, streams still in
+                    # handshake can never complete: fail them now. An
+                    # ESTABLISHED stream is its own TCP connection, like
+                    # on a LAN: an exiting process FINs it after its last
+                    # bytes (which may still be in flight - closing here
+                    # truncated them), a vanished host errors it. Its
+                    # pipe ends on that EOF/error by itself.
                     if not survivors:
                         for sid in list(self.node_streams.pop(node, ())):
                             st = self.streams.get(sid)
-                            if st is not None:
+                            if st is not None and st.get("state") != "ready":
                                 print(f"[stream] close (node {node} gone): "
                                       f"sid {sid}", flush=True)
                                 self._stream_pop(sid)
