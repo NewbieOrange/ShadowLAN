@@ -171,7 +171,36 @@ def main():
     okC2 = d2 is not None and d2.startswith("IF_ISO_OK")
     print("phase C isolate:", d2)
     cleanup()
-    ok = ok and okC1 and okC2
+    # ---- phase D: wake latency of the Windows wait doors ----
+    # A Linux-hooked echo peer on the same relay; the Wine client pings
+    # it through blocking recv, select and WSAPoll (TCP) and select /
+    # blocking recvfrom (UDP). Sleep-sliced doors measured 10-25 ms.
+    okD = False
+    from test_latency import PEER_A as ECHO_PEER
+    elog = os.path.join(tmp, "echo-hook.log")
+    eenv = dict(os.environ, LD_PRELOAD=os.path.join(HOOKDIR, "lan_hook.so"),
+                LAN_HOOK_SERVER="127.0.0.1", LAN_HOOK_PORT=str(PUB),
+                LAN_HOOK_TOKEN="", LAN_HOOK_DEBUG="1", LAN_HOOK_LEASE_WAIT="3000")
+    echo = subprocess.Popen([sys.executable, "-c", ECHO_PEER], env=eenv,
+                            stdout=subprocess.PIPE, stderr=open(elog, "w"), text=True)
+    vip = None
+    if echo.stdout.readline().startswith("A_READY"):
+        m = re.search(r"self=(10\.\d+\.\d+\.\d+)", open(elog, errors="replace").read())
+        vip = m.group(1) if m else None
+    if vip:
+        o3 = os.path.join(tmp, "wlat.out")
+        p3 = launch("wlat", winpath(os.path.join(tmp, "wlat-hook.log")), o3, ports=(vip,),
+                    extra={"LAN_HOOK_DEBUG": "0"})
+        d3 = wait_for(o3, r"WLAT_(OK|SLOW|FAIL)", 90)
+        p3.kill()
+        okD = d3 is not None and d3.startswith("WLAT_OK")
+        print("phase D:", (wait_for(o3, r"^WLAT ", 1) or ""), d3)
+    else:
+        print("phase D: echo peer never got a vnode")
+    echo.kill()
+    echo.wait()
+    cleanup()
+    ok = ok and okC1 and okC2 and okD
     if not ok:
         dump_tail(os.path.join(tmp, "host.out"), 6)
         dump_tail(cout, 6)

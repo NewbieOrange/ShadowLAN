@@ -14,6 +14,138 @@
 
 typedef void (*run_fn)(int, int);
 
+static int dbl_cmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+static double qpc_ms(LARGE_INTEGER a, LARGE_INTEGER b) {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+/* Wake latency of the Windows wait doors through the tunnel, against an
+ * echo peer (64-byte TCP echo on 47584 after an 'E' byte, UDP echo on
+ * 47585): median RTT per door. A sleep-sliced door shows 10-25 ms. */
+static int wlat(const char *ip) {
+    struct sockaddr_in t;
+    memset(&t, 0, sizeof(t));
+    t.sin_family = AF_INET;
+    t.sin_addr.s_addr = inet_addr(ip);
+    t.sin_port = htons(47584);
+    SOCKET s = INVALID_SOCKET;
+    for (int i = 0; i < 50 && s == INVALID_SOCKET; i++) {
+        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (connect(s, (struct sockaddr *)&t, sizeof(t)) != 0) {
+            closesocket(s);
+            s = INVALID_SOCKET;
+            Sleep(200);
+        }
+    }
+    if (s == INVALID_SOCKET) {
+        printf("WLAT_FAIL connect %d\n", WSAGetLastError());
+        return 1;
+    }
+    send(s, "E", 1, 0);
+    double med[5];
+    const char *names[5] = {"tcp_block", "tcp_select", "tcp_poll", "udp_select", "udp_block"};
+    for (int door = 0; door < 3; door++) {
+        double v[40];
+        for (int i = 0; i < 45; i++) {
+            char buf[64];
+            memset(buf, 'p', sizeof(buf));
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            send(s, buf, 64, 0);
+            int got = 0;
+            while (got < 64) {
+                if (door == 1) {
+                    fd_set rf;
+                    FD_ZERO(&rf);
+                    FD_SET(s, &rf);
+                    struct timeval tv = {5, 0};
+                    if (select(0, &rf, NULL, NULL, &tv) <= 0) {
+                        printf("WLAT_FAIL select %d\n", WSAGetLastError());
+                        return 1;
+                    }
+                } else if (door == 2) {
+                    WSAPOLLFD p;
+                    p.fd = s;
+                    p.events = POLLRDNORM;
+                    p.revents = 0;
+                    if (WSAPoll(&p, 1, 5000) <= 0) {
+                        printf("WLAT_FAIL poll %d\n", WSAGetLastError());
+                        return 1;
+                    }
+                }
+                int n = recv(s, buf + got, 64 - got, 0);
+                if (n <= 0) {
+                    printf("WLAT_FAIL recv %d err=%d\n", n, WSAGetLastError());
+                    return 1;
+                }
+                got += n;
+            }
+            QueryPerformanceCounter(&b);
+            if (i >= 5) v[i - 5] = qpc_ms(a, b);
+        }
+        qsort(v, 40, sizeof(v[0]), dbl_cmp);
+        med[door] = v[20];
+    }
+    SOCKET u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct sockaddr_in ub;
+    memset(&ub, 0, sizeof(ub));
+    ub.sin_family = AF_INET;
+    bind(u, (struct sockaddr *)&ub, sizeof(ub));
+    int tmo = 3000;
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof(tmo));
+    struct sockaddr_in ut = t;
+    ut.sin_port = htons(47585);
+    for (int door = 3; door < 5; door++) {
+        double v[40];
+        int ok = 0;
+        for (int i = 0; i < 45; i++) {
+            char buf[64];
+            memset(buf, 'u', sizeof(buf));
+            memcpy(buf, &i, sizeof(i));
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            sendto(u, buf, 64, 0, (struct sockaddr *)&ut, sizeof(ut));
+            for (;;) {
+                if (door == 3) {
+                    fd_set rf;
+                    FD_ZERO(&rf);
+                    FD_SET(u, &rf);
+                    struct timeval tv = {3, 0};
+                    if (select(0, &rf, NULL, NULL, &tv) <= 0) break;
+                }
+                char rb[128];
+                int n = recvfrom(u, rb, sizeof(rb), 0, NULL, NULL);
+                if (n <= 0) break;
+                int seq;
+                memcpy(&seq, rb, sizeof(seq));
+                if (seq == i) {
+                    QueryPerformanceCounter(&b);
+                    if (i >= 5) v[ok++] = qpc_ms(a, b);
+                    break;
+                }
+            }
+        }
+        if (ok < 20) {
+            printf("WLAT_FAIL %s only %d replies\n", names[door], ok);
+            return 1;
+        }
+        qsort(v, ok, sizeof(v[0]), dbl_cmp);
+        med[door] = v[ok / 2];
+    }
+    int fast = 1;
+    printf("WLAT");
+    for (int i = 0; i < 5; i++) {
+        printf(" %s=%.2f", names[i], med[i]);
+        if (med[i] >= 5.0) fast = 0;
+    }
+    printf("\n%s\n", fast ? "WLAT_OK" : "WLAT_SLOW");
+    return fast ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: test_late.exe host|client|clash [qport aport] [xport]\n");
@@ -25,6 +157,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     WSADATA wd;
     WSAStartup(MAKEWORD(2, 2), &wd);
+    if (!strcmp(argv[1], "wlat")) return wlat(argc > 2 ? argv[2] : "10.200.0.2");
     if (!strcmp(argv[1], "clash")) {
         /* faithful shared-UDP-port semantics for one machine: binds
          * coexist only with SO_REUSEADDR on BOTH sockets, and every
