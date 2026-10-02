@@ -109,9 +109,22 @@ Semantics that matter:
   getpeername can bind OUR OWN export depending on link order - use the
   ELF-introspected real symbol).
 - Backpressure: TCP app-send blocks (or EWOULDBLOCK for nonblocking apps)
-  when the 4 MB out-queue is full; in-queue (1 MB) pauses relay reads
-  until drained (kernel window). UDP hook queues drop the NEW datagram
-  (never reorder/drop-old).
+  when the 256 KB out-queue is full (`DT_ST_MAXOUT`; writable again at
+  2/3, kernel `sk_stream_is_writeable`); a single send bigger than the
+  queue is accepted in parts. In-queue (1 MB) pauses relay reads until
+  drained (kernel window). UDP hook queues drop the NEW datagram (never
+  reorder/drop-old); so do droppable control frames (UDP-over-TCP
+  datagrams, beacons) once 64 KB wait for the link - hook
+  (`DT_CTLQ_DROP`) and relay (`WQ_DROP_BYTES`) alike.
+- Buffers (bufferbloat vs bandwidth): tunnel sockets on hook, relay and
+  wclient set NO `SO_SNDBUF`/`SO_RCVBUF` (either disables autotuning on
+  Linux AND Windows and is clamped to rmem/wmem_max - a stock VPS capped
+  a relayed stream near 425 KB in flight). `TCP_NOTSENT_LOWAT` 32 KB
+  (Linux/macOS) caps unsent bytes beyond cwnd, so backpressure reaches
+  the app; cwnd (throughput) is untouched. `hook/bench_latency.py
+  --shaped [--baseline] [--udp-over-tcp]` measures both against a plain
+  kernel path over netem links; check throughput AND same-stream ping
+  before changing any of these numbers.
 - Relay: per-writer send queues (drain task) — never write a control
   writer outside `r_send`; droppable = beacons/UDP_TUN, ASSIGN/STREQ are
   not. `NODE_TTL=600` keeps a node+virt for reconnects (stale sibling
@@ -130,7 +143,10 @@ appended — `dt_env_with_node`, ANSI + wide paths). Consequences:
 
 - Launcher self-restart chains and game+child = ONE vnode, many links. The
   relay fans out per-link; a sibling link dying never kills the node or
-  its streams (whole-node-dark does; the peer sees EOF).
+  its streams. Whole-node-dark fails only streams still in HANDSHAKE;
+  an established stream is its own TCP connection and ends on its own
+  FIN/RST (an exiting process FINs after its last bytes - closing it at
+  node-dark truncated them; the peer still sees EOF).
 - Streams to a shared node are CLAIMED (see protocol) — exactly one
   process bridges the local port.
 - No shared memory sections were needed anywhere: identity lifetime ==
@@ -228,6 +244,36 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
 - Blocking sends from apps: `dt_stream_send_wait` blocks while out-queue
   full (nonblocking apps get EWOULDBLOCK); never fall through to the
   REAL socket of a tunneled connection.
+- Waits are event-driven (`dt_wait_arm/rearm/done/sleep`, hk_sess.c): a
+  blocked app call takes a pooled wake slot naming its sockets, ARMS it
+  BEFORE scanning hook state, and adds the slot's fd to its real wait;
+  `dt_sig_locked` (now live on Linux too) pokes matching armed slots. ANY
+  new hook state an app can wait for (data, FIN, death, connect verdict,
+  out-queue room via `wr_full`) must call `dt_sig_locked`, or waiters
+  only see it at the 100 ms backstop rescan.
+- A tunneled stream's REAL fd is a never-connected socket: the kernel
+  reports it hung-up/readable at once. It must never join a real
+  poll/select (that made every poll return instantly = busy-spinning app
+  threads); its readiness comes from hook state only, and EOF (peer FIN,
+  SHUT_RD) is readable like the kernel's.
+- Inside the .so, `select()`/`poll()` bind to OUR exports: the hook's own
+  threads use `real_select`/`r_poll`/`r_recvfrom` (hk_stream.c maps
+  `select` to `dt_isel`). The old UDP recvfrom wait called the hooked
+  select, saw tunnel data "readable", then blocked forever in the REAL
+  recvfrom.
+- Pump `sending` flag: every exit from a send attempt (incl. EAGAIN)
+  clears it - the exit drain waits on it, and a stuck flag silently
+  skipped the drain (latent until small kernel buffers made EAGAIN
+  common). The exit drain lifts `TCP_NOTSENT_LOWAT` and sizes SO_SNDBUF
+  to the backlog so the kernel takes everything and flushes after exit.
+- Ledger (Linux): `flock` excludes processes, not threads - a process
+  mutex pairs with it, and attach is serialized (two racing first binds
+  swapped `g_slp_fd` under a holder, leaking the lock: every later bind
+  in the process hung).
+- Control link is nonblocking: one thread multiplexes inbound frames,
+  queued frames (each stored as complete wire bytes = ONE send; with
+  Nagle off, hdr/type/payload writes were three segments) and wakeups,
+  never parking in a send.
 - Relay-side (Python): an `asyncio.start_server` callback RETURNING
   closes the transport — per-stream handlers `await st["done"]` for the
   stream's lifetime (this exact bug RST every join mid-handshake).
@@ -311,7 +357,7 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   they move together in a dedicated `chore: bump version to X` commit.
 - **rc versions are NEVER committed** — local stamp only; keep those two
   lines dirty in the working tree between releases (current: none —
-  3.0.0 is released; the next local build starts 3.0.1-rc1).
+  3.1.0 is released; the next local build starts 3.1.1-rc1).
   At release: change to the final number, commit the bump, build, ship.
 - **No rc references in git content either**: all change notes between
   releases live in ONE "Status snapshot (UNRELEASED)" section here; at
@@ -441,6 +487,25 @@ Pitfalls baked into the implementation (`hk_GetAdaptersAddresses`):
   beneath and never see each other. `bind(0)` under LAN_ONLY=1 allocates
   from the node's ephemeral space (>=49152) and must not collide with
   claimed vports. test_bindfidelity guards the whole matrix.
+
+## Status snapshot (3.1.0)
+
+3.1.0 RELEASED: latency / bufferbloat pass on top of 3.0.0 (wire
+unchanged: PVER 3 / UVER 3 - hooks and relays of 3.0.0 and 3.1.0
+interoperate; the relay-side gains need the new server.py deployed). Measured with `hook/bench_latency.py`:
+
+- Idle loopback RTT through relay + hooks: every door ~0.1 ms at ~0% CPU
+  (was: blocking TCP recv 10 ms, UDP poll/select 25 ms, TCP poll/select
+  0.1 ms only by busy-spinning 60-99% CPU, blocking UDP recvfrom HUNG).
+  Windows doors under Wine (test_late phase D): 0.3-0.55 ms (was 10-51).
+- Shaped 20 Mbit / 40 ms: throughput 19.1 Mbit (= kernel), ping queued
+  behind bulk on the same stream 241 ms (was 4 s; plain kernel 555 ms);
+  UDP-over-TCP under overload bounded ~200 ms (was unbounded, > 3 s).
+  200 Mbit / 100 ms: 186 Mbit (was 187, kernel 181).
+- Fixes found on the way: ledger flock race (hung binds), exit-drain
+  `sending` flag, relay node-dark truncating established streams.
+- New tests: test_latency (Linux doors, big send, bind race), test_late
+  phase D (Windows doors under Wine).
 
 ## Status snapshot (3.0.0)
 

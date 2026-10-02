@@ -83,8 +83,17 @@ connections), so leave it off when plain UDP works.
 
 `poll`/`select` hooks are load-bearing: runtimes (incl. every socket with
 a timeout) wait in `poll` and never call `recvfrom` until the fd reads
-ready, so tunnel-queued data must report readable. Slices bound the extra
-latency to ~25ms.
+ready, so tunnel-queued data must report readable. Every wait door
+(recv/recvfrom/connect/send, poll/ppoll/select/pselect, WSAPoll) blocks
+on the real fds plus a wake channel the tunnel threads poke on each
+arrival, so a queued byte wakes the app immediately (sub-millisecond on
+loopback; no sleep slices, no busy-spin).
+
+Tunnel sockets size themselves like any OS socket (no fixed buffers:
+kernel autotuning reaches the path's bandwidth-delay product) and keep
+only a small unsent backlog (`TCP_NOTSENT_LOWAT` on Linux), so a bulk
+transfer runs at full link rate without queueing seconds of data in
+front of the app's next message.
 
 ## Use
 
