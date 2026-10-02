@@ -353,6 +353,7 @@ struct dt_usess *dt_usess_find(int game_port, const unsigned *ovirt, const struc
                 continue;
             }
 #endif
+            dt_wake_write(g_hwake_w); /* poller: watch the new socket now */
             return &g_us[i];
         }
     return NULL;
@@ -573,7 +574,7 @@ void dt_sock_state_locked(long long gsock, int *data, int *dead, int *writable, 
                 *writable = 1;
             }
             if (g_st[i].state == ST_OPEN && !g_st[i].dead) {
-                *writable = 1;
+                if (g_st[i].ototal <= DT_ST_WROOM) *writable = 1;
                 if (!g_st[i].connect_signaled) *connect = 1;
             }
         }
@@ -583,6 +584,100 @@ void dt_sock_state_full(long long gsock, int *data, int *dead, int *writable, in
     dt_sock_state_locked(gsock, data, dead, writable, connect);
     DUNLOCK();
 }
+/* ---- wake channels for blocked app calls ----
+ * Hook state changes (queued data, connect verdict, death, send room)
+ * happen on pump threads; an app thread blocked in poll/select/recv must
+ * see them NOW, not at its next sleep slice. A waiter takes a slot,
+ * names the sockets it watches, and adds the slot's wake fd to its real
+ * wait; dt_sig_locked pokes armed matching slots once. Arm happens
+ * BEFORE the waiter's readiness scan, so an event is either seen by the
+ * scan or pokes the fd - never lost. Slots and their socket pairs are
+ * pooled for the process lifetime. */
+#define DT_WAIT_NS 8
+static struct {
+    int used, armed, any, n, paired;
+    long long socks[DT_WAIT_NS];
+    DTSOCK r, w;
+} g_wt[DT_MAXWAIT];
+int dt_wait_arm(const long long *socks, int n) {
+    int slot = -1;
+    DLOCK();
+    for (int i = 0; i < DT_MAXWAIT; i++)
+        if (!g_wt[i].used) {
+            slot = i;
+            g_wt[i].used = 1;
+            break;
+        }
+    DUNLOCK();
+    if (slot < 0) return -1;
+    if (!g_wt[slot].paired) {
+        DTSOCK r, w;
+        dt_wake_pair(&r, &w);
+        if (r == DTSOCK_BAD) {
+            DLOCK();
+            g_wt[slot].used = 0;
+            DUNLOCK();
+            return -1;
+        }
+        g_wt[slot].r = r;
+        g_wt[slot].w = w;
+        g_wt[slot].paired = 1;
+    }
+    DLOCK();
+    g_wt[slot].any = n < 0 || n > DT_WAIT_NS;
+    g_wt[slot].n = g_wt[slot].any ? 0 : n;
+    for (int i = 0; i < g_wt[slot].n; i++) g_wt[slot].socks[i] = socks[i];
+    g_wt[slot].armed = 1;
+    DUNLOCK();
+    return slot;
+}
+void dt_wait_rearm(int slot) {
+    if (slot < 0) return;
+    dt_wake_drain(g_wt[slot].r);
+    DLOCK();
+    g_wt[slot].armed = 1;
+    DUNLOCK();
+}
+void dt_wait_done(int slot) {
+    if (slot < 0) return;
+    DLOCK();
+    g_wt[slot].armed = 0;
+    g_wt[slot].used = 0;
+    DUNLOCK();
+    dt_wake_drain(g_wt[slot].r);
+}
+DTSOCK dt_wait_fd(int slot) {
+    return slot < 0 ? DTSOCK_BAD : g_wt[slot].r;
+}
+/* block until the slot is poked or ms elapse (no slot: plain sleep) */
+void dt_wait_sleep(int slot, int ms) {
+    if (ms > DT_WAIT_BACKSTOP_MS || ms < 0) ms = DT_WAIT_BACKSTOP_MS;
+    if (slot < 0) {
+        dt_msleep(ms < 5 ? ms : 5);
+        return;
+    }
+#ifdef LINUX_BUILD
+    struct pollfd p = {(int)g_wt[slot].r, POLLIN, 0};
+    dt_reals();
+    r_poll(&p, 1, ms);
+#else
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(g_wt[slot].r, &rf);
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+    select(0, &rf, NULL, NULL, &tv);
+#endif
+}
+static void dt_wait_poke_locked(long long gsock) {
+    for (int i = 0; i < DT_MAXWAIT; i++) {
+        if (!g_wt[i].used || !g_wt[i].armed) continue;
+        int hit = g_wt[i].any;
+        for (int j = 0; !hit && j < g_wt[i].n; j++) hit = g_wt[i].socks[j] == gsock;
+        if (!hit) continue;
+        g_wt[i].armed = 0;
+        dt_wake_write(g_wt[i].w);
+    }
+}
 #ifndef LINUX_BUILD
 struct dt_evmap g_evmap[DT_MAXEV];
 /* DLOCK must be held (every queue-insert path holds it). */
@@ -590,6 +685,7 @@ void dt_sig_locked(long long gsock) {
     int i;
     for (i = 0; i < DT_MAXEV; i++)
         if (g_evmap[i].used && g_evmap[i].sock == gsock) (void)WSASetEvent(g_evmap[i].ev);
+    dt_wait_poke_locked(gsock);
 }
 void dt_ev_unhook_sock(long long sock) {
     int i;
@@ -607,7 +703,7 @@ void dt_ev_unhook_ev(WSAEVENT ev) {
 }
 #else
 void dt_sig_locked(long long gsock) {
-    (void)gsock;
+    dt_wait_poke_locked(gsock);
 }
 #endif
 void dt_udp_push(long long gsock, const unsigned char *p, size_t n,

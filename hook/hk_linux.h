@@ -12,6 +12,8 @@ HK_INT extern ssize_t (*r_sendto)(int, const void *, size_t, int, const struct s
                                   socklen_t);
 HK_INT extern int (*r_close)(int);
 HK_INT extern int (*r_bind)(int, const struct sockaddr *, socklen_t);
+HK_INT extern int (*r_poll)(struct pollfd *, nfds_t, int);
+HK_INT extern ssize_t (*r_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 
 HK_INT void dt_reals(void);
 #endif

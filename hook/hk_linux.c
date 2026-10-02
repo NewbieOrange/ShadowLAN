@@ -10,7 +10,11 @@ ssize_t (*r_recv)(int, void *, size_t, int) = 0;
 ssize_t (*r_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = 0;
 int (*r_close)(int) = 0;
 int (*r_bind)(int, const struct sockaddr *, socklen_t) = 0;
+int (*r_poll)(struct pollfd *, nfds_t, int) = 0;
+ssize_t (*r_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *) = 0;
 void dt_reals(void) {
+    if (!r_poll) r_poll = dlsym(RTLD_NEXT, "poll");
+    if (!r_recvfrom) r_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
     if (!r_connect) r_connect = dlsym(RTLD_NEXT, "connect");
     if (!real_select) real_select = dlsym(RTLD_NEXT, "select");
     if (!real_getsockopt) real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
@@ -74,12 +78,13 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *
             struct timeval tv0;
             gettimeofday(&tv0, NULL);
             t0 = (long long)tv0.tv_sec * 1000 + tv0.tv_usec / 1000;
-            int iters = 0;
+            int slot = -1;
             for (;;) {
                 struct sockaddr_in from;
                 size_t on = 0;
                 int pr = dt_udp_pop((long long)sockfd, (unsigned char *)buf, len, &from, &on);
                 if (pr == 1) {
+                    dt_wait_done(slot);
                     if (src && addrlen && *addrlen >= sizeof(from)) {
                         memcpy(src, &from, sizeof(from));
                         *addrlen = sizeof(from);
@@ -87,50 +92,57 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *
                     return (ssize_t)on;
                 }
                 if (pr == -1) {
+                    dt_wait_done(slot);
                     errno = EBADF;
                     return -1;
                 }
-                if (++iters == 20) {
-                    char lb[128];
-                    snprintf(lb, sizeof(lb), "recvfrom direct wait fd=%d tmo=%d nb=%d", sockfd, tmo,
-                             nb);
-                    dlog(lb);
-                    iters = 0;
-                }
-                fd_set rf;
-                FD_ZERO(&rf);
-                FD_SET(sockfd, &rf);
-                struct timeval tv = {0, 50000};
-                int rr = select(sockfd + 1, &rf, NULL, NULL, nb ? &(struct timeval){0, 0} : &tv);
-                if (rr > 0) {
-                    struct sockaddr_in rfrom;
-                    socklen_t rfl = sizeof(rfrom);
-                    struct sockaddr *sp = src ? src : (struct sockaddr *)&rfrom;
-                    socklen_t *lp = src ? addrlen : &rfl;
-                    ssize_t rn = real_recvfrom(sockfd, buf, len, flags, sp, lp);
+                /* a real wire datagram (LAN, loopback bridge)? never
+                 * block in the kernel here: tunnel arrivals land in the
+                 * hook queue, not on this fd */
+                struct sockaddr_in rfrom;
+                socklen_t rfl = sizeof(rfrom);
+                struct sockaddr *sp = src ? src : (struct sockaddr *)&rfrom;
+                socklen_t *lp = src ? addrlen : &rfl;
+                dt_reals();
+                ssize_t rn = r_recvfrom(sockfd, buf, len, flags | MSG_DONTWAIT, sp, lp);
+                if (rn >= 0) {
                     if (g_lan_only && rn > 0 && lp && *lp >= sizeof(struct sockaddr_in) &&
                         !ipv4_is_loopback(((struct sockaddr_in *)sp)->sin_addr.s_addr)) {
                         dt_log_wire_drop(((struct sockaddr_in *)sp)->sin_addr.s_addr);
-                        if (nb) {
-                            errno = EAGAIN;
-                            return -1;
-                        }
                         continue; /* LAN_ONLY: no wire world beyond the tunnel */
                     }
+                    dt_wait_done(slot);
                     if (rn > 0 && g_direct) dt_hosted_unsource(sp, (socklen_int_t *)lp);
                     return rn;
                 }
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    int e = errno;
+                    dt_wait_done(slot);
+                    errno = e;
+                    return -1;
+                }
                 if (nb) {
+                    dt_wait_done(slot);
                     errno = EAGAIN;
                     return -1;
                 }
-                struct timeval tvn;
-                gettimeofday(&tvn, NULL);
-                long long now = (long long)tvn.tv_sec * 1000 + tvn.tv_usec / 1000;
+                if (slot < 0) { /* arm, then look again before sleeping */
+                    slot = dt_wait_arm((long long[]){sockfd}, 1);
+                    continue;
+                }
+                long long now = dt_now_ms();
                 if (tmo >= 0 && now - t0 >= tmo) {
+                    dt_wait_done(slot);
                     errno = EAGAIN;
                     return -1;
                 }
+                {
+                    long w = DT_WAIT_BACKSTOP_MS;
+                    if (tmo >= 0 && tmo - (now - t0) < w) w = (long)(tmo - (now - t0));
+                    struct pollfd pw[2] = {{sockfd, POLLIN, 0}, {(int)dt_wait_fd(slot), POLLIN, 0}};
+                    r_poll(pw, slot >= 0 ? 2 : 1, (int)w);
+                }
+                dt_wait_rearm(slot);
             }
         }
     }
@@ -208,22 +220,29 @@ static int my_connect_hook(int s, const struct sockaddr *a, socklen_t l) {
                 return -1;
             }
             long long t0 = dt_now_ms();
+            int slot = dt_wait_arm((long long[]){s}, 1); /* before the first look */
             for (;;) {
                 DLOCK();
                 struct dt_stream *st = dt_stream_by_sock((long long)s);
                 int state = st ? st->state : 0;
                 unsigned fail = st ? st->fail : 0;
                 DUNLOCK();
-                if (state == ST_OPEN) return 0;
+                if (state == ST_OPEN) {
+                    dt_wait_done(slot);
+                    return 0;
+                }
                 if (state == ST_DEAD) {
+                    dt_wait_done(slot);
                     errno = (fail == STF_JOIN_TIMEOUT) ? ETIMEDOUT : ECONNREFUSED;
                     return -1;
                 }
                 if (dt_now_ms() - t0 > (long long)DT_ST_TIMEOUT_MS + 500) {
+                    dt_wait_done(slot);
                     errno = ETIMEDOUT;
                     return -1;
                 }
-                dt_msleep(10);
+                dt_wait_sleep(slot, DT_WAIT_BACKSTOP_MS);
+                dt_wait_rearm(slot);
             }
         }
         if (r == 2) {
@@ -607,11 +626,15 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 /* poll/select must report tunnel-queued data as readable, or apps with
  * timeouts (incl. every CPython socket with settimeout) sleep in poll
- * and never call recvfrom. Slices bound tunnel latency to ~25ms. */
+ * and never call recvfrom. Waits are event-driven: the real wait gets
+ * a wake fd that every hook state change pokes (dt_sig_locked), so a
+ * queued datagram/stream byte wakes the app at once. A tunneled
+ * stream's own fd never joins the real wait: it is a never-connected
+ * socket the kernel reports as hung up, which made every poll return
+ * at once (a busy-spinning app thread). */
 #include <poll.h>
 #include <signal.h>
 #include <sys/select.h>
-static int dt_select_scan(int nfds, fd_set *r, fd_set *w, fd_set *x);
 /* kernel: a socket still in connect() never reports writable; the
  * merged scan adds the connect edge back exactly once at verdict */
 static int dt_fd_connecting(long long fd) {
@@ -639,61 +662,161 @@ static int dt_poll_scan(struct pollfd *fds, nfds_t nfds) {
     }
     return n;
 }
-static void dt_mask_connecting(int nfds, fd_set *w0, fd_set *w) {
-    if (!w0 || !w) return;
-    for (int fd = 0; fd < nfds; fd++)
-        if (FD_ISSET(fd, w) && dt_fd_connecting((long long)fd)) FD_CLR(fd, w);
-}
-static int dt_wscan(int nfds, fd_set *w0, fd_set *wout) {
-    int n = 0;
-    if (!w0 || !wout) return 0;
-    for (int fd = 0; fd < nfds; fd++) {
-        if (!FD_ISSET(fd, w0)) continue;
-        int data, dead, wr, cn;
-        dt_sock_state_full((long long)fd, &data, &dead, &wr, &cn);
-        if (wr || cn) FD_SET(fd, wout);
+/* 2 = tunneled stream (hook-owned readiness only), 1 = tunnel-fed
+ * datagram socket (real fd + hook queue), 0 = not ours */
+static int dt_fd_kind(int fd) {
+    if (fd < 0) return 0;
+    if (dt_stream_by_sock_peek((long long)fd)) return 2;
+    if (dt_is_udp_like((long long)fd)) {
+        dt_udp_ensure((long long)fd); /* fan-out needs the entry */
+        return 1;
     }
-    for (int fd = 0; fd < nfds; fd++)
-        if (FD_ISSET(fd, wout)) n++;
-    return n;
+    return 0;
+}
+/* Shared poll/ppoll/select/pselect core. tmo_ms < 0 = infinite. */
+static int dt_poll_core(struct pollfd *fds, nfds_t nfds, long tmo_ms, const sigset_t *mask) {
+    static int (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *) =
+        0;
+    if (!real_ppoll) real_ppoll = dlsym(RTLD_NEXT, "ppoll");
+    long long ks[8];
+    int nk = 0, any = 0, streams = 0;
+    for (nfds_t i = 0; i < nfds; i++) {
+        int k = dt_fd_kind(fds[i].fd);
+        if (!k) continue;
+        if (k == 2) streams++;
+        if (nk < 8) ks[nk++] = fds[i].fd;
+        else any = 1;
+    }
+    if (!nk) { /* nothing of ours in the set: the plain kernel wait */
+        struct timespec ts = {tmo_ms / 1000, (tmo_ms % 1000) * 1000000};
+        return real_ppoll(fds, nfds, tmo_ms < 0 ? NULL : &ts, mask);
+    }
+    struct pollfd sb[33], *pf = nfds < 32 ? sb : (struct pollfd *)malloc((nfds + 1) * sizeof(*pf));
+    if (!pf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int slot = dt_wait_arm(ks, any ? -1 : nk); /* before the first scan */
+    long long t0 = dt_now_ms();
+    int n, err = 0, polled = 0;
+    for (;;) {
+        for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
+        n = dt_poll_scan(fds, nfds);
+        if (n) break;
+        long w = DT_WAIT_BACKSTOP_MS;
+        if (tmo_ms >= 0) {
+            long left = tmo_ms - (long)(dt_now_ms() - t0);
+            if (left <= 0) {
+                if (polled) break;
+                left = 0; /* zero timeout still samples the real fds once */
+            }
+            if (left < w) w = left;
+        }
+        polled = 1;
+        for (nfds_t i = 0; i < nfds; i++) {
+            pf[i] = fds[i];
+            if (streams && dt_stream_by_sock_peek((long long)fds[i].fd)) pf[i].fd = -1;
+        }
+        nfds_t m = nfds;
+        if (slot >= 0) {
+            pf[m].fd = (int)dt_wait_fd(slot);
+            pf[m].events = POLLIN;
+            pf[m].revents = 0;
+            m++;
+        }
+        struct timespec ts = {w / 1000, (w % 1000) * 1000000};
+        int r = real_ppoll(pf, m, &ts, mask);
+        if (r < 0) {
+            err = errno;
+            n = -1;
+            break;
+        }
+        for (nfds_t i = 0; i < nfds; i++) fds[i].revents = pf[i].fd < 0 ? 0 : pf[i].revents;
+        n = dt_poll_scan(fds, nfds);
+        if (n) break;
+        dt_wait_rearm(slot);
+    }
+    dt_wait_done(slot);
+    if (pf != sb) free(pf);
+    if (n < 0) errno = err;
+    return n < 0 ? -1 : n;
 }
 int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     static int (*real_poll)(struct pollfd *, nfds_t, int) = 0;
     ensure_init();
     if (!real_poll) real_poll = dlsym(RTLD_NEXT, "poll");
     if (!g_direct) return real_poll(fds, nfds, timeout);
-    for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
-    if (dt_poll_scan(fds, nfds)) {
-        int n = 0;
-        for (nfds_t i = 0; i < nfds; i++)
-            if (fds[i].revents) n++;
-        return n;
+    return dt_poll_core(fds, nfds, timeout < 0 ? -1 : timeout, NULL);
+}
+int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo, const sigset_t *mask) {
+    static int (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *) =
+        0;
+    ensure_init();
+    if (!real_ppoll) real_ppoll = dlsym(RTLD_NEXT, "ppoll");
+    if (!g_direct) return real_ppoll(fds, nfds, tmo, mask);
+    long ms = tmo ? (long)(tmo->tv_sec * 1000 + (tmo->tv_nsec + 999999) / 1000000) : -1;
+    return dt_poll_core(fds, nfds, ms, mask);
+}
+/* select on top of the poll core, with the kernel's own readiness
+ * masks (fs/select.c POLLIN_SET / POLLOUT_SET / POLLEX_SET). */
+static int dt_select_core(int nfds, fd_set *r, fd_set *w, fd_set *x, long ms,
+                          const sigset_t *mask) {
+    if (nfds < 0 || nfds > FD_SETSIZE) {
+        errno = EINVAL;
+        return -1;
     }
-    int waited = 0;
-    for (;;) {
-        int slice = 25;
-        if (timeout >= 0) {
-            if (waited >= timeout) return 0;
-            if (timeout - waited < slice) slice = timeout - waited;
-        }
-        int r = real_poll(fds, nfds, slice);
-        if (r < 0) return r; /* EINTR etc: preserve */
-        if (r > 0) {
-            dt_poll_scan(fds, nfds);
-            int n = 0;
-            for (nfds_t i = 0; i < nfds; i++)
-                if (fds[i].revents) n++;
-            return n ? n : r;
-        }
-        if (dt_poll_scan(fds, nfds)) {
-            int n = 0;
-            for (nfds_t i = 0; i < nfds; i++)
-                if (fds[i].revents) n++;
-            return n;
-        }
-        waited += slice;
-        if (timeout >= 0 && waited >= timeout) return 0;
+    int cnt = 0;
+    for (int fd = 0; fd < nfds; fd++)
+        if ((r && FD_ISSET(fd, r)) || (w && FD_ISSET(fd, w)) || (x && FD_ISSET(fd, x))) cnt++;
+    struct pollfd sb[64], *pf = cnt <= 64 ? sb : (struct pollfd *)malloc(cnt * sizeof(*pf));
+    if (!pf) {
+        errno = ENOMEM;
+        return -1;
     }
+    int k = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        short ev = 0;
+        if (r && FD_ISSET(fd, r)) ev |= POLLIN;
+        if (w && FD_ISSET(fd, w)) ev |= POLLOUT;
+        if (x && FD_ISSET(fd, x)) ev |= POLLPRI;
+        if (!ev) continue;
+        pf[k].fd = fd;
+        pf[k].events = ev;
+        pf[k].revents = 0;
+        k++;
+    }
+    int rc = dt_poll_core(pf, (nfds_t)k, ms, mask);
+    if (rc >= 0) {
+        for (int i = 0; i < k; i++)
+            if (pf[i].revents & POLLNVAL) {
+                errno = EBADF;
+                rc = -1;
+                break;
+            }
+    }
+    if (rc >= 0) {
+        if (r) FD_ZERO(r);
+        if (w) FD_ZERO(w);
+        if (x) FD_ZERO(x);
+        rc = 0;
+        for (int i = 0; i < k; i++) {
+            short re = pf[i].revents, ev = pf[i].events;
+            if ((ev & POLLIN) && (re & (POLLIN | POLLRDNORM | POLLRDBAND | POLLHUP | POLLERR))) {
+                FD_SET(pf[i].fd, r);
+                rc++;
+            }
+            if ((ev & POLLOUT) && (re & (POLLOUT | POLLWRNORM | POLLWRBAND | POLLERR))) {
+                FD_SET(pf[i].fd, w);
+                rc++;
+            }
+            if ((ev & POLLPRI) && (re & POLLPRI)) {
+                FD_SET(pf[i].fd, x);
+                rc++;
+            }
+        }
+    }
+    if (pf != sb) free(pf);
+    return rc;
 }
 int pselect(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct timespec *tmo,
             const sigset_t *mask) {
@@ -702,277 +825,14 @@ int pselect(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct timespec *tm
     ensure_init();
     if (!real_pselect) real_pselect = dlsym(RTLD_NEXT, "pselect");
     if (!g_direct) return real_pselect(nfds, r, w, x, tmo, mask);
-    long budget = tmo ? (long)(tmo->tv_sec * 1000 + tmo->tv_nsec / 1000000) : -1;
-    fd_set r0, w0, x0;
-    if (r) r0 = *r;
-    if (w) w0 = *w;
-    if (x) x0 = *x;
-    {
-        struct timespec z = {0, 0};
-        fd_set rr;
-        if (r) rr = r0;
-        else FD_ZERO(&rr);
-        int qr = real_pselect(nfds, r ? &rr : NULL, NULL, NULL, &z, NULL);
-        int tun = r ? dt_select_scan(nfds, &r0, NULL, NULL) : 0;
-        if (qr > 0 || tun > 0) {
-            if (r) {
-                FD_ZERO(r);
-                if (qr > 0)
-                    for (int fd = 0; fd < nfds; fd++)
-                        if (FD_ISSET(fd, &rr)) FD_SET(fd, r);
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            }
-            if (w) {
-                FD_ZERO(w);
-                dt_wscan(nfds, &w0, w);
-            }
-            if (x) FD_ZERO(x);
-            int n = 0;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, r)) n++;
-            if (w)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, w)) n++;
-            return n;
-        }
-    }
-    long waited = 0;
-    for (;;) {
-        long slice = 25;
-        if (budget >= 0) {
-            if (waited >= budget) {
-                if (r) FD_ZERO(r);
-                if (w) FD_ZERO(w);
-                if (x) FD_ZERO(x);
-                return 0;
-            }
-            if (budget - waited < slice) slice = budget - waited;
-        }
-        fd_set rr, ww, xx;
-        if (r) rr = r0;
-        else FD_ZERO(&rr);
-        if (w) ww = w0;
-        else FD_ZERO(&ww);
-        if (x) xx = x0;
-        else FD_ZERO(&xx);
-        struct timespec tv;
-        tv.tv_sec = slice / 1000;
-        tv.tv_nsec = (slice % 1000) * 1000000;
-        int rr_ = real_pselect(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv, mask);
-        if (rr_ < 0) return rr_;
-        if (rr_ > 0) {
-            if (r) *r = rr;
-            if (w) {
-                *w = ww;
-                dt_mask_connecting(nfds, &w0, w);
-                dt_wscan(nfds, &w0, w);
-            }
-            if (x) *x = xx;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            int n = 0;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, r)) n++;
-            if (w)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, w)) n++;
-            if (x)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, x)) n++;
-            if (n) return n;
-            /* every reported event was filtered (vacuous writable on a
-             * connecting socket): keep waiting, like the kernel would */
-        }
-        if (r && dt_select_scan(nfds, &r0, NULL, NULL)) {
-            FD_ZERO(r);
-            if (w) FD_ZERO(w);
-            if (x) FD_ZERO(x);
-            for (int fd = 0; fd < nfds; fd++)
-                if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            int n = 0;
-            for (int fd = 0; fd < nfds; fd++)
-                if (FD_ISSET(fd, r)) n++;
-            return n;
-        }
-        waited += slice;
-        if (budget >= 0 && waited >= budget) {
-            if (r) FD_ZERO(r);
-            if (w) FD_ZERO(w);
-            if (x) FD_ZERO(x);
-            return 0;
-        }
-    }
-}
-int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo, const sigset_t *mask) {
-    static int (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *) =
-        0;
-    ensure_init();
-    if (!real_ppoll) real_ppoll = dlsym(RTLD_NEXT, "ppoll");
-    if (!g_direct) return real_ppoll(fds, nfds, tmo, mask);
-    long budget = tmo ? (long)(tmo->tv_sec * 1000 + tmo->tv_nsec / 1000000) : -1;
-    for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
-    if (dt_poll_scan(fds, nfds)) {
-        int n = 0;
-        for (nfds_t i = 0; i < nfds; i++)
-            if (fds[i].revents) n++;
-        return n;
-    }
-    long waited = 0;
-    for (;;) {
-        struct timespec cur = {0, 25000000};
-        if (budget >= 0) {
-            if (waited >= budget) return 0;
-            long rem = budget - waited;
-            if (rem < 25) {
-                cur.tv_sec = 0;
-                cur.tv_nsec = rem * 1000000;
-            }
-        }
-        int r = real_ppoll(fds, nfds, &cur, mask);
-        if (r < 0) return r;
-        if (r > 0) {
-            dt_poll_scan(fds, nfds);
-            int n = 0;
-            for (nfds_t i = 0; i < nfds; i++)
-                if (fds[i].revents) n++;
-            return n ? n : r;
-        }
-        if (dt_poll_scan(fds, nfds)) {
-            int n = 0;
-            for (nfds_t i = 0; i < nfds; i++)
-                if (fds[i].revents) n++;
-            return n;
-        }
-        waited += 25;
-        if (budget >= 0 && waited >= budget) return 0;
-    }
-}
-static int dt_select_scan(int nfds, fd_set *r, fd_set *w, fd_set *x) {
-    int n = 0;
-    if (r) {
-        for (int fd = 0; fd < nfds; fd++) {
-            if (!FD_ISSET(fd, r)) continue;
-            if (dt_fd_readable((long long)fd)) n++;
-            /* NB: keep FD_ISSET as-is; readable mark = bit already set.
-             * We only count here; real select result merged by caller. */
-        }
-    }
-    (void)w;
-    (void)x;
-    return n;
+    long ms = tmo ? (long)(tmo->tv_sec * 1000 + (tmo->tv_nsec + 999999) / 1000000) : -1;
+    return dt_select_core(nfds, r, w, x, ms, mask);
 }
 int select(int nfds, fd_set *r, fd_set *w, fd_set *x, struct timeval *tmo) {
     static int (*real_select)(int, fd_set *, fd_set *, fd_set *, struct timeval *) = 0;
     ensure_init();
     if (!real_select) real_select = dlsym(RTLD_NEXT, "select");
     if (!g_direct) return real_select(nfds, r, w, x, tmo);
-    long budget = tmo ? (long)(tmo->tv_sec * 1000 + tmo->tv_usec / 1000) : -1;
-    fd_set r0, w0, x0;
-    if (r) r0 = *r;
-    if (w) w0 = *w;
-    if (x) x0 = *x;
-    /* fast path: tunnel data already pending? */
-    {
-        struct timeval z = {0, 0};
-        fd_set rr;
-        FD_ZERO(&rr);
-        if (r) rr = r0;
-        int qr = real_select(nfds, r ? &rr : NULL, NULL, NULL, &z);
-        int tun = r ? dt_select_scan(nfds, &r0, NULL, NULL) : 0;
-        if (qr > 0 || tun > 0) {
-            if (r) {
-                FD_ZERO(r);
-                if (qr > 0)
-                    for (int fd = 0; fd < nfds; fd++)
-                        if (FD_ISSET(fd, &rr)) FD_SET(fd, r);
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            }
-            if (w) {
-                FD_ZERO(w);
-                dt_wscan(nfds, &w0, w);
-            }
-            if (x) FD_ZERO(x);
-            int n = 0;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, r)) n++;
-            if (w)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, w)) n++;
-            return n;
-        }
-    }
-    long waited = 0;
-    for (;;) {
-        long slice = 25;
-        if (budget >= 0) {
-            if (waited >= budget) {
-                if (r) FD_ZERO(r);
-                if (w) FD_ZERO(w);
-                if (x) FD_ZERO(x);
-                return 0;
-            }
-            if (budget - waited < slice) slice = budget - waited;
-        }
-        fd_set rr, ww, xx;
-        FD_ZERO(&rr);
-        FD_ZERO(&ww);
-        FD_ZERO(&xx);
-        if (r) rr = r0;
-        if (w) ww = w0;
-        if (x) xx = x0;
-        struct timeval tv;
-        tv.tv_sec = slice / 1000;
-        tv.tv_usec = (slice % 1000) * 1000;
-        int rr_ = real_select(nfds, r ? &rr : NULL, w ? &ww : NULL, x ? &xx : NULL, &tv);
-        if (rr_ < 0) return rr_;
-        if (rr_ > 0) {
-            if (r) *r = rr;
-            if (w) {
-                *w = ww;
-                dt_mask_connecting(nfds, &w0, w);
-                dt_wscan(nfds, &w0, w);
-            }
-            if (x) *x = xx;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            int n = 0;
-            if (r)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, r)) n++;
-            if (w)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, w)) n++;
-            if (x)
-                for (int fd = 0; fd < nfds; fd++)
-                    if (FD_ISSET(fd, x)) n++;
-            if (n) return n;
-            /* every reported event was filtered (vacuous writable on a
-             * connecting socket): keep waiting, like the kernel would */
-        }
-        if (r && dt_select_scan(nfds, &r0, NULL, NULL)) {
-            FD_ZERO(r);
-            if (w) FD_ZERO(w);
-            if (x) FD_ZERO(x);
-            for (int fd = 0; fd < nfds; fd++)
-                if (FD_ISSET(fd, &r0) && dt_fd_readable((long long)fd)) FD_SET(fd, r);
-            int n = 0;
-            for (int fd = 0; fd < nfds; fd++)
-                if (FD_ISSET(fd, r)) n++;
-            return n;
-        }
-        waited += slice;
-        if (budget >= 0 && waited >= budget) {
-            if (r) FD_ZERO(r);
-            if (w) FD_ZERO(w);
-            if (x) FD_ZERO(x);
-            return 0;
-        }
-    }
+    long ms = tmo ? (long)(tmo->tv_sec * 1000 + (tmo->tv_usec + 999) / 1000) : -1;
+    return dt_select_core(nfds, r, w, x, ms, NULL);
 }

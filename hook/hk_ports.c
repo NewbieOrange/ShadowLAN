@@ -112,6 +112,7 @@ void dt_set_nonblock(long long gsock, int nb) {
  * other side of these calls pass through. Creation failure degrades to
  * slice polling (bounded, just slower). */
 DTSOCK g_wake_r = DTSOCK_BAD, g_wake_w = DTSOCK_BAD;
+DTSOCK g_hwake_r = DTSOCK_BAD, g_hwake_w = DTSOCK_BAD; /* hosted-UDP poller */
 /* MUST use real symbols: these run under DLOCK and inside app threads;
  * the hooked send/recv would re-enter the same lock (non-recursive). */
 void dt_wake_write(DTSOCK w) {
@@ -198,22 +199,48 @@ void dt_wake_pair(DTSOCK *rp, DTSOCK *wp) {
     }
 #endif
 }
+/* Queue one control frame, stored as its complete wire bytes
+ * ([u32 len][u8 type][payload]) so it leaves in ONE send - with Nagle
+ * off, separate header/type/payload writes went out as three segments.
+ * Datagram-like frames (UDP-over-TCP game traffic, beacons) are dropped
+ * NEW when the link is backed up, as a full UDP socket buffer would:
+ * queued stale datagrams only add delay in front of fresh ones. */
 void dt_tcp_queue(unsigned char type, const unsigned char *p, size_t n) {
+    int droppable = type == DT_UDP_TUN || type == DT_BCAST;
     struct dt_frame *f = (struct dt_frame *)malloc(sizeof(*f));
     if (!f) return;
     f->type = type;
-    f->n = n;
+    f->n = 5 + n;
     f->next = NULL;
-    f->p = n ? (unsigned char *)malloc(n) : NULL;
-    if (n && !f->p) {
+    f->p = (unsigned char *)malloc(f->n);
+    if (!f->p) {
         free(f);
         return;
     }
-    if (n) memcpy(f->p, p, n);
+    dt_put32(f->p, (unsigned)(1 + n));
+    f->p[4] = type;
+    if (n) memcpy(f->p + 5, p, n);
     DLOCK();
+    if (droppable && g_sq_bytes + f->n > DT_CTLQ_DROP) {
+        static long long last_note = 0;
+        size_t q = g_sq_bytes;
+        long long now = dt_now_ms();
+        int note = now - last_note > 5000;
+        if (note) last_note = now;
+        DUNLOCK();
+        free(f->p);
+        free(f);
+        if (note) {
+            char lb[96];
+            snprintf(lb, sizeof(lb), "ctl queue backed up (%zu B): drop new op=0x%02x", q, type);
+            dlog(lb);
+        }
+        return;
+    }
     if (g_sqt) g_sqt->next = f;
     else g_sqh = f;
     g_sqt = f;
+    g_sq_bytes += f->n;
     DUNLOCK();
     dt_wake_write(g_wake_w); /* send now, not at the next poll slice */
 }

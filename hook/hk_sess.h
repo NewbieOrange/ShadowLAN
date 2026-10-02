@@ -38,6 +38,12 @@ HK_INT void dt_sock_state_locked(long long gsock, int *data, int *dead, int *wri
                                  int *connect);
 HK_INT void dt_sock_state_full(long long gsock, int *data, int *dead, int *writable, int *connect);
 HK_INT void dt_sig_locked(long long gsock);
+/* wake channels (call WITHOUT DLOCK): socks n<0 = any socket */
+HK_INT int dt_wait_arm(const long long *socks, int n);
+HK_INT void dt_wait_rearm(int slot);
+HK_INT void dt_wait_done(int slot);
+HK_INT DTSOCK dt_wait_fd(int slot);
+HK_INT void dt_wait_sleep(int slot, int ms);
 #ifndef LINUX_BUILD
 HK_INT void dt_ev_unhook_sock(long long sock);
 HK_INT void dt_ev_unhook_ev(WSAEVENT ev);

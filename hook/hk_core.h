@@ -74,7 +74,27 @@ typedef int socklen_int_t;
 #define DT_MAXICMP 128
 #define DT_RSTMARK 255u
 #define DT_ST_MAXIN (1024 * 1024)
-#define DT_ST_MAXOUT (4 * 1024 * 1024)
+/* App-visible send buffer above the tunnel socket. In-flight bytes live
+ * in the kernel (autotuned like any TCP socket); this only absorbs app
+ * bursts, so it stays small: every queued byte is latency in front of
+ * the app's next message. A send larger than the queue is accepted in
+ * parts (kernel semantics), so throughput never depends on its size. */
+#define DT_ST_MAXOUT (256 * 1024)
+/* poll/select report a stream writable below 2/3 of it (kernel
+ * sk_stream_is_writeable: free >= queued/2) */
+#define DT_ST_WROOM (DT_ST_MAXOUT / 3 * 2)
+/* Unsent bytes the kernel may hold beyond what is in flight
+ * (TCP_NOTSENT_LOWAT on Linux tunnel sockets): keeps backpressure at
+ * the app instead of a deep kernel queue; cwnd/throughput unaffected. */
+#define DT_NOTSENT_LOWAT (32 * 1024)
+/* Droppable control frames (beacons, UDP-over-TCP datagrams) are
+ * refused - the NEW one, like a full UDP socket buffer - once this many
+ * bytes wait for the control link. */
+#define DT_CTLQ_DROP (64 * 1024)
+/* Waits block on real fds + a wake channel signalled by every hook
+ * state change; the rescan backstop only bounds a missed signal. */
+#define DT_WAIT_BACKSTOP_MS 100
+#define DT_MAXWAIT 64
 #define SL_FATAL_NORELAY 200
 #define SL_FATAL_NOLEASE 201
 
@@ -117,6 +137,7 @@ struct dt_stream {
     int peer_fin;
     int wr_shut;
     int rd_shut;
+    int wr_full; /* app saw a full out-queue: signal room at DT_ST_WROOM */
 };
 struct dt_udp {
     int used;
@@ -219,6 +240,7 @@ HK_INT extern struct dt_stream g_st[DT_MAXSTREAM];
 HK_INT extern struct dt_udp g_uq[DT_MAXUDP];
 HK_INT extern struct dt_slot g_sl[DT_MAXSLOT];
 HK_INT extern struct dt_frame *g_sqh, *g_sqt;
+HK_INT extern size_t g_sq_bytes;
 HK_INT extern volatile int g_tun_run, g_tun_started, g_tcp_up;
 HK_INT extern volatile int g_have_assign;
 HK_INT extern volatile int g_init_done;

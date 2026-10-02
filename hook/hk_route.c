@@ -126,8 +126,17 @@ int dt_stream_send(long long gsock, const unsigned char *buf, size_t len) {
         return -1;
     }
     if (st->ototal + len > DT_ST_MAXOUT) {
-        DUNLOCK();
-        return -2;
+        /* all-or-nothing while the write fits the queue at all (what
+         * apps assume of small nonblocking sends); a write bigger than
+         * the whole queue goes in parts, as a kernel splits it */
+        size_t room = st->ototal < DT_ST_MAXOUT ? DT_ST_MAXOUT - st->ototal : 0;
+        if (len <= DT_ST_MAXOUT || room == 0) {
+            st->wr_full = 1;
+            DUNLOCK();
+            return -2;
+        }
+        len = room;
+        st->wr_full = 1;
     }
     if (len) {
         struct dt_chunk *c = (struct dt_chunk *)malloc(sizeof(*c));
@@ -192,34 +201,42 @@ void dt_stream_send_err(int r) {
 }
 int dt_stream_send_wait(long long s, const unsigned char *buf, size_t len) {
     int nonblock = dt_is_nonblock(s);
+    size_t done = 0;
+    int slot = -1, r;
     for (;;) {
-        int r = dt_stream_send(s, buf, len);
-        if (r >= 0) return r;
-        if (r == -3) {
-            dt_stream_send_err(-3);
-            return -3;
+        r = dt_stream_send(s, buf + done, len - done);
+        if (r > 0) {
+            done += (size_t)r;
+            if (done < len && !nonblock) continue; /* blocking: queue it all */
+            r = (int)done;
+            break;
         }
-        if (r == -1) {
-#ifdef LINUX_BUILD
-            /* kernel: send to a stream the peer reset => SIGPIPE + EPIPE
-             * (default-ignored here only if the app blocked it already) */
-            raise(SIGPIPE);
-            errno = EPIPE;
-            return -1;
-#else
-            dt_stream_send_err(-1);
-            return -1;
-#endif
-        }
-        if (r == -2) {
-            if (nonblock) {
-                dt_stream_send_err(-2);
-                return -2;
+        if (r == -2 && !nonblock) {
+            /* arm first, then retry: room freed in between pokes the slot */
+            if (slot < 0) slot = dt_wait_arm(&s, 1);
+            else {
+                dt_wait_sleep(slot, DT_WAIT_BACKSTOP_MS);
+                dt_wait_rearm(slot);
             }
-            dt_msleep(5);
             continue;
         }
+        if (done) r = (int)done; /* report the queued part; error surfaces next call */
+        break;
     }
+    dt_wait_done(slot);
+    if (r == -3) dt_stream_send_err(-3);
+    else if (r == -2) dt_stream_send_err(-2);
+    else if (r == -1) {
+#ifdef LINUX_BUILD
+        /* kernel: send to a stream the peer reset => SIGPIPE + EPIPE
+         * (default-ignored here only if the app blocked it already) */
+        raise(SIGPIPE);
+        errno = EPIPE;
+#else
+        dt_stream_send_err(-1);
+#endif
+    }
+    return r;
 }
 /* pop stream bytes; 1 got (>0), 0 empty, -1 dead.
  * Gather across in-queue chunks up to blen: a kernel TCP recv() of N
@@ -310,7 +327,10 @@ int dt_stream_has(long long gsock) {
     int r = 0;
     DLOCK();
     struct dt_stream *st = dt_stream_by_sock(gsock);
-    if (st) r = (st->h || st->dead || st->state == ST_DEAD) ? 1 : 0; /* dead = readable EOF */
+    /* kernel: queued bytes, EOF (peer FIN / our SHUT_RD) and death are
+     * all readable - recv() then returns data, 0, or the error */
+    if (st)
+        r = (st->h || st->peer_fin || st->rd_shut || st->dead || st->state == ST_DEAD) ? 1 : 0;
     DUNLOCK();
     return r;
 }
@@ -418,10 +438,17 @@ int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen, size_t *outn, 
 #else
     t0 = (long long)GetTickCount();
 #endif
+    int slot = -1;
     for (;;) {
         int r = dt_stream_pop(gsock, buf, blen, outn);
-        if (r != 0) return r;
-        if (nonblock) return 0;
+        if (r != 0 || nonblock) {
+            dt_wait_done(slot);
+            return r;
+        }
+        if (slot < 0) { /* arm, then pop again before the first sleep */
+            slot = dt_wait_arm(&gsock, 1);
+            continue;
+        }
         long long now;
 #ifdef LINUX_BUILD
         struct timeval tv;
@@ -430,7 +457,10 @@ int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen, size_t *outn, 
 #else
         now = (long long)GetTickCount();
 #endif
-        if (timeout_ms >= 0 && now - t0 >= timeout_ms) return 0;
+        if (timeout_ms >= 0 && now - t0 >= timeout_ms) {
+            dt_wait_done(slot);
+            return 0;
+        }
         /* stop early if socket was closed under us */
         {
             int alive = 0;
@@ -438,8 +468,12 @@ int dt_tcp_wait(long long gsock, unsigned char *buf, size_t blen, size_t *outn, 
             struct dt_stream *st = dt_stream_by_sock(gsock);
             alive = (st != NULL);
             DUNLOCK();
-            if (!alive) return -1;
+            if (!alive) {
+                dt_wait_done(slot);
+                return -1;
+            }
         }
-        dt_msleep(10);
+        dt_wait_sleep(slot, timeout_ms >= 0 ? (int)(timeout_ms - (now - t0)) : -1);
+        dt_wait_rearm(slot);
     }
 }

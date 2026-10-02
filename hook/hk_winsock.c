@@ -170,10 +170,12 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags, struct socka
     int nb = dt_is_nonblock((long long)s);
     int tmo = dt_rcvtimeo_ms((long long)s);
     DWORD t0 = GetTickCount();
+    int slot = -1;
     for (;;) {
         struct sockaddr_in tfrom;
         size_t on = 0;
         int pr = dt_udp_pop((long long)s, (unsigned char *)buf, (size_t)len, &tfrom, &on);
+        if (pr != 0) dt_wait_done(slot);
         if (pr == 1) {
             if (g_debug) {
                 unsigned long av = 0;
@@ -195,17 +197,31 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags, struct socka
             WSASetLastError(WSAEBADF);
             return SOCKET_ERROR;
         }
+        if (!nb && slot < 0) { /* arm, then look again before sleeping */
+            slot = dt_wait_arm((long long[]){(long long)s}, 1);
+            if (slot >= 0) continue;
+        }
+        /* real wire datagrams on the socket, or a hook arrival (wake) */
         fd_set rf;
         FD_ZERO(&rf);
         FD_SET(s, &rf);
+        DTSOCK wk = dt_wait_fd(slot);
+        if (wk != DTSOCK_BAD) FD_SET(wk, &rf);
+        long w = DT_WAIT_BACKSTOP_MS;
+        if (tmo >= 0 && tmo - (long)(GetTickCount() - t0) < w)
+            w = tmo - (long)(GetTickCount() - t0);
+        if (w < 0) w = 0;
         struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 50000;
-        struct timeval ztv;
-        ztv.tv_sec = 0;
-        ztv.tv_usec = 0;
-        int rr = select(0, &rf, NULL, NULL, nb ? &ztv : &tv);
-        if (rr > 0) {
+        tv.tv_sec = nb ? 0 : w / 1000;
+        tv.tv_usec = nb ? 0 : (w % 1000) * 1000;
+        int rr = select(0, &rf, NULL, NULL, &tv);
+        if (wk != DTSOCK_BAD && rr > 0 && FD_ISSET(wk, &rf)) {
+            dt_wait_rearm(slot);
+            if (!FD_ISSET(s, &rf)) continue;
+        }
+        if (rr > 0 && FD_ISSET(s, &rf)) {
+            dt_wait_done(slot);
+            slot = -1;
             int n = p_recvfrom(s, buf, len, flags, from, fromlen);
             if (g_debug) {
                 char lb[96];
@@ -232,6 +248,7 @@ static int dt_win_udp_recv(SOCKET s, char *buf, int len, int flags, struct socka
             return SOCKET_ERROR;
         }
         if (tmo >= 0 && (int)(GetTickCount() - t0) >= tmo) {
+            dt_wait_done(slot);
             WSASetLastError(WSAETIMEDOUT);
             return SOCKET_ERROR;
         }
@@ -505,22 +522,29 @@ static int dt_connect_wait(long long gsock, int nonblock) {
         return SOCKET_ERROR;
     }
     long long t0 = dt_now_ms();
+    int slot = dt_wait_arm(&gsock, 1); /* before the first look */
     for (;;) {
         DLOCK();
         struct dt_stream *st = dt_stream_by_sock(gsock);
         int state = st ? st->state : 0;
         unsigned fail = st ? st->fail : 0;
         DUNLOCK();
-        if (state == ST_OPEN) return 0;
+        if (state == ST_OPEN) {
+            dt_wait_done(slot);
+            return 0;
+        }
         if (state == ST_DEAD) {
+            dt_wait_done(slot);
             WSASetLastError(dt_stfail_wsae(fail));
             return SOCKET_ERROR;
         }
         if (dt_now_ms() - t0 > DT_ST_TIMEOUT_MS + 500) {
+            dt_wait_done(slot);
             WSASetLastError(WSAETIMEDOUT);
             return SOCKET_ERROR;
         }
-        dt_msleep(10);
+        dt_wait_sleep(slot, DT_WAIT_BACKSTOP_MS);
+        dt_wait_rearm(slot);
     }
 }
 int WSAAPI hk_connect(SOCKET s, const struct sockaddr *a, int l) {
@@ -1012,108 +1036,131 @@ int WSAAPI hk_ioctlsocket(SOCKET s, long cmd, u_long *argp) {
     }
     return r;
 }
-/* select/WSAPoll must report tunnel data readable (same reason as Linux). */
+/* select/WSAPoll must report tunnel data readable (same reason as Linux).
+ * Event-driven like Linux: the real wait carries a wake socket that every
+ * hook state change pokes; tunneled-stream sockets (never connected for
+ * real) are answered from hook state alone and kept out of the real call. */
+static int dt_win_ours(SOCKET s, int *is_stream) {
+    *is_stream = dt_stream_by_sock_peek((long long)s);
+    if (*is_stream) return 1;
+    if (dt_is_udp_like((long long)s)) {
+        dt_udp_ensure((long long)s); /* fan-out needs the entry */
+        return 1;
+    }
+    return 0;
+}
 int WSAAPI hk_select(int nfds, fd_set *r, fd_set *w, fd_set *x, const struct timeval *tmo) {
     typedef int(WSAAPI * PFN_select)(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
     static PFN_select p_sel = 0;
     if (!p_sel)
         p_sel = (PFN_select)GetProcAddress(hWS2 ? hWS2 : GetModuleHandleA("ws2_32.dll"), "select");
     if (!g_direct) return p_sel(nfds, r, w, x, tmo);
-    long budget = tmo ? (long)(tmo->tv_sec * 1000 + tmo->tv_usec / 1000) : -1;
-    fd_set r0, w0, x0;
+    long budget = tmo ? (long)(tmo->tv_sec * 1000 + (tmo->tv_usec + 999) / 1000) : -1;
+    fd_set r0, w0, x0, st0; /* st0: tunneled streams in the request */
     FD_ZERO(&r0);
     FD_ZERO(&w0);
     FD_ZERO(&x0);
+    FD_ZERO(&st0);
     if (r) r0 = *r;
     if (w) w0 = *w;
     if (x) x0 = *x;
-    {
-        fd_set rq = r0, wq = w0, xq = x0;
-        struct timeval z = {0, 0};
-        int qr =
-            ((r || w || x)) ? p_sel(nfds, r ? &rq : NULL, w ? &wq : NULL, x ? &xq : NULL, &z) : 0;
-        if (qr < 0) return qr;
-        int n = 0;
+    long long ks[8];
+    int nk = 0, any = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        fd_set *q = pass ? &w0 : &r0;
+        for (u_int i = 0; i < q->fd_count; i++) {
+            int is_st = 0;
+            if (!dt_win_ours(q->fd_array[i], &is_st)) continue;
+            if (is_st && !FD_ISSET(q->fd_array[i], &st0)) FD_SET(q->fd_array[i], &st0);
+            if (nk < 8) ks[nk++] = (long long)q->fd_array[i];
+            else any = 1;
+        }
+    }
+    if (!nk) return p_sel(nfds, r, w, x, tmo); /* nothing of ours: the plain wait */
+    int slot = dt_wait_arm(ks, any ? -1 : nk); /* before the first scan */
+    DTSOCK wk = dt_wait_fd(slot);
+    long long t0 = dt_now_ms();
+    int polled = 0, n = 0;
+    for (;;) {
+        fd_set hr, hw;
+        FD_ZERO(&hr);
+        FD_ZERO(&hw);
+        for (u_int i = 0; i < r0.fd_count; i++)
+            if (dt_fd_readable((long long)r0.fd_array[i])) FD_SET(r0.fd_array[i], &hr);
+        for (u_int i = 0; i < w0.fd_count; i++) {
+            int data, dead, wr, cn;
+            dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
+            if (wr || cn) FD_SET(w0.fd_array[i], &hw);
+        }
+        int hook_hit = hr.fd_count + hw.fd_count > 0;
+        long wt = hook_hit ? 0 : DT_WAIT_BACKSTOP_MS;
+        if (budget >= 0) {
+            long left = budget - (long)(dt_now_ms() - t0);
+            if (left <= 0) {
+                if (polled) break;
+                left = 0;
+            }
+            if (left < wt) wt = left;
+        }
+        polled = 1;
+        fd_set rq, wq, xq;
+        FD_ZERO(&rq);
+        FD_ZERO(&wq);
+        FD_ZERO(&xq);
+        for (u_int i = 0; i < r0.fd_count; i++)
+            if (!FD_ISSET(r0.fd_array[i], &st0)) FD_SET(r0.fd_array[i], &rq);
+        for (u_int i = 0; i < w0.fd_count; i++)
+            if (!FD_ISSET(w0.fd_array[i], &st0)) FD_SET(w0.fd_array[i], &wq);
+        for (u_int i = 0; i < x0.fd_count; i++)
+            if (!FD_ISSET(x0.fd_array[i], &st0)) FD_SET(x0.fd_array[i], &xq);
+        int wake_in = 0;
+        if (!hook_hit && wk != DTSOCK_BAD && rq.fd_count < FD_SETSIZE) {
+            FD_SET(wk, &rq);
+            wake_in = 1;
+        }
+        int rr = 0;
+        if (rq.fd_count + wq.fd_count + xq.fd_count) {
+            struct timeval tv = {wt / 1000, (wt % 1000) * 1000};
+            rr = p_sel(nfds, &rq, &wq, &xq, &tv);
+            if (rr < 0) {
+                n = rr;
+                break;
+            }
+        } else if (wt > 0)
+            dt_msleep((int)wt); /* empty real wait (no slot): backstop */
+        if (wake_in && FD_ISSET(wk, &rq)) {
+            FD_CLR(wk, &rq);
+            dt_wait_rearm(slot);
+        }
+        n = 0;
         if (r) {
             FD_ZERO(r);
             for (u_int i = 0; i < rq.fd_count; i++) FD_SET(rq.fd_array[i], r);
-            for (u_int i = 0; i < r0.fd_count; i++)
-                if (dt_fd_readable((long long)r0.fd_array[i])) FD_SET(r0.fd_array[i], r);
-            for (u_int i = 0; i < r->fd_count; i++) n++;
+            for (u_int i = 0; i < hr.fd_count; i++)
+                if (!FD_ISSET(hr.fd_array[i], r)) FD_SET(hr.fd_array[i], r);
+            n += (int)r->fd_count;
         }
         if (w) {
-            *w = wq;
-            for (u_int i = 0; i < w0.fd_count; i++)
-                if (FD_ISSET(w0.fd_array[i], w) && dt_fd_connecting((long long)w0.fd_array[i]))
-                    FD_CLR(w0.fd_array[i], w);
-            for (u_int i = 0; i < w0.fd_count; i++) {
-                int data, dead, wr, cn;
-                dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
-                if (wr || cn) FD_SET(w0.fd_array[i], w);
-            }
-            for (u_int i = 0; i < w->fd_count; i++) n++;
+            FD_ZERO(w);
+            for (u_int i = 0; i < wq.fd_count; i++) FD_SET(wq.fd_array[i], w);
+            for (u_int i = 0; i < hw.fd_count; i++)
+                if (!FD_ISSET(hw.fd_array[i], w)) FD_SET(hw.fd_array[i], w);
+            n += (int)w->fd_count;
         }
         if (x) {
             *x = xq;
-            for (u_int i = 0; i < x->fd_count; i++) n++;
+            n += (int)x->fd_count;
         }
-        if (n) return n;
+        if (n) break;
+        if (budget >= 0 && dt_now_ms() - t0 >= budget) break;
     }
-    long waited = 0;
-    for (;;) {
-        long slice = 25;
-        if (budget >= 0) {
-            if (waited >= budget) {
-                if (r) FD_ZERO(r);
-                if (w) FD_ZERO(w);
-                if (x) FD_ZERO(x);
-                return 0;
-            }
-            if (budget - waited < slice) slice = budget - waited;
-        }
-        fd_set rq = r0, wq = w0, xq = x0;
-        struct timeval tv;
-        tv.tv_sec = slice / 1000;
-        tv.tv_usec = (slice % 1000) * 1000;
-        int rr_ = p_sel(nfds, r ? &rq : NULL, w ? &wq : NULL, x ? &xq : NULL, &tv);
-        if (rr_ < 0) return rr_;
-        {
-            int n = 0;
-            if (r) {
-                FD_ZERO(r);
-                if (rr_ > 0)
-                    for (u_int i = 0; i < rq.fd_count; i++) FD_SET(rq.fd_array[i], r);
-                for (u_int i = 0; i < r0.fd_count; i++)
-                    if (dt_fd_readable((long long)r0.fd_array[i])) FD_SET(r0.fd_array[i], r);
-                for (u_int i = 0; i < r->fd_count; i++) n++;
-            }
-            if (w) {
-                FD_ZERO(w);
-                if (rr_ > 0)
-                    for (u_int i = 0; i < wq.fd_count; i++) FD_SET(wq.fd_array[i], w);
-                for (u_int i = 0; i < w0.fd_count; i++) {
-                    int data, dead, wr, cn;
-                    dt_sock_state_full((long long)w0.fd_array[i], &data, &dead, &wr, &cn);
-                    if (wr || cn) FD_SET(w0.fd_array[i], w);
-                }
-                for (u_int i = 0; i < w->fd_count; i++) n++;
-            }
-            if (x) {
-                if (rr_ > 0) {
-                    *x = xq;
-                    for (u_int i = 0; i < x->fd_count; i++) n++;
-                } else FD_ZERO(x);
-            }
-            if (n) return n;
-        }
-        waited += slice;
-        if (budget >= 0 && waited >= budget) {
-            if (r) FD_ZERO(r);
-            if (w) FD_ZERO(w);
-            if (x) FD_ZERO(x);
-            return 0;
-        }
+    dt_wait_done(slot);
+    if (n == 0) {
+        if (r) FD_ZERO(r);
+        if (w) FD_ZERO(w);
+        if (x) FD_ZERO(x);
     }
+    return n;
 }
 int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
     typedef int(WSAAPI * PFN_WSAPoll)(LPWSAPOLLFD, ULONG, INT);
@@ -1121,48 +1168,92 @@ int WSAAPI hk_WSAPoll(LPWSAPOLLFD fds, ULONG nfds, INT timeout) {
     if (!p_p)
         p_p = (PFN_WSAPoll)GetProcAddress(hWS2 ? hWS2 : GetModuleHandleA("ws2_32.dll"), "WSAPoll");
     if (!g_direct) return p_p(fds, nfds, timeout);
-    for (ULONG i = 0; i < nfds; i++) fds[i].revents = 0;
-    {
-        int n = 0;
+    long long ks[8];
+    int nk = 0, any = 0;
+    for (ULONG i = 0; i < nfds; i++) {
+        int is_st = 0;
+        if (!dt_win_ours(fds[i].fd, &is_st)) continue;
+        if (nk < 8) ks[nk++] = (long long)fds[i].fd;
+        else any = 1;
+    }
+    if (!nk) return p_p(fds, nfds, timeout); /* nothing of ours: the plain wait */
+    WSAPOLLFD sb[33], *pf = nfds < 32 ? sb : (WSAPOLLFD *)malloc((nfds + 1) * sizeof(*pf));
+    ULONG ib[33], *idx = nfds < 32 ? ib : (ULONG *)malloc((nfds + 1) * sizeof(*idx));
+    if (!pf || !idx) {
+        if (pf && pf != sb) free(pf);
+        if (idx && idx != ib) free(idx);
+        WSASetLastError(WSAENOBUFS);
+        return SOCKET_ERROR;
+    }
+    int slot = dt_wait_arm(ks, any ? -1 : nk); /* before the first scan */
+    DTSOCK wk = dt_wait_fd(slot);
+    long long t0 = dt_now_ms();
+    int polled = 0, n = 0;
+    for (;;) {
+        int hook_hit = 0;
         for (ULONG i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
             if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd))
                 fds[i].revents |= POLLRDNORM;
-            if (fds[i].revents & (POLLOUT | POLLWRNORM) && dt_fd_connecting((long long)fds[i].fd))
-                fds[i].revents &= ~(POLLOUT | POLLWRNORM);
             if (fds[i].events & (POLLOUT | POLLWRNORM)) {
                 int data, dead, wr, cn;
                 dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
                 if (wr || cn) fds[i].revents |= POLLOUT;
             }
-            if (fds[i].revents) n++;
+            if (fds[i].revents) hook_hit = 1;
         }
-        if (n) return n;
-    }
-    int waited = 0;
-    for (;;) {
-        int slice = 25;
+        long wt = hook_hit ? 0 : DT_WAIT_BACKSTOP_MS;
         if (timeout >= 0) {
-            if (waited >= timeout) return 0;
-            if (timeout - waited < slice) slice = timeout - waited;
-        }
-        int r = p_p(fds, nfds, slice);
-        if (r < 0) return r;
-        int n = 0;
-        for (ULONG i = 0; i < nfds; i++) {
-            if ((fds[i].events & POLLRDNORM) && dt_fd_readable((long long)fds[i].fd))
-                if (!(fds[i].revents & POLLRDNORM)) fds[i].revents |= POLLRDNORM;
-            if (fds[i].events & (POLLOUT | POLLWRNORM)) {
-                int data, dead, wr, cn;
-                dt_sock_state_full((long long)fds[i].fd, &data, &dead, &wr, &cn);
-                if ((wr || cn) && !(fds[i].revents & POLLOUT)) fds[i].revents |= POLLOUT;
+            long left = timeout - (long)(dt_now_ms() - t0);
+            if (left <= 0) {
+                if (polled) break;
+                left = 0;
             }
+            if (left < wt) wt = left;
+        }
+        polled = 1;
+        ULONG m = 0;
+        for (ULONG i = 0; i < nfds; i++) {
+            if (dt_stream_by_sock_peek((long long)fds[i].fd)) continue;
+            pf[m] = fds[i];
+            pf[m].revents = 0;
+            idx[m++] = i;
+        }
+        if (!hook_hit && wk != DTSOCK_BAD) {
+            pf[m].fd = wk;
+            pf[m].events = POLLRDNORM;
+            pf[m].revents = 0;
+            idx[m++] = nfds; /* the wake entry */
+        }
+        int rr = 0;
+        if (m) {
+            rr = p_p(pf, m, (INT)wt);
+            if (rr < 0) {
+                n = rr;
+                break;
+            }
+        } else if (wt > 0)
+            dt_msleep((int)wt);
+        n = 0;
+        for (ULONG j = 0; j < m; j++) {
+            if (idx[j] == nfds) {
+                if (pf[j].revents) dt_wait_rearm(slot);
+                continue;
+            }
+            fds[idx[j]].revents |= pf[j].revents;
+        }
+        for (ULONG i = 0; i < nfds; i++) {
+            if (fds[i].revents & (POLLOUT | POLLWRNORM) && dt_fd_connecting((long long)fds[i].fd))
+                fds[i].revents &= ~(POLLOUT | POLLWRNORM);
             if (fds[i].revents) n++;
         }
-        if (n) return n;
-        if (r < 0) return r;
-        waited += slice;
-        if (timeout >= 0 && waited >= timeout) return 0;
+        if (n) break;
+        if (timeout >= 0 && dt_now_ms() - t0 >= timeout) break;
     }
+    dt_wait_done(slot);
+    if (pf != sb) free(pf);
+    if (idx != ib) free(idx);
+    return n;
 }
 
 /* Event-driven waiting (WSAEventSelect family): inbound tunnel data sits

@@ -671,6 +671,7 @@ struct dt_stream *dt_stream_alloc(long long gsock, const struct sockaddr_in *dst
         st->peer_fin = 0;
         st->wr_shut = 0;
         st->rd_shut = 0;
+        st->wr_full = 0;
         st->shut_done = 0;
         st->ever_open = 0;
         st->wake_r = st->wake_w = DTSOCK_BAD;

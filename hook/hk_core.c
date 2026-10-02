@@ -21,6 +21,7 @@ struct dt_stream g_st[DT_MAXSTREAM];
 struct dt_udp g_uq[DT_MAXUDP];
 struct dt_slot g_sl[DT_MAXSLOT];
 struct dt_frame *g_sqh = NULL, *g_sqt = NULL;
+size_t g_sq_bytes = 0;
 volatile int g_tun_run = 0, g_tun_started = 0, g_tcp_up = 0;
 volatile int g_have_assign = 0;
 volatile int g_init_done = 0;
