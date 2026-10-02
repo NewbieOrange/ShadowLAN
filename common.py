@@ -109,6 +109,31 @@ def parse_hostport(s, default_port):
     return s, default_port
 
 
+NOTSENT_LOWAT = 32 * 1024   # keep in step with DT_NOTSENT_LOWAT (hook)
+
+
+def tune_tcp(sock):
+    """Tunnel TCP like any kernel socket: Nagle off, NO fixed
+    SO_SNDBUF/SO_RCVBUF (either one disables autotuning and is clamped to
+    rmem_max/wmem_max - on a stock VPS that capped a relayed stream near
+    425 KB in flight while also letting MBs sit queued in front of slow
+    readers). TCP_NOTSENT_LOWAT keeps unsent bytes beyond cwnd small so
+    backpressure reaches the sender instead of a queue in the middle;
+    throughput is set by cwnd, which it does not touch."""
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    lowat = getattr(socket, "TCP_NOTSENT_LOWAT", None)
+    if lowat is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, lowat, NOTSENT_LOWAT)
+        except OSError:
+            pass
+
+
 def make_reuse_udp(bind_ip, port):
     """UDP socket, REUSEADDR (+REUSEPORT where avail), BROADCAST.
 
@@ -131,11 +156,20 @@ def make_reuse_udp(bind_ip, port):
 
 
 class QueueProto(asyncio.DatagramProtocol):
-    def __init__(self):
-        self.q = asyncio.Queue()
+    """maxsize > 0 bounds the backlog like a kernel UDP receive buffer:
+    when the consumer falls behind, the NEW datagram is dropped (asyncio
+    would otherwise drain the socket into an unbounded, ever-older
+    queue)."""
+
+    def __init__(self, maxsize=0):
+        self.q = asyncio.Queue(maxsize=maxsize)
+        self.dropped = 0
 
     def datagram_received(self, data, addr):
-        self.q.put_nowait((data, addr))
+        try:
+            self.q.put_nowait((data, addr))
+        except asyncio.QueueFull:
+            self.dropped += 1
 
 
 def encode_udp_game(mtype, game_port, cli_ip, cli_port, raw):

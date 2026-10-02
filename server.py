@@ -41,7 +41,7 @@ from common import (
     decode_stjoin, encode_stsid,
     encode_stfail, decode_stfail,
     ip_to_int, int_to_ip, parse_ports, tcp_read, tcp_send,
-    ST_TIMEOUT_S, T_STSHUT,
+    ST_TIMEOUT_S, T_STSHUT, tune_tcp,
 )
 
 
@@ -68,7 +68,11 @@ class Relay:
     # TCP datagrams) instead of blocking the room on a stalled reader
     WQ_MAXFRAMES = 1024
     WQ_MAXBYTES = 4 * 1024 * 1024
+    # droppable frames are datagram-like: refuse the NEW one once this
+    # much waits (stale datagrams queued in TCP are pure added latency)
+    WQ_DROP_BYTES = 64 * 1024
     DROPPABLE = (T_BCAST, T_BCAST_FROM, T_UDP_TUN)
+    UDP_INQ_MAX = 1024     # relay UDP ingress backlog (datagrams)
 
     def __init__(self, port, token="", allowed_tcp=None, allowed_udp=None,
                  disc_ports=None, subnet="10.200.0.0/24", bind="0.0.0.0"):
@@ -142,18 +146,18 @@ class Relay:
             self.wq_task[key] = asyncio.create_task(self._wq_drain(writer, q))
         frame = HDR.pack(1 + len(payload)) + bytes([mtype]) + payload
         cnt, byts = self.wq_size[key]
-        if cnt >= self.WQ_MAXFRAMES or byts > self.WQ_MAXBYTES:
-            if droppable:
-                now = time.monotonic()
-                if now - self._wq_drop_note.get(key, 0.0) > 5.0:
-                    self._wq_drop_note[key] = now
-                    print(f"[relay] control queue full for "
-                          f"{writer.get_extra_info('peername')}: dropping "
-                          f"op 0x{mtype:02x}", flush=True)
-                return
-            while cnt >= self.WQ_MAXFRAMES or byts > self.WQ_MAXBYTES:
-                await asyncio.sleep(0.01)
-                cnt, byts = self.wq_size[key]
+        if droppable and (cnt >= self.WQ_MAXFRAMES
+                          or byts + len(frame) > self.WQ_DROP_BYTES):
+            now = time.monotonic()
+            if now - self._wq_drop_note.get(key, 0.0) > 5.0:
+                self._wq_drop_note[key] = now
+                print(f"[relay] control queue backed up for "
+                      f"{writer.get_extra_info('peername')} ({byts}B): "
+                      f"dropping new op 0x{mtype:02x}", flush=True)
+            return
+        while cnt >= self.WQ_MAXFRAMES or byts > self.WQ_MAXBYTES:
+            await asyncio.sleep(0.01)
+            cnt, byts = self.wq_size[key]
         try:
             q.put_nowait(frame)
         except asyncio.QueueFull:
@@ -752,16 +756,7 @@ class Relay:
     # ---- control connection -------------------------------------------------
     async def accept_conn(self, reader, writer):
         peer = writer.get_extra_info("peername")
-        # Match the hooks' enlarged, Nagle-free tunnels: big buffers on
-        # both ends keep bulk transfers flowing without window stalls.
-        try:
-            _ts = writer.get_extra_info("socket")
-            if _ts is not None:
-                _ts.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                _ts.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
-                _ts.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
-        except OSError:
-            pass
+        tune_tcp(writer.get_extra_info("socket"))
         try:
             mtype, payload = await asyncio.wait_for(
                 tcp_read(reader), timeout=ST_TIMEOUT_S)
@@ -1374,7 +1369,7 @@ class Relay:
         psock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         psock.bind((self.bind, self.port))
         psock.setblocking(False)
-        pproto = QueueProto()
+        pproto = QueueProto(maxsize=self.UDP_INQ_MAX)
         self._public_udp, _ = await loop.create_datagram_endpoint(lambda: pproto, sock=psock)
         print(f"[udp] relay {self.bind}:{self.port}", flush=True)
         self._udp_task = asyncio.create_task(self.udp_consume(pproto))

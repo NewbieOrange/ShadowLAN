@@ -53,7 +53,7 @@ from common import (
     decode_udp_game, encode_udp_game,
     encode_ctl_node, encode_udp_node, decode_bcast_from, decode_icmp, encode_icmp,
     decode_streq, encode_stjoin, encode_stsid, encode_stfail, encode_stopen,
-    make_reuse_udp, parse_ports, tcp_read, tcp_send, ST_TIMEOUT_S,
+    make_reuse_udp, parse_ports, tcp_read, tcp_send, ST_TIMEOUT_S, tune_tcp,
 )
 
 
@@ -226,6 +226,9 @@ class WinClient:
 
     async def pipe_stream(self, ra, wa, rb, wb, tag):
         """Raw bidirectional pipe between two (reader, writer) pairs."""
+        for w in (wa, wb):
+            tune_tcp(w.get_extra_info("socket"))
+
         async def pump(src, dst):
             try:
                 while True:
@@ -533,6 +536,7 @@ class WinClient:
                 try:
                     print(f"[peer] dialing {self.server_ip}:{self.port} (TCP) ...", flush=True)
                     reader, writer = await asyncio.open_connection(self.server_ip, self.port)
+                    tune_tcp(writer.get_extra_info("socket"))
                 except OSError as e:
                     print(f"[peer] dial failed: {e}, retry {backoff}s", flush=True)
                     await asyncio.sleep(backoff)
